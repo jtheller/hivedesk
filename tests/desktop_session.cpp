@@ -17,7 +17,9 @@ void stream_restarts(){
     };
     for(unsigned desktop=0;desktop<4;++desktop){
         const auto next=sequence.next();sequence.begin(7);require(sequence.next()==next,"Same-stream capture restart reset sequence");
-        now+=500000;emit(true);for(unsigned i=0;i<300;++i)emit(false);
+        require(sequence.first(),"Capture restart did not require an IDR");
+        for(unsigned timeout=0;timeout<4;++timeout)require(sequence.first(),"Capture timeout consumed first-IDR requirement");
+        now+=500000;emit(sequence.first());require(!sequence.first(),"Accepted first submit did not clear IDR requirement");for(unsigned i=0;i<300;++i)emit(false);
         // A frame accepted by NVENC but retired at stop still consumes an ID.
         sequence.submitted();
     }

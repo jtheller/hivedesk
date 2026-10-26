@@ -213,7 +213,10 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                     if(impl_->keyframe&&encoder.in_flight()!=0)continue;
                     const auto capture_started=Clock::now();const auto capture_begin=now_us();
                     const bool changed=capture.next();capture_wait=uint32_t(std::min<uint64_t>(10000000,now_us()-capture_begin));have_picture=have_picture||changed;
-                    const bool forced=impl_->keyframe.exchange(false)||(!automatic&&Clock::now()-last_keyframe>=std::chrono::seconds(1));
+                    // Sequence numbers survive capture restarts; encoder state
+                    // does not. Keep forcing the first IDR through capture
+                    // timeouts and unavailable slots until a submit succeeds.
+                    const bool forced=impl_->keyframe.exchange(false)||impl_->sequence.first()||(!automatic&&Clock::now()-last_keyframe>=std::chrono::seconds(1));
                     if(!changed&&(!forced||!have_picture))continue;
                     // No raw-frame FIFO. When slots/credit recover, acquire the
                     // current desktop instead of consuming old captured images.
