@@ -24,7 +24,7 @@ try {
     if($repo.private -or -not $repo.permissions.push){throw 'Public release repository is not writable'}
     # A published tag is immutable from this workflow. Drafts can be resumed
     # after an interrupted upload, but only for the exact original source commit.
-    $releases=@(Invoke-RestMethod ('https://api.github.com/repos/'+$repository+'/releases?per_page=100') -Headers $headers)
+    $releases=Invoke-RestMethod ('https://api.github.com/repos/'+$repository+'/releases?per_page=100') -Headers $headers
     $release=$releases | Where-Object tag_name -eq $tag | Select-Object -First 1
     if($release -and -not $release.draft){throw 'This version is already published; increment the version instead of replacing assets'}
     if($release -and $release.target_commitish -ne $commit){throw 'Draft release belongs to another commit'}
@@ -36,7 +36,7 @@ try {
     if($LASTEXITCODE){throw 'Cannot push release tag'}
     if(-not $release){
         $noteFile=Join-Path $projectRoot ('docs\releases\'+$version+'.md')
-        $notes=if(Test-Path -LiteralPath $noteFile){Get-Content -LiteralPath $noteFile -Raw -Encoding UTF8}else{'Windows x64 installer. Automatic updates are applied only while remote sessions are idle.'}
+        $notes=if(Test-Path -LiteralPath $noteFile){[IO.File]::ReadAllText($noteFile)}else{'Windows x64 installer. Automatic updates are applied only while remote sessions are idle.'}
         $body=@{tag_name=$tag;target_commitish=$commit;name=('HiveDesk '+$version);body=$notes;draft=$true;prerelease=$false} | ConvertTo-Json
         $release=Invoke-RestMethod ('https://api.github.com/repos/'+$repository+'/releases') -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
     }
