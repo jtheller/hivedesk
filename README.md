@@ -5,7 +5,10 @@ Windows-native personal LAN desktop switching. This is an early hardware-tested 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
-Alpha.27 adds automatic signed updates. Install this version once on each computer;
+Alpha.28 adds a live ~16ms diagnostic HUD, metric warning colors and a translucent,
+click-through background. Update both computers for fast source diagnostics.
+
+Alpha.27 introduced automatic signed updates. Install alpha.27 or newer once;
 afterward the service checks the latest GitHub Release every 15 minutes (first
 check 60–90 seconds after startup). Downloads happen in the background. Installation
 waits for all inbound/outbound remote sessions, queued starts and reconnect intents

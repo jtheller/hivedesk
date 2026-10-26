@@ -77,11 +77,16 @@ public:
             const auto peer=active_.load();if(!peer||closing_)return;
             const auto report=viewer_.feedback();if(report.session&&report.session==active_session_)transport_.send_feedback(*peer,report);
             if(shell_.debug_enabled()&&GetTickCount64()-last_debug_tick_>=250){
-                last_debug_tick_=GetTickCount64();const auto stats=viewer_.diagnostics();shell_.update_viewer_diagnostics(*peer,stats);
-                const auto size=remote_size_.load();telemetry_.viewer(*peer,stats,uint32_t(size>>32),uint32_t(size));
-                const auto input=transport_.input_diagnostics(*peer);
-                telemetry_.input(*peer,active_session_,input);shell_.update_input_diagnostics(*peer,input);
+                last_debug_tick_=GetTickCount64();const auto size=remote_size_.load();
+                const auto stats=viewer_.diagnostics();const auto input=transport_.input_diagnostics(*peer);
+                telemetry_.viewer(*peer,stats,uint32_t(size>>32),uint32_t(size));
+                telemetry_.input(*peer,active_session_,input);
             }
+        };
+        callbacks.debug_tick=[this] {
+            const auto peer=active_.load();if(!peer||closing_)return;
+            const auto stats=viewer_.diagnostics();shell_.update_viewer_diagnostics(*peer,stats);
+            const auto input=transport_.input_diagnostics(*peer);shell_.update_input_diagnostics(*peer,input);
         };
         callbacks.captured_input=[this](const std::string& peer,uint64_t session,const hive::InputEvent& input,uint64_t captured_us) {
             // Bind captured events to their original selection. A queued event

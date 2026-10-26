@@ -34,6 +34,8 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
             uint64_t last_sample=0,previous_completion=0,encoded_frames=0,send_wait=0;
             uint64_t encoded_bytes=0,window_qp_sum=0,window_qp_samples=0;
             uint64_t rate_frames=0,rate_bytes=0,rate_qp_sum=0,rate_qp_samples=0,sent_frames=0,total_send_wait=0;
+            DiagnosticWindow<5> diagnostic_window;diagnostic_window.sample(now_us(),{});
+            uint32_t live_encode=0,live_color=0,live_nvenc=0;uint64_t live_sample=0;
             bool previous_keyframe=true;
             std::exception_ptr failure;
             auto fail=[&](std::exception_ptr problem){
@@ -50,6 +52,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         {
                             std::lock_guard lock(impl_->wait_mutex);
                             const auto now=result.completed_us;
+                            live_encode=result.total_us;live_color=result.color_us;live_nvenc=result.nvenc_us;live_sample=now;
                             if(!result.frame.keyframe||completed.needs_keyframe()){
                                 if(!last_sample||now-last_sample>1000000)encode_us=capacity_us=0;
                                 auto ema=[](uint32_t old,uint32_t value){return old?(old*7+value)/8:value;};
@@ -146,19 +149,19 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         // hardware that cannot reconfigure its bitrate.
                         pacer.observe(now,capacity,service,fresh?report.queue_us:0,blocked&&!bitrate_feedback,fresh&&report.recover,sampled_at,reported_at);
                         if(health&&now-last_health>=250000){health({settings.session,pacer.target(),pacer.rate(),pacer.pressure()});last_health=now;}
-                        if(diagnostics&&now-diagnostic_since>=1000000){
-                            SourceDiagnostics d;d.session=settings.session;const auto elapsed=now-diagnostic_since;
+                        if(diagnostics&&now-diagnostic_since>=16000){
+                            SourceDiagnostics d;d.session=settings.session;
                             {
                                 std::lock_guard lock(impl_->wait_mutex);
-                                d.encoded_millihz=uint32_t(std::min<uint64_t>(4000000,encoded_frames*1000000000ull/elapsed));d.encode_us=encode_us;
-                                d.color_us=color_us;d.nvenc_us=nvenc_us;d.encode_details=true;
-                                const auto age=now>=last_sample?now-last_sample:0;
-                                d.encode_age_us=last_sample?uint32_t(std::min<uint64_t>(UINT32_MAX,age)):UINT32_MAX;
-                                d.send_wait_us_per_second=uint32_t(std::min<uint64_t>(1000000,send_wait*1000000/elapsed));
-                                d.actual_bitrate_bps=uint32_t(std::min<uint64_t>(UINT32_MAX,encoded_bytes*8000000/elapsed));
-                                d.average_qp=window_qp_samples?uint32_t(window_qp_sum/window_qp_samples):UINT32_MAX;
+                                const auto window=diagnostic_window.sample(now,{encoded_frames,encoded_bytes,send_wait,window_qp_sum,window_qp_samples});
+                                d.encoded_millihz=window.rate(0,1000000000,4000000);d.encode_us=live_encode;
+                                d.color_us=live_color;d.nvenc_us=live_nvenc;d.encode_details=true;
+                                const auto age=now>=live_sample?now-live_sample:0;
+                                d.encode_age_us=live_sample?uint32_t(std::min<uint64_t>(UINT32_MAX,age)):UINT32_MAX;
+                                d.send_wait_us_per_second=window.rate(2,1000000,1000000);
+                                d.actual_bitrate_bps=window.rate(1,8000000);
+                                d.average_qp=window.values[4]?uint32_t(window.values[3]/window.values[4]):UINT32_MAX;
                                 d.source_discarded=completed.discarded();
-                                encoded_frames=encoded_bytes=send_wait=window_qp_sum=window_qp_samples=0;
                             }
                             d.rate_details=true;d.automatic_cbr=encoder.automatic_rate();d.target_bitrate_bps=encoder.bitrate_bps();
                             d.quality_limited=encoder.dynamic_rate()&&rate_control.decision().rate_limit_millihz<pacer.target();

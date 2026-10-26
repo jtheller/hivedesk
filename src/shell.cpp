@@ -1,5 +1,7 @@
 #include "hivedesk/shell.h"
 #include "panel_composition.h"
+#include "debug_model.h"
+#include <optional>
 #include "hivedesk/network_key.h"
 #include "hivedesk/desktop_aux.h"
 #include "hivedesk/adaptive.h"
@@ -59,7 +61,10 @@ struct Shell::Impl {
     HANDLE settings_process{};HWND health_badge{};
     StreamHealth stream_health{};SlowIndicator slow_indicator;ULONGLONG last_stream_tick=0;
     SourceDiagnostics source_diagnostics{};ViewerDiagnostics viewer_diagnostics{};ULONGLONG source_stats_time=0,health_time=0;
+    struct PendingSource {std::string peer;SourceDiagnostics value;uint64_t generation;ULONGLONG received;};
+    std::mutex source_mutex;std::optional<PendingSource> pending_source;
     InputDiagnostics input_diagnostics{};
+    DebugSurface debug_surface;HFONT debug_font{};std::array<DiagnosticPulse,6> debug_pulses{};
     HFONT font{},title_font{},small_font{}; HBRUSH background_brush{},edit_brush{};
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
     ShellConfig config; ShellCallbacks callbacks; std::vector<Peer> peers;
@@ -134,7 +139,7 @@ struct Shell::Impl {
         if(copied){auto& cached=thumbnails[active_id];if(cached)DeleteObject(cached);cached=image;}else DeleteObject(image);
     }
     void reset_remote_cursor() {
-        stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
+        stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;debug_pulses={};slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
         SetCursor(LoadCursorW(nullptr,IDC_ARROW));if(remote_cursor)DestroyCursor(remote_cursor);
         remote_cursor=nullptr;remote_cursor_visible=true;remote_cursor_received=false;remote_pointer_revision=0;remote_pointer={};
     }
@@ -279,51 +284,31 @@ struct Shell::Impl {
         if(row>=visible_tiles()||(p.y-px(12))%tile_stride()>=tile_height())return -1;
         const int index=row+scroll;return index<=static_cast<int>(peers.size())?index:-1;
     }
-    std::wstring debug_text()const {
-        const auto& v=viewer_diagnostics;const auto& d=source_diagnostics;const auto now=GetTickCount64();
-        std::wostringstream out;out<<std::fixed<<std::setprecision(1);
-        out<<L"HiveDesk debug   "<<remote_width<<L" x "<<remote_height<<L"   HEVC 4:4:4\n";
-        if(health_time)out<<L"Target "<<stream_health.target_millihz/1000.0<<L"   Cap "<<stream_health.rate_millihz/1000.0<<L" fps"<<(now-health_time>2000?L"  [STALE]":L"")<<L"\n";
-        else out<<L"Target / cap: waiting for source\n";
-        out<<L"Limit reason: ";if(!stream_health.pressure)out<<L"none";
-        if(stream_health.pressure&PressureEncode)out<<L"encode ";if(stream_health.pressure&PressureDecode)out<<L"decode/render ";if(stream_health.pressure&PressureNetwork)out<<L"send/network ";out<<L"\n";
-        out<<L"FPS   RX "<<v.received_millihz/1000.0<<L"   Decode "<<v.decoded_millihz/1000.0<<L"   Present "<<v.presented_millihz/1000.0<<L"\n";
-        out<<L"Decode "<<v.decode_us/1000.0<<L"   Render "<<v.render_us/1000.0<<L"   Present "<<v.present_us/1000.0<<L" ms\n";
-        out<<L"Service p90 "<<v.service_p90_us/1000.0<<L" ms   Queue "<<v.queue_us/1000.0<<L" ms / "<<v.queue_depth<<L" frames\n";
-        out<<L"RX "<<v.receive_kbps/1000.0<<L" Mbps   Discard "<<v.discarded<<L"   Skip "<<v.skipped<<L"   IDR "<<(v.recovering?L"wait":L"ok")<<L"\n";
-        out<<L"Recovery: gap "<<v.sequence_gaps<<L"   age "<<v.age_expired<<L"   queue "<<v.queue_overflows<<L"\n";
-        if(source_stats_time){
-            out<<L"Source "<<d.encoded_millihz/1000.0<<L" fps   Encode "<<d.encode_us/1000.0<<L" ms\n";
-            if(d.encode_details){
-                out<<L"Color/sync "<<d.color_us/1000.0<<L" ms   NVENC/wait "<<d.nvenc_us/1000.0<<L" ms\n";
-                if(d.encode_age_us==UINT32_MAX)out<<L"Encode sample: waiting\n";
-                else out<<L"Encode sample age "<<d.encode_age_us/1000.0<<L" ms"<<(d.encode_age_us>1000000?L"  [STALE]":L"")<<L"\n";
-            }else out<<L"Update source for Color / NVENC timing\n";
-            out<<L"Capture wait "<<d.capture_wait_us/1000.0<<L" ms   Send wait "<<d.send_wait_us_per_second/1000.0<<L" ms/s\n";
-            out<<L"Transit excess "<<d.network_extra_us/1000.0<<L" ms   Feedback ";if(d.feedback_age_us==UINT32_MAX)out<<L"none";else out<<d.feedback_age_us/1000.0<<L" ms";out<<L"\n";
-            if(d.rate_details){
-                out<<(d.automatic_cbr?L"Auto CBR ":L"CQP baseline ")<<d.target_bitrate_bps/1000000.0<<L" / actual "<<d.actual_bitrate_bps/1000000.0<<L" Mbps\n";
-                out<<L"QP ";if(d.average_qp==UINT32_MAX)out<<L"--";else out<<d.average_qp;
-                out<<(d.quality_limited?L"  [quality floor]":L"")<<L"   "<<wide(d.rate_reason<=4?auto_rate_reason_name(AutoRateReason(d.rate_reason)):"unknown")<<L"   Source drop "<<d.source_discarded<<L"\n";
-            }
-            out<<L"Source stats age "<<(now-source_stats_time)/1000.0<<L" s"<<(now-source_stats_time>2500?L"  [STALE]":L"");
-        }else out<<L"Source detail unavailable / waiting\nUpdate the controlled computer for source detail.";
-        const auto& input=input_diagnostics;
-        if(input.samples&&input.sample_age_us<=2000000){
-            out<<L"\nInput ACK roundtrip p50 / p99 "<<input.ack_roundtrip_p50_us/1000.0<<L" / "<<input.ack_roundtrip_p99_us/1000.0<<L" ms";
-            out<<L"\nDispatch p99 "<<input.capture_to_send_p99_us/1000.0<<L" / Host queue p95 "<<input.host_queue_p95_us/1000.0<<L" / Inject p95 "<<input.inject_p95_us/1000.0<<L" ms";
-        }else out<<L"\nInput ACK roundtrip p50 / p99 -- / -- ms\nInput timing: "<<(input.ready?L"move or type to sample":L"waiting for input channel");
-        out<<L"\nIdle desktop sends fewer frames. Present is not scanout.";return out.str();
+    DebugRows debug_rows() {
+        return build_debug_rows({remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time},debug_pulses);
+    }
+    void paint_health() {
+        RECT rect{};GetClientRect(health_badge,&rect);DebugRows rows;
+        if(reconnecting)rows={{{L"Reconnecting...  Ctrl + Alt + ` to cancel",DiagnosticTone::Warning}}};
+        else if(config.desktop.debug_overlay)rows=debug_rows();
+        else rows={{{(stream_health.pressure&PressureNetwork)?L"Slow connection":L"Device busy",DiagnosticTone::Warning}}};
+        if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
     }
     void timer() {
+        // Latest-state mailbox: no per-report UI messages or stale report FIFO.
+        std::optional<PendingSource> incoming;
+        {std::lock_guard lock(source_mutex);incoming=std::move(pending_source);pending_source.reset();}
+        if(incoming&&incoming->generation==generation.load()&&incoming->peer==active_id&&incoming->value.session==input_session){source_diagnostics=incoming->value;source_stats_time=incoming->received;}
         sample_cursor();
         if(GetTickCount64()-last_stream_tick>=100){last_stream_tick=GetTickCount64();if(callbacks.stream_tick)callbacks.stream_tick();}
         const bool warning=slow_indicator.update(GetTickCount64(),stream_health);
         if(health_badge) {
             if(remote&&(reconnecting||warning||config.desktop.debug_overlay)&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
-                const int width=px(reconnecting?280:config.desktop.debug_overlay?460:136),height=px(!reconnecting&&config.desktop.debug_overlay?390:30);RECT bounds{};GetWindowRect(health_badge,&bounds);
+                if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
+                const int width=px(reconnecting?280:config.desktop.debug_overlay?460:136),height=px(!reconnecting&&config.desktop.debug_overlay?438:30);RECT bounds{};GetWindowRect(health_badge,&bounds);
                 const int inset=px(16);
                 if(!IsWindowVisible(health_badge)||bounds.left!=inset||bounds.top!=inset||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOPMOST,inset,inset,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);InvalidateRect(health_badge,nullptr,FALSE);}
+                if(config.desktop.debug_overlay||reconnecting)InvalidateRect(health_badge,nullptr,FALSE);
             }else if(IsWindowVisible(health_badge))ShowWindow(health_badge,SW_HIDE);
         }
         if(panel_mode&&!thumbnail_fades.empty())InvalidateRect(panel,nullptr,FALSE);
@@ -514,26 +499,9 @@ struct Shell::Impl {
         if(window==s->health_badge) {
             if(message==WM_NCHITTEST)return HTTRANSPARENT;
             if(message==WM_ERASEBKGND)return 1;
-            if(message==WM_PAINT){
-                PAINTSTRUCT ps{};HDC dc=BeginPaint(window,&ps);RECT rect{};GetClientRect(window,&rect);fill(dc,rect,RGB(1,2,3));
-                HBRUSH brush=CreateSolidBrush(RGB(40,40,44));HGDIOBJ old_brush=SelectObject(dc,brush),old_pen=SelectObject(dc,GetStockObject(NULL_PEN));
-                RoundRect(dc,0,0,rect.right,rect.bottom,s->px(12),s->px(12));SelectObject(dc,old_brush);DeleteObject(brush);
-                if(s->reconnecting){
-                    SelectObject(dc,old_pen);RECT label{s->px(12),0,rect.right-s->px(8),rect.bottom};
-                    draw_text(dc,s->small_font,L"Reconnecting...  Ctrl + Alt + ` to cancel",label,RGB(245,245,245));
-                    EndPaint(window,&ps);return 0;
-                }
-                if(s->config.desktop.debug_overlay){
-                    SelectObject(dc,old_pen);auto old_font=SelectObject(dc,s->small_font);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(235,240,248));
-                    RECT text{s->px(14),s->px(12),rect.right-s->px(14),rect.bottom-s->px(12)};const auto value=s->debug_text();
-                    DrawTextW(dc,value.c_str(),int(value.size()),&text,DT_LEFT|DT_NOPREFIX);SelectObject(dc,old_font);EndPaint(window,&ps);return 0;
-                }
-                brush=CreateSolidBrush(RGB(245,180,60));old_brush=SelectObject(dc,brush);Ellipse(dc,s->px(10),s->px(11),s->px(18),s->px(19));SelectObject(dc,old_brush);SelectObject(dc,old_pen);DeleteObject(brush);
-                RECT label{ s->px(26),0,rect.right-s->px(8),rect.bottom};
-                draw_text(dc,s->small_font,(s->stream_health.pressure&PressureNetwork)?L"Slow connection":L"Device busy",label,RGB(245,245,245));
-                EndPaint(window,&ps);return 0;
-            }
+            if(message==WM_PAINT){PAINTSTRUCT ps{};BeginPaint(window,&ps);EndPaint(window,&ps);s->paint_health();return 0;}
         }
+
         if(window==s->owner||(!s->owner&&message==WM_NCCREATE)) {
             if(message==s->taskbar_created&&s->taskbar_created){s->tray_present=false;s->tray();return 0;}
             switch(message) {
@@ -614,6 +582,7 @@ struct Shell::Impl {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);dpi=static_cast<int>(GetDpiForSystem());
         background_brush=CreateSolidBrush(Background);edit_brush=CreateSolidBrush(Card);
         font=CreateFontW(-px(16),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+        debug_font=CreateFontW(-px(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Consolas");
         small_font=CreateFontW(-px(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
         title_font=CreateFontW(-px(24),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
         for(const wchar_t* name:{L"HiveDesk.Owner",L"HiveDesk.Viewer",L"HiveDesk.Switcher",L"HiveDesk.Settings",L"HiveDesk.Health"}) {
@@ -627,7 +596,7 @@ struct Shell::Impl {
         viewer=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
         panel=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Switcher",L"HiveDesk computers",WS_POPUP,0,0,px(200),px(123),nullptr,nullptr,instance,this);
         health_badge=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED|WS_EX_TRANSPARENT,L"HiveDesk.Health",L"Stream status",WS_POPUP,0,0,px(136),px(30),viewer,nullptr,instance,this);
-        if(health_badge)SetLayeredWindowAttributes(health_badge,RGB(1,2,3),255,LWA_COLORKEY);
+
         if(!owner||!viewer||!panel){error="Could not create native desktop windows.";return false;}
         try{composition.create(panel);}catch(const std::exception& e){error=e.what();return false;}system_color();
         // GetAsyncKeyState cannot distinguish remote-injected modifiers. Start
@@ -657,6 +626,7 @@ struct Shell::Impl {
         for(auto& item:thumbnails)DeleteObject(item.second);thumbnails.clear();
         for(auto& item:prior_thumbnails)DeleteObject(item.second);prior_thumbnails.clear();
         reset_remote_cursor();
+        if(debug_font)DeleteObject(debug_font);
         if(font)DeleteObject(font);if(small_font)DeleteObject(small_font);if(title_font)DeleteObject(title_font);if(background_brush)DeleteObject(background_brush);if(edit_brush)DeleteObject(edit_brush);
     }
 };
@@ -712,7 +682,8 @@ void Shell::update_health(const std::string& peer,const StreamHealth& health) {
 }
 bool Shell::debug_enabled()const{return impl_->config.desktop.debug_overlay;}
 void Shell::update_source_diagnostics(const std::string& peer,const SourceDiagnostics& value){
-    const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id)return;s->source_diagnostics=value;s->source_stats_time=GetTickCount64();});
+    const auto generation=impl_->generation.load();const auto received=GetTickCount64();
+    std::lock_guard lock(impl_->source_mutex);impl_->pending_source=Impl::PendingSource{peer,value,generation,received};
 }
 void Shell::update_viewer_diagnostics(const std::string& peer,const ViewerDiagnostics& value){
     const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id)return;s->viewer_diagnostics=value;if(s->config.desktop.debug_overlay)InvalidateRect(s->health_badge,nullptr,FALSE);});

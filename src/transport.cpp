@@ -280,6 +280,13 @@ struct Transport::Impl {
                 if (keyframe) wait_keyframe = false;
                 video = VideoPacket{std::move(b),Clock::now()};
             } else {
+                // HUD reports are latest-state data. Coalesce unsent reports
+                // so faster diagnostics cannot build a stale control backlog.
+                if(channel==0&&!b.empty()&&b[0]==Diagnostics){
+                    for(auto it=control.begin();it!=control.end();++it)if(!it->empty()&&(*it)[0]==Diagnostics){
+                        control_bytes-=it->size();control.erase(it);break;
+                    }
+                }
                 if (control.size() >= (channel==2?128u:2048u) || control_bytes + b.size() > (channel==2?16384u:4*1024*1024u)) return false;
                 control_bytes += b.size(); control.push_back(std::move(b));
             }
@@ -1187,6 +1194,12 @@ bool Transport::self_test(std::string& result) {
            observed.receiver_queue_us!=10||observed.feedback_sequence!=73||observed.source_discarded!=5||observed.sequence_gaps!=2||observed.age_expired!=3||observed.queue_overflows!=4){
             result="Automatic-rate source extension roundtrip failed";return false;
         }
+        const auto before_reports=control->control.size();
+        for(int i=0;i<1000;++i){d.encode_us=2300+i;if(!sender.send_diagnostics("rate-peer",d)){result="HUD diagnostic enqueue failed";return false;}}
+        size_t actual_bytes=0;for(const auto& packet:control->control)actual_bytes+=packet.size();
+        if(control->control.size()!=before_reports||actual_bytes!=control->control_bytes||control->control.front()!=full_feedback||
+           !owner.dispatch(*control,control->control.back())||observed.encode_us!=3299){result="HUD reports accumulated or damaged unrelated control messages";return false;}
+        d.encode_us=2300;sender.send_diagnostics("rate-peer",d);
         const auto full_diagnostics=control->control.back();truncated=full_diagnostics;truncated.pop_back();trailing=full_diagnostics;trailing.push_back(0);
         if(owner.dispatch(*control,truncated)||owner.dispatch(*control,trailing)){result="Malformed automatic-rate diagnostics accepted";return false;}
         // Old peers receive exactly their previous layouts; new peers also
@@ -1366,7 +1379,11 @@ bool Transport::self_test(std::string& result) {
     if (!wrong.start(wcfg,{},error)) { result = "Wrong-key test setup failed."; return false; }
     if (wrong.connect("127.0.0.1",b.impl_->cfg.port,id,error) || !wrong.peers().empty()) { result = "Wrong Network Key was accepted."; return false; }
     CursorState cursor;cursor.x=12345;cursor.y=54321;cursor.position_revision=77;cursor.width=2;cursor.height=1;cursor.hotspot_x=1;cursor.mask=Bytes(8,0xff);
-    bool ok=a.request_snapshot("test-b",901)&&b.send_cursor("test-a",cursor)&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000})&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000,500,734,10000,true});
+    bool ok=a.request_snapshot("test-b",901)&&b.send_cursor("test-a",cursor)&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000});
+    // Check both wire formats after delivery. Unsent diagnostic states now
+    // intentionally coalesce; the separate queue test verifies that behavior.
+    {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_diagnostics;})&&ok;}
+    ok=b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000,500,734,10000,true})&&ok;
     {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_snapshot&&got_cursor&&got_diagnostics&&got_encode_diagnostics;})&&ok;
         ok=ok&&state==0&&snapshot_count==1;}
     cursor.width=cursor.height=cursor.hotspot_x=0;cursor.mask.clear();cursor.visible=false;

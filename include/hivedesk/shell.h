@@ -28,6 +28,7 @@ struct ShellCallbacks {
     std::function<void()> panel_opened;
     std::function<bool(const std::string&, const CursorState&)> cursor_changed;
     std::function<void()> stream_tick;
+    std::function<void()> debug_tick;
     std::function<bool(const std::wstring&,const DesktopPreferences&)> save_preferences;
 };
 class Shell {

@@ -1,4 +1,5 @@
 #include "hivedesk/media.h"
+#include "hivedesk/diagnostic_window.h"
 #include "hivedesk/config.h"
 #include "hivedesk/adaptive.h"
 #include "hivedesk/auto_rate.h"
@@ -845,6 +846,7 @@ struct MediaViewer::Impl {
     ViewerDiagnostics diagnostics{};
     uint64_t sample_since=0,received_count=0,decoded_count=0,presented_count=0,received_bytes=0;
     uint64_t receive_sample_at=0;
+    DiagnosticWindow<4> live_window;std::array<uint64_t,4> live_totals{};
     void sync_queue() {
         feedback.recover=frames.recovering();diagnostics.discarded=frames.discarded();
         if(stopping)return;
@@ -876,6 +878,7 @@ bool MediaViewer::open(HWND window, std::string& error) {
     try { renderer = std::make_unique<Renderer>(window); }
     catch (const std::exception& problem) { error = problem.what(); return false; }
     { std::lock_guard guard(impl_->mutex); impl_->stopping = false; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
+        impl_->live_window={};impl_->live_totals={};impl_->live_window.sample(now_us(),{});
         impl_->feedback={};impl_->last_arrival=0;impl_->service_samples.clear();impl_->present_samples.clear();impl_->diagnostics={};impl_->sample_since=now_us();impl_->receive_sample_at=0;impl_->received_count=impl_->decoded_count=impl_->presented_count=impl_->received_bytes=0;}
     std::promise<std::string> initialized; auto ready = initialized.get_future();
     impl_->worker = std::thread([this, renderer = std::move(renderer), initialized = std::move(initialized)]() mutable {
@@ -915,7 +918,7 @@ bool MediaViewer::open(HWND window, std::string& error) {
                 impl_->status = text.str(); impl_->displayed = true;
                 impl_->diagnostics.render_us=render_us;impl_->diagnostics.present_us=present_us;
                 impl_->diagnostics.convert_us=renderer->convert_us();impl_->diagnostics.draw_us=renderer->draw_us();
-                if(presented){++impl_->presented_count;impl_->present_samples.presented(now_us());}else if(!renderer->present_pending())++impl_->diagnostics.skipped;
+                if(presented){++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}else if(!renderer->present_pending())++impl_->diagnostics.skipped;
             }, renderer->adapter());
             initialized.set_value({}); announced = true;
             while (true) {
@@ -943,7 +946,7 @@ bool MediaViewer::open(HWND window, std::string& error) {
                 if(retry){
                     uint32_t present_us=0;const bool presented=renderer->retry_present([&]{return eligible();},&present_us);
                     std::lock_guard guard(impl_->mutex);impl_->diagnostics.present_us=present_us;
-                    if(presented){++impl_->presented_count;impl_->present_samples.presented(now_us());if(active)impl_->frames.mark_ready(*active,now_us());}
+                    if(presented){++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());if(active)impl_->frames.mark_ready(*active,now_us());}
                     else if(!renderer->present_pending())++impl_->diagnostics.skipped;
                     // Still busy: retire these pixels before decoding newer
                     // work. Never retry an older picture after its replacement.
@@ -956,7 +959,7 @@ bool MediaViewer::open(HWND window, std::string& error) {
                 // with zero display delay, so active describes this picture.
                 decoder.feed(active->frame);
                 const auto elapsed=now_us()-began;
-                {std::lock_guard guard(impl_->mutex);++impl_->decoded_count;impl_->diagnostics.decode_us=uint32_t(std::min<uint64_t>(10000000,elapsed-std::min(elapsed,callback_us)));
+                {std::lock_guard guard(impl_->mutex);++impl_->decoded_count;++impl_->live_totals[1];impl_->diagnostics.decode_us=uint32_t(std::min<uint64_t>(10000000,elapsed-std::min(elapsed,callback_us)));
                     impl_->diagnostics.nvdec_map_us=decoder.map_us();
                     if(!active->frame.keyframe)impl_->service_samples.add(now_us(),uint32_t(std::min<uint64_t>(1000000,elapsed)));}
             }
@@ -972,7 +975,7 @@ void MediaViewer::submit(EncodedFrame frame) {
     if (impl_->stopping) return;
     if(!impl_->frames.accepts_session(frame.session))return;
     const auto now=now_us();impl_->feedback.session=frame.session;impl_->feedback.capture_time_us=frame.capture_time_us;impl_->last_arrival=now;
-    impl_->diagnostics.session=frame.session;++impl_->received_count;impl_->received_bytes+=frame.data.size();
+    impl_->diagnostics.session=frame.session;++impl_->received_count;++impl_->live_totals[0];impl_->live_totals[3]+=frame.data.size();impl_->received_bytes+=frame.data.size();
     ++impl_->feedback.received_frames;impl_->feedback.received_bytes+=frame.data.size();
     const bool queued=impl_->frames.push(std::move(frame),now);impl_->sync_queue();
     if(queued||impl_->frames.recovery_pending())impl_->changed.notify_one();
@@ -998,11 +1001,17 @@ StreamFeedback MediaViewer::feedback() const {
     return report;
 }
 ViewerDiagnostics MediaViewer::diagnostics() const {
-    const auto report=feedback();std::lock_guard guard(impl_->mutex);auto result=impl_->diagnostics;
-    result.service_p90_us=report.service_us;result.queue_us=report.queue_us;result.queue_depth=uint32_t(impl_->frames.size());result.recovering=report.recover;
-    const auto now=now_us();result.present_gap_p95_us=impl_->present_samples.p95(now);result.present_gap_max_us=impl_->present_samples.maximum(now);
-    result.service_sample_age_us=report.service_sample_age_us;result.receive_sample_age_us=report.receive_sample_age_us;result.transit_extra_us=report.transit_extra_us;
-    result.sequence_gaps=report.sequence_gaps;result.age_expired=report.age_expired;result.queue_overflows=report.queue_overflows;return result;
+    std::lock_guard guard(impl_->mutex);if(impl_->stopping)return {};
+    auto result=impl_->diagnostics;const auto now=now_us();
+    const auto rates=impl_->live_window.sample(now,impl_->live_totals);
+    result.received_millihz=rates.rate(0,1000000000,4000000);result.decoded_millihz=rates.rate(1,1000000000,4000000);
+    result.presented_millihz=rates.rate(2,1000000000,4000000);result.receive_kbps=rates.rate(3,8000);
+    result.service_p90_us=impl_->service_samples.p90(now);result.service_sample_age_us=impl_->service_samples.sample_age(now);
+    result.queue_us=uint32_t(std::min<uint64_t>(UINT32_MAX,impl_->frames.queue_age(now)));result.queue_depth=uint32_t(impl_->frames.size());result.recovering=impl_->frames.recovering();
+    result.present_gap_p95_us=impl_->present_samples.p95(now);result.present_gap_max_us=impl_->present_samples.maximum(now);
+    result.receive_sample_age_us=impl_->last_arrival?uint32_t(std::min<uint64_t>(UINT32_MAX,now-impl_->last_arrival)):UINT32_MAX;
+    result.transit_extra_us=impl_->frames.transit_extra_us();result.sequence_gaps=impl_->frames.sequence_gaps();
+    result.age_expired=impl_->frames.age_expired();result.queue_overflows=impl_->frames.queue_overflows();return result;
 }
 
 static bool codec_self_test(std::string& report,const StreamSettings& settings) {
