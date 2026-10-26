@@ -1,0 +1,1441 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mstcpip.h>
+#include <windows.h>
+#include <bcrypt.h>
+#include <iphlpapi.h>
+#include "hivedesk/transport.h"
+#include "hivedesk/network_key.h"
+#include "rate_wire.h"
+#include "video_send_window.h"
+#include "input_send_window.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <thread>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+namespace hive { namespace {
+using Bytes = std::vector<uint8_t>;
+using Key = std::array<uint8_t, 32>;
+using Clock = std::chrono::steady_clock;
+uint64_t transport_us(Clock::time_point point=Clock::now()){return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(point.time_since_epoch()).count());}
+constexpr uint32_t kMaxFrame = 16 * 1024 * 1024;
+constexpr uint32_t kMaxClipboard = 1024 * 1024;
+constexpr uint32_t kMaxPacket = kMaxFrame + 64;
+constexpr uint16_t kDiscoveryPort = 47979;
+constexpr size_t kMaxConnections = 128;
+// These are latency budgets, not extra playback buffering. A stalled TCP write
+// cannot be skipped midway: abort that connection rather than flush old video.
+constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
+constexpr auto kVideoWriteBudget = std::chrono::milliseconds(150);
+enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
+    AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20 };
+constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
+
+void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
+void u32(Bytes& b, uint32_t n) { for (int i = 3; i >= 0; --i) b.push_back(uint8_t(n >> (i * 8))); }
+void u64(Bytes& b, uint64_t n) { for (int i = 7; i >= 0; --i) b.push_back(uint8_t(n >> (i * 8))); }
+void str(Bytes& b, const std::string& s) { u16(b, uint16_t(s.size())); b.insert(b.end(), s.begin(), s.end()); }
+struct Reader {
+    const Bytes& b; size_t at = 0; bool good = true;
+    uint8_t byte() { if (at >= b.size()) { good = false; return 0; } return b[at++]; }
+    uint16_t word() { uint16_t a = byte(); return uint16_t((a << 8) | byte()); }
+    uint32_t dword() { uint32_t n = 0; for (int i = 0; i < 4; ++i) n = (n << 8) | byte(); return n; }
+    uint64_t qword() { uint64_t n = 0; for (int i = 0; i < 8; ++i) n = (n << 8) | byte(); return n; }
+    std::string string(size_t max) {
+        auto n = word(); if (!good || n > max || at + n > b.size()) { good = false; return {}; }
+        std::string s(reinterpret_cast<const char*>(b.data() + at), n); at += n; return s;
+    }
+    bool end() const { return good && at == b.size(); }
+};
+bool random_bytes(uint8_t* p, size_t n) { return BCryptGenRandom(nullptr, p, ULONG(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0; }
+bool decode_key(const std::string& s, Key& key) {
+    if (s.size() != 64) return false;
+    auto hex = [](char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; };
+    for (size_t i = 0; i < key.size(); ++i) { int a = hex(s[2*i]), b = hex(s[2*i+1]); if (a < 0 || b < 0) return false; key[i] = uint8_t(a*16+b); }
+    return true;
+}
+bool derive_network_key(const std::string& text, Key& key) {
+    if (!valid_network_key(text)) return false;
+    // Preserve existing 32-byte keys exactly for older installations.
+    if (decode_key(text,key)) return true;
+    // A stable application salt lets every peer derive the same network key.
+    // Derivation happens once at network startup, never on the frame/input path.
+    constexpr char salt[] = "HiveDesk.NetworkKey.v1";
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,BCRYPT_ALG_HANDLE_HMAC_FLAG)<0) return false;
+    const bool ok=BCryptDeriveKeyPBKDF2(algorithm,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(text.data())),ULONG(text.size()),
+        reinterpret_cast<PUCHAR>(const_cast<char*>(salt)),sizeof(salt)-1,100000,key.data(),ULONG(key.size()),0)>=0;
+    BCryptCloseAlgorithmProvider(algorithm,0);return ok;
+}
+bool hmac(const Key& key, const Bytes& input, Key& result) {
+    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE hash = nullptr;
+    bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) >= 0;
+    if (ok) ok = BCryptCreateHash(alg, &hash, nullptr, 0, const_cast<PUCHAR>(key.data()), ULONG(key.size()), 0) >= 0;
+    if (ok) ok = BCryptHashData(hash, const_cast<PUCHAR>(input.data()), ULONG(input.size()), 0) >= 0;
+    if (ok) ok = BCryptFinishHash(hash, result.data(), ULONG(result.size()), 0) >= 0;
+    if (hash) BCryptDestroyHash(hash); if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+bool equal_key(const Key& a, const Key& b) { uint8_t diff = 0; for (size_t i = 0; i < a.size(); ++i) diff |= a[i] ^ b[i]; return diff == 0; }
+struct Agreement {
+    BCRYPT_ALG_HANDLE algorithm{};BCRYPT_KEY_HANDLE key{};
+    ~Agreement(){if(key)BCryptDestroyKey(key);if(algorithm)BCryptCloseAlgorithmProvider(algorithm,0);}
+    bool generate(Bytes& public_key){
+        ULONG size=0;
+        if(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_ECDH_P256_ALGORITHM,nullptr,0)<0||
+            BCryptGenerateKeyPair(algorithm,&key,256,0)<0||BCryptFinalizeKeyPair(key,0)<0)return false;
+        public_key.resize(sizeof(BCRYPT_ECCKEY_BLOB)+64);
+        return BCryptExportKey(key,nullptr,BCRYPT_ECCPUBLIC_BLOB,public_key.data(),ULONG(public_key.size()),&size,0)>=0&&size==public_key.size();
+    }
+    bool derive(const Bytes& public_key,Key& shared){
+        if(public_key.size()!=sizeof(BCRYPT_ECCKEY_BLOB)+64)return false;
+        BCRYPT_ECCKEY_BLOB header{};memcpy(&header,public_key.data(),sizeof(header));
+        if(header.dwMagic!=BCRYPT_ECDH_PUBLIC_P256_MAGIC||header.cbKey!=32)return false;
+        BCRYPT_KEY_HANDLE peer{};BCRYPT_SECRET_HANDLE secret{};ULONG size=0;
+        BCryptBuffer buffer{sizeof(BCRYPT_SHA256_ALGORITHM),KDF_HASH_ALGORITHM,const_cast<wchar_t*>(BCRYPT_SHA256_ALGORITHM)};
+        BCryptBufferDesc parameters{BCRYPTBUFFER_VERSION,1,&buffer};
+        bool ok=BCryptImportKeyPair(algorithm,nullptr,BCRYPT_ECCPUBLIC_BLOB,&peer,const_cast<PUCHAR>(public_key.data()),ULONG(public_key.size()),0)>=0&&
+            BCryptSecretAgreement(key,peer,&secret,0)>=0&&BCryptDeriveKey(secret,BCRYPT_KDF_HASH,&parameters,shared.data(),ULONG(shared.size()),&size,0)>=0&&size==shared.size();
+        if(secret)BCryptDestroySecret(secret);if(peer)BCryptDestroyKey(peer);return ok;
+    }
+};
+struct LanAddress {uint32_t address,mask;};
+std::vector<LanAddress> lan_addresses(){
+    ULONG size=16384;std::vector<uint8_t> storage(size);
+    ULONG result=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data()),&size);
+    if(result==ERROR_BUFFER_OVERFLOW){storage.resize(size);result=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data()),&size);}
+    std::vector<LanAddress> addresses;if(result!=NO_ERROR)return addresses;
+    for(auto* adapter=reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data());adapter;adapter=adapter->Next){
+        if(adapter->OperStatus!=IfOperStatusUp||adapter->IfType==IF_TYPE_SOFTWARE_LOOPBACK)continue;
+        for(auto* unicast=adapter->FirstUnicastAddress;unicast;unicast=unicast->Next){
+            if(!unicast->Address.lpSockaddr||unicast->Address.lpSockaddr->sa_family!=AF_INET||unicast->OnLinkPrefixLength==0||unicast->OnLinkPrefixLength>32)continue;
+            const auto ip=ntohl(reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr)->sin_addr.s_addr);
+            addresses.push_back({ip,0xffffffffu<<(32-unicast->OnLinkPrefixLength)});
+        }
+    }return addresses;
+}
+bool on_link(const std::string& address){
+    IN_ADDR parsed{};if(inet_pton(AF_INET,address.c_str(),&parsed)!=1)return false;
+    const auto ip=ntohl(parsed.s_addr);if((ip>>24)==127)return true;
+    for(const auto& local:lan_addresses())if((local.address&local.mask)==(ip&local.mask))return true;
+    return false;
+}
+bool text_ok(const std::string& s, size_t limit) { return !s.empty() && s.size() <= limit && s.find('\0') == std::string::npos; }
+bool utf16_ok(const std::wstring& s) {
+    if (s.size() > kMaxClipboard / 2) return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        auto c = uint16_t(s[i]); if (!c) return false;
+        if (c >= 0xd800 && c <= 0xdbff) { if (++i == s.size()) return false; c = uint16_t(s[i]); if (c < 0xdc00 || c > 0xdfff) return false; }
+        else if (c >= 0xdc00 && c <= 0xdfff) return false;
+    }
+    return true;
+}
+bool valid_input(const InputEvent& e) {
+    switch (e.kind) {
+    case InputKind::Key: return e.a >= 0 && e.a <= 255 && (e.b == 0 || e.b == 1) && (e.c == 0 || e.c == 1);
+    case InputKind::Absolute: return e.a >= 0 && e.a <= 65535 && e.b >= 0 && e.b <= 65535;
+    case InputKind::Relative: return true;
+    case InputKind::Button: return e.a >= 1 && e.a <= 5 && (e.b == 0 || e.b == 1);
+    case InputKind::Wheel: return e.b == 0 || e.b == 1;
+    case InputKind::ReleaseAll: return true;
+    default: return false;
+    }
+}
+Bytes input_bytes(const InputPacket& packet) {
+    Bytes b{InputData};u64(b,packet.session);u64(b,packet.sequence);u64(b,packet.capture_time_us);
+    u32(b,uint32_t(packet.event.kind));u32(b,uint32_t(packet.event.a));u32(b,uint32_t(packet.event.b));u32(b,uint32_t(packet.event.c));return b;
+}
+bool send_all(SOCKET s, const uint8_t* p, size_t n) {
+    while (n) { int sent = ::send(s, reinterpret_cast<const char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (sent <= 0) return false; p += sent; n -= sent; }
+    return true;
+}
+bool recv_all(SOCKET s, uint8_t* p, size_t n) {
+    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (received <= 0) return false; p += received; n -= received; }
+    return true;
+}
+bool send_blob(SOCKET s, const Bytes& b) { Bytes head; u32(head, uint32_t(b.size())); return send_all(s, head.data(), head.size()) && send_all(s, b.data(), b.size()); }
+bool recv_blob(SOCKET s, Bytes& b, uint32_t max) { Bytes head(4); if (!recv_all(s, head.data(), 4)) return false; Reader r{head}; auto n = r.dword(); if (!n || n > max) return false; b.resize(n); return recv_all(s, b.data(), n); }
+void socket_options(SOCKET s) { BOOL yes = TRUE; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof(yes)); DWORD timeout = 3000; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)); setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)); }
+
+struct Cipher {
+    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_KEY_HANDLE key = nullptr;
+    ~Cipher() { if (key) BCryptDestroyKey(key); if (alg) BCryptCloseAlgorithmProvider(alg, 0); }
+    bool init(const Key& material) {
+        return BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) >= 0 &&
+            BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)), sizeof(BCRYPT_CHAIN_MODE_GCM), 0) >= 0 &&
+            BCryptGenerateSymmetricKey(alg, &key, nullptr, 0, const_cast<PUCHAR>(material.data()), ULONG(material.size()), 0) >= 0;
+    }
+    bool crypt(bool encrypt, const Bytes& aad, const Bytes& input, Bytes& output, std::array<uint8_t,16>& tag) {
+        // Each direction has a different derived key. Counter is authenticated and cannot repeat.
+        std::array<uint8_t,12> nonce{}; std::copy(aad.end()-8, aad.end(), nonce.begin()+4);
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth; BCRYPT_INIT_AUTH_MODE_INFO(auth);
+        auth.pbNonce = nonce.data(); auth.cbNonce = ULONG(nonce.size()); auth.pbAuthData = const_cast<PUCHAR>(aad.data()); auth.cbAuthData = ULONG(aad.size()); auth.pbTag = tag.data(); auth.cbTag = ULONG(tag.size());
+        output.resize(input.size()); ULONG done = 0;
+        NTSTATUS status = encrypt ? BCryptEncrypt(key, const_cast<PUCHAR>(input.data()), ULONG(input.size()), &auth, nullptr, 0, output.data(), ULONG(output.size()), &done, 0)
+                                  : BCryptDecrypt(key, const_cast<PUCHAR>(input.data()), ULONG(input.size()), &auth, nullptr, 0, output.data(), ULONG(output.size()), &done, 0);
+        return status >= 0 && done == input.size();
+    }
+};
+
+Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
+    Bytes b{'H','I','V','E',uint8_t(cfg.automatic_lan?2:1),channel}; str(b, cfg.device_id); str(b, cfg.device_name); u16(b, cfg.port);
+    size_t at = b.size(); b.resize(at+32); if (!random_bytes(b.data()+at, 32)) return {};
+    // Version-one peers treat this as an opaque challenge. A tagged capability
+    // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
+    // The complete challenge (including capabilities) is authenticated by HMAC.
+    std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
+    b[at+8]=b[at+9]=b[at+10]=0;b[at+11]=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput;return b;
+}
+bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
+    Reader r{b}; if (r.byte() != 'H' || r.byte() != 'I' || r.byte() != 'V' || r.byte() != 'E' || r.byte() != (automatic?2:1)) return false;
+    channel = r.byte(); peer.id = r.string(128); peer.name = r.string(256); peer.port = r.word();
+    if(!r.good || channel>2 || !peer.port || !text_ok(peer.id,128) || !text_ok(peer.name,256) || b.size()-r.at!=32)return false;
+    if(std::equal(feature_marker.begin(),feature_marker.end(),b.begin()+r.at)){
+        r.at+=feature_marker.size();peer.features=r.dword();
+    }
+    if(channel==2&&!(peer.features&FeatureDedicatedInput))return false;
+    return true;
+}
+bool signed_part(const Key& key, const Bytes& transcript, uint8_t label, Key& signature) { Bytes b = transcript; b.push_back(label); return hmac(key,b,signature); }
+}
+
+struct Transport::Impl {
+    struct Conn {
+        Impl* owner; std::atomic<SOCKET> socket{INVALID_SOCKET}; Peer peer; std::atomic<uint8_t> channel{0};
+        std::atomic<bool> ready{false}, closed{false}, reader_done{false}, writer_done{true}; Cipher tx, rx; uint64_t tx_seq = 0, rx_seq = 0;
+        Key confirmation{},pair_key{};uint64_t token=0,bound_control_token=0;
+        std::thread reader, writer; std::mutex queue_mutex, socket_mutex; std::condition_variable queue_cv;
+        std::deque<Bytes> control; size_t control_bytes = 0; bool control_inflight = false;
+        struct VideoPacket { Bytes payload; Clock::time_point queued_at; };
+        std::optional<VideoPacket> video; bool wait_keyframe = false;
+        WSAEVENT send_complete = WSA_INVALID_EVENT; bool video_socket_configured = false;
+        VideoSendWindow video_send;
+        InputSendWindow input_send;
+        uint64_t input_receive_session=0,input_receive_sequence=0;
+        bool input_enabled=false,input_ending=false;
+        explicit Conn(Impl* p, SOCKET s) : owner(p), socket(s) {}
+        ~Conn() { close(); if (reader.joinable()) reader.join(); if (writer.joinable()) writer.join(); if(send_complete!=WSA_INVALID_EVENT)WSACloseEvent(send_complete); SecureZeroMemory(pair_key.data(),pair_key.size()); }
+        void close(bool abortive = false) {
+            // Publish while holding the same mutex used by queue_cv.wait(). An
+            // atomic flag alone cannot prevent a notify-before-wait lost wake.
+            {std::lock_guard lock(queue_mutex);closed = true; ready = false;}
+            // Do not let a socket handle be recycled while a new WSASend or its
+            // result query is using it. Pending I/O is canceled by closesocket.
+            {std::lock_guard lock(socket_mutex);SOCKET s = socket.exchange(INVALID_SOCKET);
+                if (s != INVALID_SOCKET) {
+                    // Video has no graceful-drain requirement: once its pair
+                    // closes, flushing buffered old desktop frames is useless.
+                    if(abortive||channel==1){linger discard{1,0};setsockopt(s,SOL_SOCKET,SO_LINGER,reinterpret_cast<const char*>(&discard),sizeof(discard));}
+                    else shutdown(s, SD_BOTH);
+                    closesocket(s);
+                }
+            }
+            queue_cv.notify_all();
+        }
+        void notify_ready() {
+            if(owner->callbacks.frame_ready){try{owner->callbacks.frame_ready(peer.id);}catch(...){owner->status("Video readiness callback failed.");}}
+        }
+        void request_fresh_frame() {
+            if(owner->callbacks.request_keyframe){try{owner->callbacks.request_keyframe(peer.id);}catch(...){owner->status("Video keyframe callback failed.");}}
+        }
+        void revoke_input(uint64_t session) {
+            {std::lock_guard lock(queue_mutex);if(input_send.session()!=session)return;
+                input_enabled=false;input_ending=true;input_send.finish();}
+            queue_cv.notify_all();
+        }
+        bool enqueue(Bytes b, bool keyframe = false) {
+            if (!ready || closed) return false;
+            std::unique_lock lock(queue_mutex);
+            if (channel == 1) {
+                if (wait_keyframe && !keyframe) return false;
+                if (video) {
+                    if (!keyframe) {
+                        // Discard the whole unsent tail, never a P-frame while
+                        // allowing its dependents to continue. The false return
+                        // asks the producer for an IDR; freeing the queue wakes it.
+                        video.reset(); wait_keyframe = true;lock.unlock();notify_ready();return false;
+                    }
+                    // A fresh IDR can replace a queued frame without referencing it.
+                }
+                if (keyframe) wait_keyframe = false;
+                video = VideoPacket{std::move(b),Clock::now()};
+            } else {
+                if (control.size() >= (channel==2?128u:2048u) || control_bytes + b.size() > (channel==2?16384u:4*1024*1024u)) return false;
+                control_bytes += b.size(); control.push_back(std::move(b));
+            }
+            queue_cv.notify_one(); return true;
+        }
+        // Caller holds queue_mutex. A missing result means the unsent chain was
+        // invalidated; the caller must ask for an IDR after releasing the lock.
+        std::optional<Bytes> take_video(Clock::time_point now,Clock::time_point* queued_at=nullptr) {
+            auto queued=std::move(*video);video.reset();
+            if(queued_at)*queued_at=queued.queued_at;
+            if(now-queued.queued_at>=kVideoQueueAge){wait_keyframe=true;video_send.expired();return {};}
+            return std::move(queued.payload);
+        }
+        bool write_video(Bytes& head,Bytes& cipher,std::array<uint8_t,16>& tag,Clock::time_point deadline,VideoSendWindow::Attempt& attempt,uint64_t input_session=0,uint64_t input_sequence=0) {
+            if(send_complete==WSA_INVALID_EVENT){send_complete=WSACreateEvent();if(send_complete==WSA_INVALID_EVENT)return false;}
+            WSAOVERLAPPED operation{};operation.hEvent=send_complete;
+            std::array<WSABUF,3> buffers{{{ULONG(head.size()),reinterpret_cast<char*>(head.data())},
+                {ULONG(cipher.size()),reinterpret_cast<char*>(cipher.data())},{ULONG(tag.size()),reinterpret_cast<char*>(tag.data())}}};
+            const DWORD total=DWORD(head.size()+cipher.size()+tag.size());
+            SOCKET s=INVALID_SOCKET;int submitted=SOCKET_ERROR,error=0;
+            {
+                std::lock_guard lock(socket_mutex);s=socket.load();if(closed||s==INVALID_SOCKET)return false;
+                if(channel==1&&!video_socket_configured){
+                    // Microsoft recommends zero SO_SNDBUF for streaming with
+                    // overlapped I/O. This exposes backpressure instead of hiding
+                    // a run of old frames in the kernel's send buffer. Control
+                    // traffic retains its normal socket options and buffering.
+                    const int zero=0;if(setsockopt(s,SOL_SOCKET,SO_SNDBUF,reinterpret_cast<const char*>(&zero),sizeof(zero)))return false;
+                    video_socket_configured=true;
+                }
+                if(Clock::now()>=deadline)return false;
+                WSAResetEvent(send_complete);
+                // One operation owns the complete encrypted packet (header,
+                // ciphertext and tag); no three-send delayed-ACK interaction.
+                attempt.submitted_at=transport_us();attempt.submitted=true;
+                if(channel==2&&input_sequence){std::lock_guard queue_lock(queue_mutex);const auto now=input_now_us();
+                    if(input_send.expired(now))return false;input_send.submitted(input_session,input_sequence,now);}
+                submitted=WSASend(s,buffers.data(),DWORD(buffers.size()),nullptr,0,&operation,nullptr);
+                if(submitted==SOCKET_ERROR)error=WSAGetLastError();
+            }
+            if(submitted==SOCKET_ERROR&&error!=WSA_IO_PENDING)return false;
+            const auto remaining=deadline-Clock::now();
+            const DWORD timeout=remaining>Clock::duration::zero()?DWORD(std::chrono::ceil<std::chrono::milliseconds>(remaining).count()):0;
+            if(WaitForSingleObject(send_complete,timeout)!=WAIT_OBJECT_0){
+                close(true);
+                // closesocket only initiates cancellation. The event must finish
+                // before stack OVERLAPPED / ciphertext / WSABUF storage is freed.
+                WaitForSingleObject(send_complete,INFINITE);
+                owner->status(channel==2?"Input send exceeded 100 ms; releasing remote control.":"Video send exceeded 150 ms; reconnecting for a fresh desktop.");
+                return false;
+            }
+            DWORD sent=0,flags=0;
+            {std::lock_guard lock(socket_mutex);
+                if(closed||socket.load()!=s)return false;
+                if(!WSAGetOverlappedResult(s,&operation,&sent,FALSE,&flags))return false;
+            }
+            // A partial completion must never be followed by a new packet on
+            // this byte stream; write_loop aborts the pair on any failure.
+            return sent==total&&Clock::now()<=deadline;
+        }
+        bool write_packet(const Bytes& b,Clock::time_point queued_at={},Clock::time_point dequeued_at={}) {
+            const auto deadline=Clock::now()+(channel==2?std::chrono::milliseconds(100):kVideoWriteBudget);
+            VideoSendWindow::Attempt attempt;attempt.queued_at=transport_us(queued_at);attempt.dequeued_at=transport_us(dequeued_at);
+            const bool video_channel=channel==1;
+            const auto finish=[&](bool sent){if(video_channel){attempt.finished_at=transport_us();attempt.completed=sent;video_send.record(attempt);}return sent;};
+            if (tx_seq == UINT64_MAX) return finish(false);
+            Bytes head; u32(head,uint32_t(b.size())); u64(head,++tx_seq);
+            Bytes cipher; std::array<uint8_t,16> tag{};const auto encrypt_begin=video_channel?transport_us():0;
+            const bool encrypted=tx.crypt(true,head,b,cipher,tag);
+            if(video_channel)attempt.encrypt_us=uint32_t(std::min<uint64_t>(UINT32_MAX,transport_us()-encrypt_begin));
+            if(!encrypted)return finish(false);
+            attempt.wire_bytes=head.size()+cipher.size()+tag.size();
+            if(video_channel||channel==2){
+                uint64_t input_session=0,input_sequence=0;
+                if(channel==2&&!b.empty()&&b[0]==InputData){Reader packet{b};packet.byte();input_session=packet.qword();input_sequence=packet.qword();}
+                return finish(write_video(head,cipher,tag,deadline,attempt,input_session,input_sequence));
+            }
+            SOCKET s = socket.load(); return send_all(s,head.data(),head.size()) && send_all(s,cipher.data(),cipher.size()) && send_all(s,tag.data(),tag.size());
+        }
+        bool read_packet(Bytes& b) {
+            SOCKET s = socket.load(); Bytes head(12); if (!recv_all(s,head.data(),head.size())) return false;
+            Reader r{head}; uint32_t n = r.dword(); uint64_t seq = r.qword();
+            if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:kMaxClipboard + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
+            Bytes encrypted(n); std::array<uint8_t,16> tag{};
+            if (!recv_all(s,encrypted.data(),encrypted.size()) || !recv_all(s,tag.data(),tag.size()) || !rx.crypt(false,head,encrypted,b,tag)) return false;
+            rx_seq = seq; return true;
+        }
+        void write_loop() {
+            if(channel==2)SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+            while (!closed && owner->running) {
+                Bytes b;bool expired=false,input_stalled=false;Clock::time_point queued_at{},dequeued_at{}; {
+                    std::unique_lock lock(queue_mutex);
+                    const auto writable=[&] {return closed||!owner->running||video||!control.empty()||(channel==2&&input_enabled&&input_send.writable());};
+                    if(channel==2) {
+                        const auto deadline=input_send.next_deadline();
+                        if(deadline)queue_cv.wait_until(lock,Clock::time_point(std::chrono::microseconds(deadline)),writable);
+                        else queue_cv.wait(lock,writable);
+                        input_stalled=input_send.expired(input_now_us());
+                    } else queue_cv.wait(lock,writable);
+                    if (closed || !owner->running) break;
+                    if(input_stalled){lock.unlock();owner->status("Input completion exceeded 100 ms; releasing remote control.");close(true);break;}
+                    if(!writable())continue;
+                    if (channel == 1) {dequeued_at=Clock::now();auto packet=take_video(dequeued_at,&queued_at);if(packet)b=std::move(*packet);else expired=true; }
+                    else if(channel==2&&control.empty()) {b=input_bytes(input_send.take(input_now_us()));control_inflight=true;}
+                    else { b = std::move(control.front()); control.pop_front(); control_bytes -= b.size(); control_inflight = true; }
+                }
+                if(channel==1){
+                    // Request recovery before granting capture credit, so the
+                    // next useful submission can already be an IDR.
+                    if(expired)request_fresh_frame();
+                    notify_ready();
+                }
+                if(expired)continue;
+                bool sent = write_packet(b,queued_at,dequeued_at);
+                if (channel!=1) { std::lock_guard lock(queue_mutex); control_inflight = false; queue_cv.notify_all(); }
+                if (!sent) {if(channel!=0)close(true);break;}
+            }
+            close();
+            // A blocked receive callback must not delay pairing teardown after
+            // a writer deadline. ended() is idempotent and invokes callbacks
+            // only after releasing the connection map lock.
+            owner->ended(*this);
+        }
+        void read_loop() {
+            if(channel==2)SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+            Bytes b;
+            while (!closed && owner->running && read_packet(b)) {
+                try { if (!owner->dispatch(*this,b)) break; }
+                catch (...) { owner->status("Remote callback failed; connection closed."); break; }
+            }
+            close(); owner->ended(*this);
+        }
+    };
+    struct Pair { std::shared_ptr<Conn> control, video, input; };
+    TransportConfig cfg; TransportCallbacks callbacks; Key group{};
+    std::atomic<bool> running{false}; bool winsock = false;std::atomic<uint64_t> connection_sequence{0};
+    std::atomic<SOCKET> listener{INVALID_SOCKET}, discovery{INVALID_SOCKET};
+    std::thread accept_thread, discovery_thread;
+    mutable std::mutex mutex; std::mutex thread_mutex, connect_mutex,config_mutex; std::vector<std::shared_ptr<Conn>> connections;
+    std::map<std::string,Pair> connected;
+    std::map<std::string,std::chrono::steady_clock::time_point> next_attempt;
+    std::mutex sleep_mutex; std::condition_variable sleep_cv;
+
+    void status(const std::string& s) { if (callbacks.status) { try { callbacks.status(s); } catch (...) {} } }
+    void ended(Conn& c) {
+        if (!running) return;
+        bool notify = false; {
+            std::lock_guard lock(mutex); auto it = connected.find(c.peer.id);
+            if(it!=connected.end()&&(it->second.control.get()==&c||it->second.video.get()==&c||it->second.input.get()==&c)) {
+                if(it->second.control)it->second.control->close();
+                if(it->second.video)it->second.video->close();
+                if(it->second.input)it->second.input->close();
+                connected.erase(it);notify=true;
+            }
+        }
+        if (notify) { Peer p = c.peer; p.authenticated = false; if (callbacks.peer) { try { callbacks.peer(p); } catch (...) {} } status("Connection closed: " + c.peer.name); }
+    }
+    bool handshake(Conn& c, bool client, uint8_t requested) {
+        if(cfg.automatic_lan&&!on_link(c.peer.address))return false;
+        SOCKET s = c.socket.load(); socket_options(s);
+        // TCP probes detect a vanished cable/peer without mistaking an idle
+        // desktop for failure. No new wire messages; older peers are compatible.
+        tcp_keepalive keepalive{1,5000,1000};DWORD returned=0;
+        if(WSAIoctl(s,SIO_KEEPALIVE_VALS,&keepalive,sizeof(keepalive),nullptr,0,&returned,nullptr,nullptr)==SOCKET_ERROR)return false;
+        TransportConfig hello_config;{std::lock_guard lock(config_mutex);hello_config=cfg;}
+        Bytes first, second; Key proof{}, received{}, transmit{}, receive{}; Peer peer; uint8_t channel = requested;
+        if (client) {
+            first = make_hello(hello_config,channel); if (first.empty() || !send_blob(s,first) || !recv_blob(s,second,512) || !parse_hello(second,peer,channel,cfg.automatic_lan) || channel != requested || peer.id == cfg.device_id) return false;
+        } else {
+            if (!recv_blob(s,first,512) || !parse_hello(first,peer,channel,cfg.automatic_lan) || peer.id == cfg.device_id) return false;
+            second = make_hello(hello_config,channel); if (second.empty() || !send_blob(s,second)) return false;
+        }
+        Bytes transcript; u32(transcript,uint32_t(first.size())); transcript.insert(transcript.end(),first.begin(),first.end()); u32(transcript,uint32_t(second.size())); transcript.insert(transcript.end(),second.begin(),second.end());
+        Key material=group;struct Wipe{Key& key;~Wipe(){SecureZeroMemory(key.data(),key.size());}}wipe{material};
+        if(cfg.automatic_lan){
+            Agreement agreement;Bytes local_public,remote_public;
+            if(!agreement.generate(local_public)||!send_blob(s,local_public)||!recv_blob(s,remote_public,128)||!agreement.derive(remote_public,material))return false;
+            const auto& a=client?local_public:remote_public;const auto& b=client?remote_public:local_public;
+            transcript.insert(transcript.end(),a.begin(),a.end());transcript.insert(transcript.end(),b.begin(),b.end());
+        }
+        if((cfg.automatic_lan&&channel==1)||channel==2){
+            Key binding{};{std::lock_guard lock(mutex);auto existing=connected.find(peer.id);
+                if(existing==connected.end()||!existing->second.control||!existing->second.control->ready||existing->second.control->closed||
+                    (channel==2&&!(existing->second.control->peer.features&FeatureDedicatedInput)))return false;
+                binding=existing->second.control->pair_key;c.bound_control_token=existing->second.control->token;}
+            Key combined{};const bool ok=hmac(binding,Bytes(material.begin(),material.end()),combined);SecureZeroMemory(binding.data(),binding.size());if(!ok)return false;material=combined;SecureZeroMemory(combined.data(),combined.size());
+        }
+        if (!signed_part(material,transcript,1,proof)) return false;
+        if (client) { if (!recv_all(s,received.data(),received.size()) || !equal_key(proof,received)) return false; }
+        else if (!send_all(s,proof.data(),proof.size())) return false;
+        if (!signed_part(material,transcript,2,proof)) return false;
+        if (client) { if (!send_all(s,proof.data(),proof.size())) return false; }
+        else if (!recv_all(s,received.data(),received.size()) || !equal_key(proof,received)) return false;
+        if (!signed_part(material,transcript,3,proof)) return false;
+        if (client) { if (!recv_all(s,received.data(),received.size()) || !equal_key(proof,received)) return false; }
+        else c.confirmation = proof;
+        if (!signed_part(material,transcript,6,c.pair_key)||!signed_part(material,transcript,client ? 4 : 5,transmit) || !signed_part(material,transcript,client ? 5 : 4,receive) || !c.tx.init(transmit) || !c.rx.init(receive)) return false;
+        SecureZeroMemory(transmit.data(),transmit.size()); SecureZeroMemory(receive.data(),receive.size());
+        peer.address = c.peer.address; peer.authenticated = true; c.peer = std::move(peer); c.channel = channel;
+        // Idle control connections have no timeout. shutdown() wakes blocked receives at stop().
+        DWORD timeout = 0; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout)); return running;
+    }
+    bool activate(const std::shared_ptr<Conn>& c) {
+        {
+            std::lock_guard lock(mutex); if (!running) return false;
+            auto& pair = connected[c->peer.id]; auto& slot = c->channel == 0 ? pair.control : c->channel==1?pair.video:pair.input;
+            if (slot && !slot->closed) return false;
+            if (c->channel != 0 && (!pair.control || pair.control->closed)) return false;
+            if(c->bound_control_token&&c->bound_control_token!=pair.control->token)return false;
+            if(c->channel==0){if(pair.video){pair.video->close();pair.video.reset();}if(pair.input){pair.input->close();pair.input.reset();}}
+            slot = c; c->ready = true;
+        }
+        if (!c->channel && callbacks.peer) { try { callbacks.peer(c->peer); } catch (...) {} }
+        return true;
+    }
+    std::shared_ptr<Conn> add(SOCKET socket, const std::string& address) {
+        auto c = std::make_shared<Conn>(this,socket); c->peer.address = address;c->token=++connection_sequence;
+        std::lock_guard thread_lock(thread_mutex);
+        std::lock_guard lock(mutex);
+        // Reap completed workers so refused handshakes cannot accumulate thread handles or heap memory.
+        std::erase_if(connections,[](const auto& item) {
+            if (!item->closed || !item->reader_done || !item->writer_done) return false;
+            if (item->reader.joinable()) item->reader.join(); if (item->writer.joinable()) item->writer.join(); return true;
+        });
+        if (!running || connections.size() >= kMaxConnections) { c->close(); return {}; }
+        connections.push_back(c); return c;
+    }
+    void accept_loop() {
+        while (running) {
+            sockaddr_in address{}; int size = sizeof(address); SOCKET s = accept(listener.load(),reinterpret_cast<sockaddr*>(&address),&size);
+            if (s == INVALID_SOCKET) break;
+            char ip[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET,&address.sin_addr,ip,sizeof(ip)); auto c = add(s,ip); if (!c) continue;
+            std::lock_guard thread_lock(thread_mutex);
+            if (!running) { c->close(); break; }
+            c->reader = std::thread([this,c] {
+                auto work = [&] {
+                    if (!handshake(*c,false,0) || !activate(c) || !send_all(c->socket.load(),c->confirmation.data(),c->confirmation.size())) { c->close(); return; }
+                    { std::lock_guard lock(thread_mutex); if (!running) { c->close(); return; } c->writer_done = false; c->writer = std::thread([c] { c->write_loop(); c->writer_done = true; }); }
+                    c->read_loop();
+                };
+                work(); c->reader_done = true;
+            });
+        }
+    }
+    std::shared_ptr<Conn> dial(const std::string& address, uint16_t port, uint8_t channel, std::string& error) {
+        sockaddr_in remote{}; remote.sin_family = AF_INET; remote.sin_port = htons(port);
+        if (inet_pton(AF_INET,address.c_str(),&remote.sin_addr) != 1) { error = "Enter an IPv4 LAN address."; return {}; }
+        SOCKET s = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if (s == INVALID_SOCKET) { error = "Cannot create connection socket."; return {}; }
+        auto c = add(s,address); if (!c) { error = "Transport stopped or too many connections."; return {}; }
+        u_long nonblocking = 1; ioctlsocket(s,FIONBIO,&nonblocking);
+        int rc = ::connect(s,reinterpret_cast<sockaddr*>(&remote),sizeof(remote));
+        if (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set write, except; FD_ZERO(&write); FD_ZERO(&except); FD_SET(s,&write); FD_SET(s,&except); timeval timeout{3,0};
+            rc = select(0,nullptr,&write,&except,&timeout); int failure = 1; int length = sizeof(failure);
+            if (rc > 0 && FD_ISSET(s,&write) && getsockopt(s,SOL_SOCKET,SO_ERROR,reinterpret_cast<char*>(&failure),&length) == 0 && failure == 0) rc = 0; else rc = SOCKET_ERROR;
+        }
+        nonblocking = 0; ioctlsocket(s,FIONBIO,&nonblocking);
+        if (rc != 0 || !handshake(*c,true,channel)) { error = "Connection or Network Key authentication failed."; c->close(); c->reader_done = true; return {}; }
+        if (!activate(c)) { error = "Peer channel is already connected or unavailable."; c->close(); c->reader_done = true; return {}; }
+        {
+            std::lock_guard lock(thread_mutex); if (!running) { c->close(); c->reader_done = true; error = "Transport stopped."; return {}; }
+            c->writer_done = false; c->writer = std::thread([c] { c->write_loop(); c->writer_done = true; }); c->reader = std::thread([c] { c->read_loop(); c->reader_done = true; });
+        }
+        return c;
+    }
+    std::shared_ptr<Conn> find(const std::string& id, bool video = false) {
+        std::lock_guard lock(mutex); auto it = connected.find(id); if (it == connected.end()) return {};
+        auto c = video ? it->second.video : it->second.control; return c && c->ready && !c->closed ? c : nullptr;
+    }
+    std::shared_ptr<Conn> find_input(const std::string& id) {
+        std::lock_guard lock(mutex);auto it=connected.find(id);if(it==connected.end())return {};
+        auto c=it->second.input;return c&&c->ready&&!c->closed?c:nullptr;
+    }
+    static bool complete(const Pair& pair) {
+        return pair.control&&pair.video&&pair.control->ready&&!pair.control->closed&&pair.video->ready&&!pair.video->closed&&
+            (!(pair.control->peer.features&FeatureDedicatedInput)||(pair.input&&pair.input->ready&&!pair.input->closed));
+    }
+    bool connect(const std::string& address, uint16_t port, std::string& id, std::string& error) {
+        // Discovery and the explicit IP action can target the same machine.
+        // Reuse its authenticated pair instead of attempting a duplicate handshake.
+        const std::lock_guard connecting(connect_mutex);
+        if (!running) { error = "Transport is not running."; return false; }
+        auto reuse=[&]{
+            const std::lock_guard lock(mutex);
+            for(const auto& [peer,pair]:connected) {
+                if(complete(pair)&&
+                    pair.control->peer.address==address&&pair.control->peer.port==port){id=peer;error.clear();return true;}
+            }
+            return false;
+        };
+        if(reuse())return true;
+        auto control = dial(address,port,0,error); if (!control) return reuse();
+        auto video = dial(address,port,1,error);
+        if (!video || video->peer.id != control->peer.id) { control->close(); if (video) video->close(); return false; }
+        if(control->peer.features&FeatureDedicatedInput){
+            auto input=dial(address,port,2,error);
+            if(!input||input->peer.id!=control->peer.id){control->close();video->close();if(input)input->close();return false;}
+        }
+        id = control->peer.id; status("Connected: " + control->peer.name); return true;
+    }
+    bool dispatch(Conn& c, const Bytes& b) {
+        Reader r{b}; uint8_t type = r.byte();
+        if ((c.channel == 1) != (type == Frame||type==AutoFrame)) return false;
+        const bool input_message=type==InputReady||type==InputData||type==InputComplete||type==InputRevoke;
+        if((c.channel==2)!=input_message)return false;
+        switch (type) {
+        case InputEnable: {
+            const auto session=r.qword();if(!(c.peer.features&FeatureDedicatedInput)||!session||!r.end())return false;
+            auto input=find_input(c.peer.id);if(!input)return false;
+            // This callback follows all earlier clipboard and start work on the
+            // control reader. The input reader stays closed until it completes.
+            {std::lock_guard lock(input->queue_mutex);input->input_receive_session=0;input->input_receive_sequence=0;}
+            const bool accepted=callbacks.input_begin&&callbacks.input_begin(c.peer.id,session);
+            if(accepted){std::lock_guard lock(input->queue_mutex);if(input->closed)return false;input->input_receive_session=session;}
+            Bytes ready{InputReady};u64(ready,session);ready.push_back(accepted?1:0);return input->enqueue(std::move(ready));
+        }
+        case InputReady: {
+            const auto session=r.qword();const auto accepted=r.byte();if(!session||accepted>1||!r.end())return false;
+            {std::lock_guard lock(c.queue_mutex);if(session==c.input_send.session()&&!c.input_ending)c.input_enabled=accepted!=0;}
+            c.queue_cv.notify_all();return true;
+        }
+        case InputData: {
+            InputPacket packet;packet.session=r.qword();packet.sequence=r.qword();packet.capture_time_us=r.qword();
+            packet.event.kind=InputKind(r.dword());packet.event.a=int32_t(r.dword());packet.event.b=int32_t(r.dword());packet.event.c=int32_t(r.dword());
+            if(!packet.session||!packet.sequence||!packet.capture_time_us||!valid_input(packet.event)||!r.end())return false;
+            {std::lock_guard lock(c.queue_mutex);if(packet.session!=c.input_receive_session||packet.sequence<=c.input_receive_sequence)return true;c.input_receive_sequence=packet.sequence;}
+            packet.received_time_us=input_now_us();
+            if(callbacks.input_packet)callbacks.input_packet(c.peer.id,packet);return true;
+        }
+        case InputComplete: {
+            InputAck ack;ack.session=r.qword();ack.sequence=r.qword();ack.capture_time_us=r.qword();ack.host_queue_us=r.dword();ack.inject_us=r.dword();const auto injected=r.byte();ack.injected=injected!=0;
+            if(!ack.session||!ack.sequence||!ack.capture_time_us||ack.host_queue_us>10000000||ack.inject_us>10000000||injected>1||!r.end())return false;
+            {std::lock_guard lock(c.queue_mutex);if(ack.session!=c.input_send.session()||c.input_ending)return true;
+                if(!c.input_send.acknowledge(ack,input_now_us()))return false;
+                if(c.input_ending&&c.input_send.empty())c.input_enabled=false;}
+            c.queue_cv.notify_all();if(callbacks.input_ack)callbacks.input_ack(c.peer.id,ack);
+            if(!ack.injected){status("Desktop input was not accepted; reconnecting remote control.");return false;}return true;
+        }
+        case InputRevoke: {
+            const auto session=r.qword();if(!session||!r.end())return false;
+            c.revoke_input(session);if(callbacks.host_ended)callbacks.host_ended(c.peer.id,session);return true;
+        }
+        case Rename:{
+            auto name=r.string(256);if(!cfg.automatic_lan||!text_ok(name,256)||!r.end())return false;
+            Peer updated;{std::lock_guard lock(mutex);c.peer.name=std::move(name);updated=c.peer;}
+            if(callbacks.peer)callbacks.peer(updated);return true;
+        }
+        case AutoStart: {
+            StreamSettings settings;settings.session=r.qword();settings.receiver_millihz=r.dword();
+            if(!(c.peer.features&FeatureAutomaticStream)||!settings.session||settings.receiver_millihz<1000||settings.receiver_millihz>2000000||!r.end())return false;
+            if(callbacks.start_stream)callbacks.start_stream(c.peer.id,settings);return true;
+        }
+        case Feedback: {
+            StreamFeedback f;f.session=r.qword();f.capture_time_us=r.qword();f.arrival_age_us=r.dword();f.service_us=r.dword();f.queue_us=r.dword();const auto recover=r.byte();f.recover=recover!=0;
+            if(!r.end()&&(!(c.peer.features&FeatureAutoRate)||!rate_wire::read_feedback(f,[&]{return r.dword();},[&]{return r.qword();})))return false;
+            if(!(c.peer.features&FeatureAutomaticStream)||!valid_feedback(f)||recover>1||!r.end())return false;
+            if(callbacks.feedback)callbacks.feedback(c.peer.id,f);return true;
+        }
+        case Health: {
+            StreamHealth h;h.session=r.qword();h.target_millihz=r.dword();h.rate_millihz=r.dword();h.pressure=r.dword();
+            if(!(c.peer.features&FeatureAutomaticStream)||!h.session||h.target_millihz<1000||h.target_millihz>2000000||!h.rate_millihz||h.rate_millihz>h.target_millihz||h.pressure>7||!r.end())return false;
+            if(callbacks.health)callbacks.health(c.peer.id,h);return true;
+        }
+        case Diagnostics: {
+            SourceDiagnostics d;d.session=r.qword();d.encoded_millihz=r.dword();d.encode_us=r.dword();d.capture_wait_us=r.dword();d.send_wait_us_per_second=r.dword();d.feedback_age_us=r.dword();d.network_extra_us=r.dword();
+            if(!r.end()){if(!(c.peer.features&FeatureEncodeTiming))return false;d.color_us=r.dword();d.nvenc_us=r.dword();d.encode_age_us=r.dword();d.encode_details=true;}
+            if(!r.end()&&(!(c.peer.features&FeatureAutoRate)||!rate_wire::read_diagnostics(d,[&]{return r.dword();},[&]{return r.qword();})))return false;
+            if(!(c.peer.features&FeatureStreamDiagnostics)||!valid_diagnostics(d)||!r.end())return false;
+            if(callbacks.diagnostics)callbacks.diagnostics(c.peer.id,d);return true;
+        }
+        case SnapshotRequest: {
+            const auto request=r.qword();if(!(c.peer.features&FeatureDesktopAux)||!request||!r.end())return false;
+            if(callbacks.snapshot_request)callbacks.snapshot_request(c.peer.id,request);return true;
+        }
+        case SnapshotReply: {
+            Snapshot snapshot;snapshot.request=r.qword();
+            if(!(c.peer.features&FeatureDesktopAux)||!r.good||!snapshot.request||b.size()==r.at||b.size()-r.at>MaxSnapshotBytes)return false;
+            snapshot.jpeg.assign(b.begin()+r.at,b.end());if(callbacks.snapshot)callbacks.snapshot(c.peer.id,std::move(snapshot));return true;
+        }
+        case Cursor: {
+            CursorState cursor;const auto visible=r.byte();cursor.visible=visible!=0;cursor.x=r.dword();cursor.y=r.dword();
+            cursor.position_revision=r.qword();cursor.width=r.dword();cursor.height=r.dword();cursor.hotspot_x=r.dword();cursor.hotspot_y=r.dword();
+            const auto colors=r.dword(),mask=r.dword();
+            if(!(c.peer.features&FeatureDesktopAux)||!r.good||visible>1||colors>256*256*4||mask>256*256/4||size_t(colors)+mask!=b.size()-r.at)return false;
+            cursor.color.assign(b.begin()+r.at,b.begin()+r.at+colors);r.at+=colors;cursor.mask.assign(b.begin()+r.at,b.end());
+            if(!valid_cursor(cursor))return false;if(callbacks.cursor)callbacks.cursor(c.peer.id,std::move(cursor));return true;
+        }
+        case Start: { StreamSettings settings; settings.fps = r.dword(); settings.bitrate_mbps = r.dword(); if (!r.end() || !settings.bitrate_mbps || settings.bitrate_mbps > 10000) return false; if (callbacks.start_stream) callbacks.start_stream(c.peer.id,settings); return true; }
+        case Stop: if (!r.end()) return false; if (callbacks.stop_stream) callbacks.stop_stream(c.peer.id); return true;
+        case HostEnded: {
+            const auto session=r.qword();if(!(c.peer.features&FeatureHostKick)||!session||!r.end())return false;
+            if(auto input=find_input(c.peer.id))input->revoke_input(session);
+            if(callbacks.host_ended)callbacks.host_ended(c.peer.id,session);return true;
+        }
+        case Input: { InputEvent e; e.kind = InputKind(r.dword()); e.a = int32_t(r.dword()); e.b = int32_t(r.dword()); e.c = int32_t(r.dword()); if (!r.end() || !valid_input(e)) return false; if (callbacks.input) callbacks.input(c.peer.id,e); return true; }
+        case Clipboard: {
+            uint32_t count = r.dword(); if (!r.good || count > kMaxClipboard/2 || b.size()-r.at != size_t(count)*2) return false;
+            std::wstring value; value.reserve(count); for (uint32_t i = 0; i < count; ++i) value.push_back(wchar_t(r.word())); if (!utf16_ok(value)) return false;
+            // Callback must finish the local clipboard write before returning. Input follows on this same thread.
+            if (callbacks.clipboard) callbacks.clipboard(c.peer.id,value); return true;
+        }
+        case Frame: case AutoFrame: {
+            EncodedFrame frame;if(type==AutoFrame){frame.session=r.qword();if(!(c.peer.features&FeatureAutomaticStream)||!frame.session)return false;}
+            frame.width = r.dword(); frame.height = r.dword(); frame.sequence = r.qword(); frame.capture_time_us = r.qword(); uint8_t key = r.byte(); frame.keyframe = key != 0;
+            if (!r.good || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384 || key > 1 || b.size()-r.at > kMaxFrame || b.size() == r.at) return false;
+            frame.data.assign(b.begin()+r.at,b.end()); if (callbacks.frame) callbacks.frame(c.peer.id,std::move(frame)); return true;
+        }
+        default: return false;
+        }
+    }
+    Bytes announcement() {
+        std::lock_guard lock(config_mutex);
+        Bytes b{'H','I','V','D',uint8_t(cfg.automatic_lan?2:1)}; str(b,cfg.device_id); str(b,cfg.device_name); u16(b,cfg.port);
+        if(!cfg.automatic_lan){Key proof{};if(!hmac(group,b,proof))return {};b.insert(b.end(),proof.begin(),proof.end());}return b;
+    }
+    void discovery_loop() {
+        auto last = std::chrono::steady_clock::now()-std::chrono::seconds(3);
+        while (running) {
+            SOCKET s = discovery.load(); auto now = std::chrono::steady_clock::now();
+            if (now-last >= std::chrono::seconds(2)) {
+                Bytes b = announcement(); sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(kDiscoveryPort); to.sin_addr.s_addr = INADDR_BROADCAST;
+                if (!b.empty()) {
+                    std::set<uint32_t> destinations{INADDR_BROADCAST};
+                    for(const auto& local:lan_addresses())if(local.mask!=0xffffffffu)destinations.insert(htonl(local.address|~local.mask));
+                    for(const auto destination:destinations){to.sin_addr.s_addr=destination;sendto(s,reinterpret_cast<const char*>(b.data()),int(b.size()),0,reinterpret_cast<sockaddr*>(&to),sizeof(to));}
+                }last = now;
+            }
+            fd_set read; FD_ZERO(&read); FD_SET(s,&read); timeval timeout{0,250000}; if (select(0,&read,nullptr,nullptr,&timeout) <= 0) continue;
+            std::array<uint8_t,1024> buffer{}; sockaddr_in remote{}; int len = sizeof(remote); int n = recvfrom(s,reinterpret_cast<char*>(buffer.data()),int(buffer.size()),0,reinterpret_cast<sockaddr*>(&remote),&len);
+            if (n < (cfg.automatic_lan?13:40) || n > 512) continue;
+            Bytes b(buffer.begin(),buffer.begin()+n-(cfg.automatic_lan?0:32));
+            if(!cfg.automatic_lan){Key received{},proof{};std::copy(buffer.begin()+n-32,buffer.begin()+n,received.begin());if(!hmac(group,b,proof)||!equal_key(received,proof))continue;}
+            Reader r{b}; if (r.byte() != 'H' || r.byte() != 'I' || r.byte() != 'V' || r.byte() != 'D' || r.byte() != (cfg.automatic_lan?2:1)) continue;
+            Peer peer; peer.id = r.string(128); peer.name = r.string(256); peer.port = r.word();
+            if (!r.end() || !peer.port || !text_ok(peer.id,128) || !text_ok(peer.name,256) || peer.id == cfg.device_id || cfg.device_id > peer.id) continue;
+            char ip[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET,&remote.sin_addr,ip,sizeof(ip)); peer.address = ip;
+            if(cfg.automatic_lan&&!on_link(peer.address))continue;
+            { std::lock_guard lock(mutex);
+                const auto retry=next_attempt.find(peer.id);if(retry!=next_attempt.end()&&now<retry->second)continue;
+                const auto current=connected.find(peer.id);
+                if(current!=connected.end()&&complete(current->second))continue;
+                next_attempt[peer.id]=now+std::chrono::seconds(3);
+            }
+            // Rebuild the connection after a peer restarts. A new announcement
+            // supplies its current address/port; retry failures without a tight loop.
+            std::string id, error; if (!connect(peer.address,peer.port,id,error) && running) status("Discovered peer connection failed: " + peer.name);
+        }
+    }
+};
+
+Transport::Transport() : impl_(std::make_unique<Impl>()) {}
+Transport::~Transport() { stop(); }
+bool Transport::start(const TransportConfig& cfg, TransportCallbacks callbacks, std::string& error) {
+    auto& p = *impl_; if (p.running) { error = "Transport already started."; return false; }
+    if (!text_ok(cfg.device_id,128) || !text_ok(cfg.device_name,256) || (!cfg.automatic_lan&&!derive_network_key(cfg.group_key,p.group))) { error = "Invalid device identity or legacy Network Key."; return false; }
+    WSADATA ws{}; if (WSAStartup(MAKEWORD(2,2),&ws) != 0) { error = "Winsock initialization failed."; return false; }
+    p.winsock = true; p.cfg = cfg; p.callbacks = std::move(callbacks);
+    SOCKET s = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); p.listener = s;
+    BOOL exclusive = TRUE; setsockopt(s,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<const char*>(&exclusive),sizeof(exclusive));
+    sockaddr_in bind_address{}; bind_address.sin_family = AF_INET; bind_address.sin_addr.s_addr = INADDR_ANY; bind_address.sin_port = htons(cfg.port);
+    if (s == INVALID_SOCKET || bind(s,reinterpret_cast<sockaddr*>(&bind_address),sizeof(bind_address)) != 0 || listen(s,SOMAXCONN) != 0) { error = "Cannot listen on the configured TCP port."; stop(); return false; }
+    int length = sizeof(bind_address); getsockname(s,reinterpret_cast<sockaddr*>(&bind_address),&length); p.cfg.port = ntohs(bind_address.sin_port);
+    p.running = true;
+    p.accept_thread = std::thread([&p] { p.accept_loop(); });
+    if (cfg.discovery) {
+        s = socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP); p.discovery = s; BOOL yes = TRUE; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const char*>(&yes),sizeof(yes)); setsockopt(s,SOL_SOCKET,SO_BROADCAST,reinterpret_cast<const char*>(&yes),sizeof(yes));
+        bind_address.sin_port = htons(kDiscoveryPort);
+        if (s != INVALID_SOCKET && bind(s,reinterpret_cast<sockaddr*>(&bind_address),sizeof(bind_address)) == 0) p.discovery_thread = std::thread([&p] { p.discovery_loop(); });
+        else { s = p.discovery.exchange(INVALID_SOCKET); if (s != INVALID_SOCKET) closesocket(s); p.status("LAN discovery unavailable. Check the local network and firewall."); }
+    }
+    return true;
+}
+void Transport::stop() {
+    auto& p = *impl_;
+    if (p.running) {
+        // Give explicit ReleaseAll/Stop already queued by the caller a bounded opportunity to leave.
+        // One deadline for the whole transport; a slow peer cannot multiply shutdown time.
+        auto deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
+        std::vector<std::shared_ptr<Impl::Conn>> pending;
+        { std::lock_guard lock(p.mutex); pending = p.connections; }
+        for (auto& c : pending) {
+            if (c->channel == 1 || !c->ready || c->closed) continue;
+            std::unique_lock lock(c->queue_mutex);
+            c->queue_cv.wait_until(lock,deadline,[&] { return c->closed || (c->control.empty() && !c->control_inflight&&(c->channel!=2||c->input_send.empty())); });
+            if (std::chrono::steady_clock::now() >= deadline) break;
+        }
+    }
+    p.running = false; p.sleep_cv.notify_all();
+    for (auto* slot : {&p.listener,&p.discovery}) { SOCKET s = slot->exchange(INVALID_SOCKET); if (s != INVALID_SOCKET) { shutdown(s,SD_BOTH); closesocket(s); } }
+    { std::lock_guard lock(p.mutex); for (auto& c : p.connections) c->close(); }
+    if (p.accept_thread.joinable()) p.accept_thread.join(); if (p.discovery_thread.joinable()) p.discovery_thread.join();
+    // Workers may create their writer only while holding thread_mutex and while running is true.
+    { std::lock_guard lock(p.thread_mutex); }
+    std::vector<std::shared_ptr<Impl::Conn>> connections; { std::lock_guard lock(p.mutex); connections = p.connections; }
+    for (auto& c : connections) { c->close(); if (c->reader.joinable()) c->reader.join(); if (c->writer.joinable()) c->writer.join(); }
+    { std::lock_guard lock(p.mutex); p.connected.clear(); p.connections.clear(); p.next_attempt.clear(); }
+    SecureZeroMemory(p.group.data(),p.group.size()); SecureZeroMemory(p.cfg.group_key.data(),p.cfg.group_key.size()); p.cfg.group_key.clear(); if (p.winsock) { WSACleanup(); p.winsock = false; }
+}
+bool Transport::connect(const std::string& address, uint16_t port, std::string& peer_id, std::string& error) { return impl_->connect(address,port,peer_id,error); }
+void Transport::rename(const std::string& name){
+    if(!text_ok(name,256))return;
+    {std::lock_guard lock(impl_->config_mutex);impl_->cfg.device_name=name;}
+    if(!impl_->cfg.automatic_lan)return;
+    Bytes message{Rename};str(message,name);
+    std::lock_guard lock(impl_->mutex);for(const auto& [id,pair]:impl_->connected)if(pair.control)pair.control->enqueue(message);
+}
+std::vector<Peer> Transport::peers() const {
+    std::vector<Peer> result; std::lock_guard lock(impl_->mutex); for (const auto& [id,pair] : impl_->connected) if (pair.control && pair.control->ready && !pair.control->closed) result.push_back(pair.control->peer); return result;
+}
+uint64_t Transport::connection_token(const std::string& peer) const {
+    std::lock_guard lock(impl_->mutex);const auto it=impl_->connected.find(peer);
+    if(it==impl_->connected.end())return 0;const auto& pair=it->second;
+    if(!Impl::complete(pair))return 0;
+    return pair.control->token;
+}
+bool Transport::request_stream(const std::string& peer, const StreamSettings& s) {
+    if(s.session){auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||s.receiver_millihz<1000||s.receiver_millihz>2000000)return false;
+        Bytes b{AutoStart};u64(b,s.session);u32(b,s.receiver_millihz);return c->enqueue(std::move(b));}
+    auto c = impl_->find(peer); if (!c || !s.bitrate_mbps || s.bitrate_mbps > 10000) return false; Bytes b{Start}; u32(b,s.fps); u32(b,s.bitrate_mbps); return c->enqueue(std::move(b));
+}
+void Transport::stop_stream(const std::string& peer) { if (auto c = impl_->find(peer)) c->enqueue(Bytes{Stop}); }
+bool Transport::end_stream(const std::string& peer,uint64_t session) {
+    if(!session)return false;
+    bool input_notified=false;
+    if(auto input=impl_->find_input(peer)){
+        {std::lock_guard lock(input->queue_mutex);if(input->input_receive_session==session){input->input_receive_session=0;input->input_receive_sequence=0;}}
+        // The control reader may be applying a large clipboard. Revoke credits
+        // on the independent input lane immediately, preserving a reciprocal
+        // session instead of mistaking intentional termination for lost ACKs.
+        Bytes notice{InputRevoke};u64(notice,session);input_notified=input->enqueue(std::move(notice));if(!input_notified)input->close(true);
+    }
+    std::shared_ptr<Impl::Conn> control,video;
+    {std::lock_guard lock(impl_->mutex);const auto found=impl_->connected.find(peer);
+        if(found==impl_->connected.end())return input_notified;control=found->second.control;video=found->second.video;}
+    // Only this sender's queued frame can be removed; receiving video on the
+    // same full-duplex connection remains untouched. Never cancel an in-flight
+    // TCP packet, which would require disconnecting the reciprocal session too.
+    if(video){std::lock_guard lock(video->queue_mutex);
+        if(video->video){Reader r{video->video->payload};
+            if(r.byte()==AutoFrame&&r.qword()==session&&r.good){video->video.reset();video->wait_keyframe=true;}}}
+    if(!control||!(control->peer.features&FeatureHostKick))return input_notified;
+    Bytes b{HostEnded};u64(b,session);const bool control_notified=control->enqueue(std::move(b));return input_notified||control_notified;
+}
+bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
+    auto c = impl_->find(peer,true); if (!c || frame.data.empty() || frame.data.size() > kMaxFrame || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384) return false;
+    if(frame.session&&!(c->peer.features&FeatureAutomaticStream))return false;
+    Bytes b{frame.session?AutoFrame:Frame}; b.reserve(frame.data.size()+34);if(frame.session)u64(b,frame.session);
+    u32(b,frame.width); u32(b,frame.height); u64(b,frame.sequence); u64(b,frame.capture_time_us); b.push_back(frame.keyframe ? 1 : 0); b.insert(b.end(),frame.data.begin(),frame.data.end()); return c->enqueue(std::move(b),frame.keyframe);
+}
+bool Transport::frame_ready(const std::string& peer) const {
+    auto c=impl_->find(peer,true);if(!c)return false;const std::lock_guard lock(c->queue_mutex);return !c->video.has_value();
+}
+VideoSendDiagnostics Transport::video_send_diagnostics(const std::string& peer)const{
+    const auto c=impl_->find(peer,true);if(!c)return {};
+    auto result=c->video_send.snapshot(transport_us());result.connection=c->token;return result;
+}
+bool Transport::send_feedback(const std::string& peer,const StreamFeedback& f) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||!valid_feedback(f))return false;
+    Bytes b{Feedback};u64(b,f.session);u64(b,f.capture_time_us);u32(b,f.arrival_age_us);u32(b,f.service_us);u32(b,f.queue_us);b.push_back(f.recover?1:0);
+    if(f.rate_details&&(c->peer.features&FeatureAutoRate))rate_wire::write_feedback(f,[&](uint32_t n){u32(b,n);},[&](uint64_t n){u64(b,n);});
+    return c->enqueue(std::move(b));
+}
+bool Transport::send_health(const std::string& peer,const StreamHealth& h) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||!h.session||h.target_millihz<1000||h.target_millihz>2000000||!h.rate_millihz||h.rate_millihz>h.target_millihz||h.pressure>7)return false;
+    Bytes b{Health};u64(b,h.session);u32(b,h.target_millihz);u32(b,h.rate_millihz);u32(b,h.pressure);return c->enqueue(std::move(b));
+}
+bool Transport::send_diagnostics(const std::string& peer,const SourceDiagnostics& d) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureStreamDiagnostics)||!valid_diagnostics(d))return false;
+    Bytes b{Diagnostics};u64(b,d.session);u32(b,d.encoded_millihz);u32(b,d.encode_us);u32(b,d.capture_wait_us);u32(b,d.send_wait_us_per_second);u32(b,d.feedback_age_us);u32(b,d.network_extra_us);
+    const bool rate=d.rate_details&&(c->peer.features&FeatureAutoRate)&&(c->peer.features&FeatureEncodeTiming);
+    if((d.encode_details||rate)&&(c->peer.features&FeatureEncodeTiming)){u32(b,d.color_us);u32(b,d.nvenc_us);u32(b,d.encode_age_us);}
+    if(rate)rate_wire::write_diagnostics(d,[&](uint32_t n){u32(b,n);},[&](uint64_t n){u64(b,n);});
+    return c->enqueue(std::move(b));
+}
+bool Transport::send_input(const std::string& peer, const InputEvent& e) { auto c = impl_->find(peer); if (!c || !valid_input(e)) return false; Bytes b{Input}; u32(b,uint32_t(e.kind)); u32(b,uint32_t(e.a)); u32(b,uint32_t(e.b)); u32(b,uint32_t(e.c)); return c->enqueue(std::move(b)); }
+bool Transport::begin_input(const std::string& peer,uint64_t session) {
+    if(!session)return false;auto control=impl_->find(peer);auto input=impl_->find_input(peer);
+    if(!control||!input||!(control->peer.features&FeatureDedicatedInput))return false;
+    {std::lock_guard lock(input->queue_mutex);if(input->closed)return false;
+        if(input->input_send.session()==session&&!input->input_ending)return true;
+        input->input_send.reset(session);input->input_enabled=false;input->input_ending=false;}
+    Bytes b{InputEnable};u64(b,session);const bool queued=control->enqueue(std::move(b));
+    if(!queued)input->close(true);return queued;
+}
+bool Transport::input_ready(const std::string& peer,uint64_t session) const {
+    auto input=impl_->find_input(peer);if(!input||!session)return false;
+    std::lock_guard lock(input->queue_mutex);return !input->closed&&input->input_enabled&&!input->input_ending&&input->input_send.session()==session;
+}
+bool Transport::send_input(const std::string& peer,const InputPacket& packet) {
+    if(!valid_input(packet.event)||!packet.session||!packet.sequence||!packet.capture_time_us)return false;
+    auto input=impl_->find_input(peer);if(!input)return false;bool queued=false;
+    {std::lock_guard lock(input->queue_mutex);
+        if(input->closed||!input->input_enabled||input->input_ending||input->input_send.session()!=packet.session||packet.sequence<=input->input_send.last_sequence())return false;
+        queued=input->input_send.enqueue(packet,input_now_us());}
+    if(queued)input->queue_cv.notify_one();
+    else {impl_->status("Input edge queue exceeded its bound; releasing remote control.");input->close(true);}
+    return queued;
+}
+bool Transport::end_input(const std::string& peer,uint64_t session) {
+    auto input=impl_->find_input(peer);if(!input||!session)return false;bool queued=true;
+    {std::lock_guard lock(input->queue_mutex);if(input->closed||input->input_send.session()!=session)return false;
+        if(input->input_ending)return true;input->input_ending=true;
+        const auto sequence=input->input_send.last_sequence();const bool release=input->input_enabled;
+        input->input_enabled=false;input->input_send.finish();
+        // Ended sessions never replay their unsent movement or wait for ACKs
+        // from a host that has already revoked them. The final release still
+        // follows the currently writing packet on the same reliable socket.
+        if(release){queued=sequence!=UINT64_MAX&&input->control.size()<128;
+            if(queued){auto bytes=input_bytes({session,sequence+1,input_now_us(),{InputKind::ReleaseAll}});input->control_bytes+=bytes.size();input->control.push_back(std::move(bytes));}}}
+    if(queued)input->queue_cv.notify_one();else input->close(true);return queued;
+}
+bool Transport::send_input_ack(const std::string& peer,const InputAck& ack) {
+    if(!ack.session||!ack.sequence||!ack.capture_time_us||ack.host_queue_us>10000000||ack.inject_us>10000000)return false;
+    auto input=impl_->find_input(peer);if(!input)return false;
+    {std::lock_guard lock(input->queue_mutex);if(input->closed||ack.session!=input->input_receive_session||ack.sequence>input->input_receive_sequence)return false;}
+    Bytes b{InputComplete};u64(b,ack.session);u64(b,ack.sequence);u64(b,ack.capture_time_us);u32(b,ack.host_queue_us);u32(b,ack.inject_us);b.push_back(ack.injected?1:0);
+    const bool queued=input->enqueue(std::move(b));if(!queued)input->close(true);return queued;
+}
+InputDiagnostics Transport::input_diagnostics(const std::string& peer) const {
+    const auto input=impl_->find_input(peer);
+    if(!input){InputDiagnostics legacy;legacy.available=bool(impl_->find(peer));return legacy;}
+    std::lock_guard lock(input->queue_mutex);auto result=input->input_send.snapshot(input_now_us());
+    result.connection=input->token;result.ready=input->input_enabled&&!input->input_ending;return result;
+}
+bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{Clipboard}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
+bool Transport::request_snapshot(const std::string& peer,uint64_t request) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!request)return false;
+    Bytes b{SnapshotRequest};u64(b,request);return c->enqueue(std::move(b));
+}
+bool Transport::send_snapshot(const std::string& peer,const Snapshot& snapshot) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!snapshot.request||snapshot.jpeg.empty()||snapshot.jpeg.size()>MaxSnapshotBytes)return false;
+    Bytes b{SnapshotReply};u64(b,snapshot.request);b.insert(b.end(),snapshot.jpeg.begin(),snapshot.jpeg.end());return c->enqueue(std::move(b));
+}
+bool Transport::send_cursor(const std::string& peer,const CursorState& cursor) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!valid_cursor(cursor))return false;
+    Bytes b{Cursor};b.push_back(cursor.visible?1:0);u32(b,cursor.x);u32(b,cursor.y);u64(b,cursor.position_revision);
+    u32(b,cursor.width);u32(b,cursor.height);u32(b,cursor.hotspot_x);u32(b,cursor.hotspot_y);
+    u32(b,uint32_t(cursor.color.size()));u32(b,uint32_t(cursor.mask.size()));
+    b.insert(b.end(),cursor.color.begin(),cursor.color.end());b.insert(b.end(),cursor.mask.begin(),cursor.mask.end());return c->enqueue(std::move(b));
+}
+std::string Transport::generate_group_key() {
+    std::array<uint8_t,8> random{};if(!random_bytes(random.data(),random.size()))return {};
+    constexpr char alphabet[]="abcdefghjkmnpqrstuvwxyz23456789";
+    std::string result;result.reserve(8);
+    constexpr size_t count=sizeof(alphabet)-1,limit=256/count*count;
+    // Rejection sampling avoids modulo bias.
+    for(auto value:random){while(value>=limit){if(!random_bytes(&value,1))return {};}result.push_back(alphabet[value%count]);}
+    SecureZeroMemory(random.data(),random.size());return result;
+}
+
+bool Transport::discovery_self_test(std::string& result){
+    Transport a,b;std::string error;const auto suffix=std::to_string(GetCurrentProcessId());
+    const std::string aid="discovery-a-"+suffix,bid="discovery-b-"+suffix;
+    if(!a.start({aid,"Discovery A","",0,true,true},{},error)||!b.start({bid,"Discovery B","",0,true,true},{},error)){result="FAIL: "+error;return false;}
+    auto paired=[&]{
+      const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+      while(std::chrono::steady_clock::now()<deadline){
+        const auto ap=a.peers(),bp=b.peers();
+        if(std::any_of(ap.begin(),ap.end(),[&](const auto& p){return p.id==bid&&p.authenticated;})&&std::any_of(bp.begin(),bp.end(),[&](const auto& p){return p.id==aid&&p.authenticated;})){
+            // Require the complete negotiated channel set, not only control/video.
+            if(a.connection_token(bid)&&b.connection_token(aid)&&a.frame_ready(bid)&&b.frame_ready(aid))return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      return false;
+    };
+    if(!paired()){result="FAIL: initial automatic discovery did not complete.";return false;}
+    const auto first_token=a.connection_token(bid);if(!first_token){result="FAIL: paired connection has no token.";return false;}
+    b.stop();
+    if(!b.start({bid,"Discovery B restarted","",0,true,true},{},error)||!paired()){result="FAIL: listener restart was not rediscovered while initiator stayed running: "+error;return false;}
+    if(a.connection_token(bid)==first_token){result="FAIL: restart reused the old connection token.";return false;}
+    a.stop();
+    if(!a.start({aid,"Discovery A restarted","",0,true,true},{},error)||!paired()){result="FAIL: initiator restart was not rediscovered while listener stayed running: "+error;return false;}
+    const auto broken=b.impl_->find(aid,true);if(!broken){result="FAIL: missing video channel before teardown check.";return false;}broken->close();
+    if(!paired()){result="FAIL: a closed video channel left an unusable control-only peer.";return false;}
+    result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
+}
+bool Transport::self_test(std::string& result) {
+    {
+        InputSendWindow queue;queue.reset(71);
+        uint64_t sequence=0;
+        const auto put=[&](InputEvent event,uint64_t at=1000){return queue.enqueue({71,++sequence,at,event},at);};
+        if(!put({InputKind::Absolute,1,2})||!put({InputKind::Absolute,3,4})||!put({InputKind::Button,1,0})||
+            !put({InputKind::Absolute,5,6})||!put({InputKind::Relative,10,-20})||!put({InputKind::Relative,-3,5},1100)||
+            !put({InputKind::Wheel,120,0})||!put({InputKind::Key,30,0})||!put({InputKind::Key,30,1})||!put({InputKind::ReleaseAll})) {
+            result="Input ordering test setup failed";return false;
+        }
+        const std::array<InputKind,8> kinds{InputKind::Absolute,InputKind::Button,InputKind::Absolute,InputKind::Relative,InputKind::Wheel,InputKind::Key,InputKind::Key,InputKind::ReleaseAll};
+        std::array<InputPacket,8> sent{};
+        for(size_t i=0;i<sent.size();++i){if(!queue.writable()){result="Input credit exhausted before its bound";return false;}sent[i]=queue.take(1200+i);if(sent[i].event.kind!=kinds[i]){result="Motion crossed an input edge";return false;}}
+        if(sent[0].event.a!=3||sent[3].event.a!=7||sent[3].event.b!=-15||sent[3].capture_time_us!=1000||queue.writable()||
+            !put({InputKind::Absolute,7,8},1300)||queue.writable()||queue.expired(101199)||!queue.expired(101200)) {
+            result="Input motion merge, eight-packet credit, or completion deadline failed";return false;
+        }
+        const auto& last=sent.back();
+        queue.submitted(71,last.sequence,1250);
+        if(!queue.acknowledge({71,last.sequence,last.capture_time_us,7,11,true},1400)||!queue.writable()) {result="Completed injection ACK did not return credit";return false;}
+        auto stats=queue.snapshot(1500);
+        if(stats.coalesced!=2||stats.inflight||stats.queued!=1||stats.acknowledged!=8||stats.capture_to_send_p99_us!=250||stats.ack_roundtrip_p99_us!=150||stats.host_queue_max_us!=7||stats.inject_max_us!=11) {
+            result="Input latency metric attribution failed";return false;
+        }
+        if(queue.snapshot(2001400).samples){result="Input samples failed to expire";return false;}
+        const auto next=queue.take(1600);
+        if(queue.acknowledge({71,next.sequence,next.capture_time_us+1,0,0,true},1700)||queue.acknowledge({71,next.sequence+1,next.capture_time_us,0,0,true},1700)) {
+            result="Unsent or mismatched input ACK accepted";return false;
+        }
+        queue.finish();if(!queue.empty()||queue.next_deadline()){result="Ended input session retained old work or deadline";return false;}
+        queue.reset(72);if(queue.enqueue({71,1,1800,{InputKind::Key,30,0}},1800)){result="Old input session entered a new queue";return false;}
+        for(size_t i=0;i<InputSendWindow::capacity;++i)if(!queue.enqueue({72,i+1,2000,{InputKind::Key,30,int32_t(i%2)}},2000)){result="Bounded input edge admission failed";return false;}
+        if(queue.enqueue({72,129,2000,{InputKind::Key,30,1}},2000)){result="Input edge queue exceeded its fixed bound";return false;}
+    }
+    {
+        // Real encrypted third-channel loopback. The control reader is held
+        // inside a clipboard callback; input must still complete and ACK. No
+        // Windows input APIs are called by this test.
+        std::mutex guard;std::condition_variable changed;
+        bool clipboard=false,started=false,blocked=false,unblock=false,ordered=false;
+        unsigned packets=0,acks=0;uint64_t last_sequence=0;bool received_clock=true;
+        Transport sender,receiver;
+        struct Release {std::mutex& guard;std::condition_variable& cv;bool& flag;~Release(){std::lock_guard lock(guard);flag=true;cv.notify_all();}} release{guard,changed,unblock};
+        TransportCallbacks outgoing,incoming;
+        incoming.clipboard=[&](const std::string&,const std::wstring& value){
+            std::unique_lock lock(guard);if(value==L"handoff")clipboard=true;
+            if(value==L"hold control"){blocked=true;changed.notify_all();changed.wait(lock,[&]{return unblock;});}
+        };
+        incoming.start_stream=[&](const std::string&,const StreamSettings& settings){std::lock_guard lock(guard);started=settings.session==901;};
+        incoming.input_begin=[&](const std::string&,uint64_t session){std::lock_guard lock(guard);ordered=clipboard&&started&&session==901;return ordered;};
+        incoming.input_packet=[&](const std::string& peer,const InputPacket& packet){
+            {std::lock_guard lock(guard);++packets;last_sequence=packet.sequence;received_clock=received_clock&&packet.received_time_us&&packet.received_time_us<=input_now_us();changed.notify_all();}
+            receiver.send_input_ack(peer,{packet.session,packet.sequence,packet.capture_time_us,7,11,true});
+        };
+        outgoing.input_ack=[&](const std::string&,const InputAck& ack){std::lock_guard lock(guard);if(ack.injected&&ack.host_queue_us==7&&ack.inject_us==11)++acks;changed.notify_all();};
+        std::string error,id;
+        if(!sender.start({"input-a","Input A","",0,false,true},outgoing,error)||!receiver.start({"input-b","Input B","",0,false,true},incoming,error)||
+            !sender.connect("127.0.0.1",receiver.impl_->cfg.port,id,error)) {result="Dedicated input handshake: "+error;return false;}
+        if(sender.send_input(id,InputPacket{901,1,input_now_us(),{InputKind::Key,30,0}})||
+            !sender.send_clipboard(id,L"handoff")||!sender.request_stream(id,{0,0,60000,901})||!sender.begin_input(id,901)) {
+            result="Dedicated input admission setup failed";return false;
+        }
+        const auto ready_deadline=Clock::now()+std::chrono::seconds(2);
+        while(!sender.input_ready(id,901)&&Clock::now()<ready_deadline)Sleep(1);
+        if(!sender.input_ready(id,901)||!sender.send_clipboard(id,L"hold control")){result="Input handshake did not follow clipboard/start";return false;}
+        {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(2),[&]{return blocked;})){result="Control isolation setup failed";return false;}}
+        auto packet=InputPacket{901,10,input_now_us(),{InputKind::Key,30,0}};packet.received_time_us=UINT64_MAX;
+        bool ok=sender.send_input(id,packet);packet.sequence=11;packet.capture_time_us=input_now_us();packet.event.b=1;ok=sender.send_input(id,packet)&&ok;
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(500),[&]{return acks==2;})&&ok;ok=ok&&packets==2&&last_sequence==11&&ordered&&received_clock;unblock=true;changed.notify_all();}
+        auto stats=sender.input_diagnostics(id);
+        ok=ok&&stats.ready&&stats.dedicated&&stats.sent==2&&stats.acknowledged==2&&stats.samples==2&&stats.host_queue_p95_us==7&&stats.inject_p95_us==11;
+        ok=ok&&sender.end_input(id,901)&&!sender.input_ready(id,901)&&!sender.send_input(id,packet);
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(500),[&]{return packets==3;})&&ok;}
+        // Ended ACKs must not retain a completion timeout or tear down the pair.
+        Sleep(120);ok=ok&&sender.connection_token(id)&&sender.input_diagnostics(id).inflight==0;
+        if(!ok){result="Input control isolation, handshake order, metadata, completion ACK, or ending-session cleanup failed";return false;}
+    }
+    {
+        // End one direction while its control reader is blocked. The input-lane
+        // revoke must retire old ACK credit immediately, preserve reverse input,
+        // and not let the late control notice revoke a replacement session.
+        std::mutex guard;std::condition_variable changed;bool blocked=false,unblock=false;
+        unsigned held_packets=0,notices=0;
+        Transport left,right;
+        struct Release {std::mutex& guard;std::condition_variable& cv;bool& flag;~Release(){std::lock_guard lock(guard);flag=true;cv.notify_all();}} release{guard,changed,unblock};
+        TransportCallbacks left_cb,right_cb;
+        left_cb.input_begin=[](const std::string&,uint64_t session){return session==222;};
+        right_cb.input_begin=[](const std::string&,uint64_t session){return session==111||session==333;};
+        left_cb.clipboard=[&](const std::string&,const std::wstring&){std::unique_lock lock(guard);blocked=true;changed.notify_all();changed.wait(lock,[&]{return unblock;});};
+        left_cb.input_packet=[&](const std::string& peer,const InputPacket& p){left.send_input_ack(peer,{p.session,p.sequence,p.capture_time_us,1,2,true});};
+        right_cb.input_packet=[&](const std::string& peer,const InputPacket& p){
+            if(p.session==111){std::lock_guard lock(guard);++held_packets;changed.notify_all();}
+            else right.send_input_ack(peer,{p.session,p.sequence,p.capture_time_us,1,2,true});
+        };
+        left_cb.host_ended=[&](const std::string&,uint64_t session){if(session==111){std::lock_guard lock(guard);++notices;changed.notify_all();}};
+        const auto acknowledged=[&](const std::string&,const InputAck&){std::lock_guard lock(guard);changed.notify_all();};
+        left_cb.input_ack=right_cb.input_ack=acknowledged;
+        std::string error,id;
+        if(!left.start({"kick-input-a","Kick input A","",0,false,true},left_cb,error)||!right.start({"kick-input-b","Kick input B","",0,false,true},right_cb,error)||
+            !left.connect("127.0.0.1",right.impl_->cfg.port,id,error)||!left.begin_input("kick-input-b",111)||!right.begin_input("kick-input-a",222)){
+            result="Reciprocal input revoke setup: "+error;return false;
+        }
+        auto deadline=Clock::now()+std::chrono::seconds(2);
+        while((!left.input_ready("kick-input-b",111)||!right.input_ready("kick-input-a",222))&&Clock::now()<deadline)Sleep(1);
+        const auto connection=left.connection_token("kick-input-b");
+        bool ok=left.input_ready("kick-input-b",111)&&right.input_ready("kick-input-a",222)&&right.send_clipboard("kick-input-a",L"block control");
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(2),[&]{return blocked;})&&ok;}
+        ok=left.send_input("kick-input-b",InputPacket{111,1,input_now_us(),{InputKind::Key,30,0}})&&ok;
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(250),[&]{return held_packets==1;})&&ok;}
+        ok=right.end_stream("kick-input-a",111)&&ok;
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(250),[&]{return notices==1;})&&ok;}
+        auto retired=left.input_diagnostics("kick-input-b");
+        ok=ok&&!retired.ready&&!retired.queued&&!retired.inflight&&right.input_ready("kick-input-a",222);
+        ok=left.begin_input("kick-input-b",333)&&ok;
+        deadline=Clock::now()+std::chrono::seconds(2);while(!left.input_ready("kick-input-b",333)&&Clock::now()<deadline)Sleep(1);
+        ok=left.send_input("kick-input-b",InputPacket{333,2,input_now_us(),{InputKind::Key,30,1}})&&
+            right.send_input("kick-input-a",InputPacket{222,1,input_now_us(),{InputKind::Relative,4,5}})&&ok;
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(500),[&]{return left.input_diagnostics("kick-input-b").acknowledged==1&&right.input_diagnostics("kick-input-a").acknowledged==1;})&&ok;}
+        Sleep(120);ok=ok&&connection&&left.connection_token("kick-input-b")==connection;
+        {std::unique_lock lock(guard);unblock=true;changed.notify_all();ok=changed.wait_for(lock,std::chrono::milliseconds(500),[&]{return notices==2;})&&ok;}
+        ok=ok&&left.input_ready("kick-input-b",333)&&right.input_ready("kick-input-a",222)&&left.connection_token("kick-input-b")==connection;
+        ok=left.send_input("kick-input-b",InputPacket{333,3,input_now_us(),{InputKind::Relative,6,7}})&&ok;
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(500),[&]{return left.input_diagnostics("kick-input-b").acknowledged==2;})&&ok;}
+        left.end_input("kick-input-b",333);right.end_input("kick-input-a",222);
+        if(!ok){result="Blocked-control input revoke disrupted reciprocal input, leaked old ACK credit, or revoked a replacement session";return false;}
+    }
+    {
+        std::mutex guard;std::condition_variable changed;bool disconnected=false;Transport sender,receiver;
+        TransportCallbacks outgoing,incoming;
+        outgoing.peer=[&](const Peer& peer){if(!peer.authenticated){std::lock_guard lock(guard);disconnected=true;changed.notify_all();}};
+        incoming.input_begin=[](const std::string&,uint64_t){return true;};
+        incoming.input_packet=[](const std::string&,const InputPacket&){}; // Inject completion deliberately absent.
+        std::string error,id;
+        if(!sender.start({"input-stall-a","Input stall A","",0,false,true},outgoing,error)||!receiver.start({"input-stall-b","Input stall B","",0,false,true},incoming,error)||
+            !sender.connect("127.0.0.1",receiver.impl_->cfg.port,id,error)||!sender.begin_input(id,902)){result="Input stall setup: "+error;return false;}
+        const auto deadline=Clock::now()+std::chrono::seconds(2);while(!sender.input_ready(id,902)&&Clock::now()<deadline)Sleep(1);
+        if(!sender.send_input(id,InputPacket{902,1,input_now_us(),{InputKind::Relative,1,2}})){result="Input stall packet was not admitted";return false;}
+        {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(1),[&]{return disconnected;})){result="Stalled input was replayable beyond its completion budget";return false;}}
+        if(sender.connection_token(id)){result="Input stall did not close the authenticated channel set";return false;}
+    }
+    {
+        // A live broker rejection must not leave a healthy-looking video pair
+        // permanently swallowing keys. Ended-session ACKs were checked above.
+        std::mutex guard;std::condition_variable changed;bool disconnected=false;Transport sender,receiver;
+        TransportCallbacks outgoing,incoming;
+        outgoing.peer=[&](const Peer& peer){if(!peer.authenticated){std::lock_guard lock(guard);disconnected=true;changed.notify_all();}};
+        incoming.input_begin=[](const std::string&,uint64_t){return true;};
+        incoming.input_packet=[&](const std::string& peer,const InputPacket& p){receiver.send_input_ack(peer,{p.session,p.sequence,p.capture_time_us,0,0,false});};
+        std::string error,id;
+        if(!sender.start({"input-reject-a","Input reject A","",0,false,true},outgoing,error)||!receiver.start({"input-reject-b","Input reject B","",0,false,true},incoming,error)||
+            !sender.connect("127.0.0.1",receiver.impl_->cfg.port,id,error)||!sender.begin_input(id,903)){result="Input rejection setup: "+error;return false;}
+        const auto deadline=Clock::now()+std::chrono::seconds(2);while(!sender.input_ready(id,903)&&Clock::now()<deadline)Sleep(1);
+        if(!sender.send_input(id,InputPacket{903,1,input_now_us(),{InputKind::Key,30,0}})){result="Input rejection packet was not admitted";return false;}
+        {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(1),[&]{return disconnected;})){result="Negative injection ACK left a dead input lane connected";return false;}}
+        if(sender.connection_token(id)){result="Rejected input did not revoke its authenticated channel set";return false;}
+    }
+    {
+        VideoSendWindow timing;
+        const auto empty=timing.snapshot(1000000);
+        if(empty.samples||empty.sample_age_us!=UINT32_MAX){result="Empty send timing window reported stale data";return false;}
+        uint64_t finished=0;
+        for(uint32_t i=1;i<=20;++i){
+            const uint64_t queued=1000000+uint64_t(i)*10000;
+            finished=queued+i*15;
+            timing.record({queued,queued+i*2,queued+i*5,finished,i*3,100,true,true});
+        }
+        auto measured=timing.snapshot(finished);
+        if(measured.samples!=20||measured.submitted_packets!=20||measured.completed_packets!=20||measured.completed_bytes!=2000||measured.failed_packets||
+            measured.encrypt_p95_us!=57||measured.encrypt_max_us!=60||measured.send_p95_us!=190||measured.send_max_us!=200||
+            measured.queue_p95_us!=38||measured.queue_max_us!=40||measured.ready_gap_p95_us!=95||measured.ready_gap_max_us!=100){
+            result="Bounded send timing percentiles/counters incorrect";return false;
+        }
+        // After all old samples have been overwritten, a prior large maximum
+        // cannot keep appearing in the bounded ring's recent measurements.
+        for(uint32_t i=0;i<VideoSendWindow::capacity;++i){
+            const uint64_t queued=1300000+uint64_t(i)*1000;finished=queued+20;
+            timing.record({queued,queued+5,queued+10,finished,5,100,true,true});
+        }
+        measured=timing.snapshot(finished);
+        if(measured.samples!=VideoSendWindow::capacity||measured.send_max_us!=10||measured.queue_max_us!=5||measured.encrypt_max_us!=5){
+            result="Video sender timing ring exceeded its bound or retained overwritten samples";return false;
+        }
+        VideoSendWindow idle;
+        idle.record({1000000,1000100,1000300,1000800,200,100,true,true});
+        idle.record({4000000,4000050,4000080,4000180,30,100,true,true});
+        measured=idle.snapshot(4000180);
+        if(measured.samples!=1||measured.submit_gap_max_us!=2999280||measured.ready_gap_max_us!=80||measured.send_max_us!=100||measured.queue_max_us!=50){
+            result="Application supply idle was mislabeled as ready-send dispatch delay";return false;
+        }
+        measured=idle.snapshot(6000180);
+        if(measured.samples||measured.send_max_us||measured.send_p95_us||measured.sample_age_us!=2000000||measured.completed_packets!=2){
+            result="Expired send timings remained current or lost lifetime counters";return false;
+        }
+        idle.record({6000200,6000210,6000220,6150220,10,100,true,false});idle.expired();idle.expired();
+        measured=idle.snapshot(6150220);
+        if(measured.submitted_packets!=3||measured.completed_packets!=2||measured.completed_bytes!=200||measured.failed_packets!=1||measured.queue_expired!=2||measured.send_max_us!=150000){
+            result="Failed/expired video send accounting hid a stall or counted delivered bytes";return false;
+        }
+    }
+    {
+        Transport sender;auto& owner=*sender.impl_;
+        auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);control->ready=true;
+        control->peer.id="rate-peer";control->peer.features=FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureAutoRate;
+        owner.connected["rate-peer"]={control,{}};
+        StreamFeedback received;SourceDiagnostics observed;
+        owner.callbacks.feedback=[&](const std::string&,const StreamFeedback& f){received=f;};
+        owner.callbacks.diagnostics=[&](const std::string&,const SourceDiagnostics& d){observed=d;};
+        StreamFeedback f{91,123456,700,2100,10,false};f.rate_details=true;f.feedback_sequence=73;
+        f.received_bytes=0x100001234ull;f.received_frames=240;f.received_kbps=200000;f.received_millihz=120000;
+        f.receive_sample_age_us=40000;f.service_sample_age_us=2000;f.transit_extra_us=123;
+        f.sequence_gaps=2;f.age_expired=3;f.queue_overflows=4;
+        if(!sender.send_feedback("rate-peer",f)||!owner.dispatch(*control,control->control.back())||!received.rate_details||
+           received.feedback_sequence!=73||received.received_bytes!=f.received_bytes||received.received_frames!=240||
+           received.received_kbps!=200000||received.received_millihz!=120000||received.receive_sample_age_us!=40000||
+           received.service_sample_age_us!=2000||received.transit_extra_us!=123||received.sequence_gaps!=2||received.age_expired!=3||received.queue_overflows!=4){
+            result="Automatic-rate receiver extension roundtrip failed";return false;
+        }
+        const auto full_feedback=control->control.back();auto truncated=full_feedback;truncated.pop_back();
+        auto trailing=full_feedback;trailing.push_back(0);
+        if(owner.dispatch(*control,truncated)||owner.dispatch(*control,trailing)){result="Malformed automatic-rate feedback accepted";return false;}
+        SourceDiagnostics d{91,120000,2300,10,20,5000,0,400,1900,6000,true};d.rate_details=true;d.automatic_cbr=true;d.quality_limited=true;
+        d.target_bitrate_bps=180000000;d.actual_bitrate_bps=175000000;d.average_qp=20;d.rate_reason=2;
+        d.receiver_service_us=2100;d.receiver_queue_us=10;d.receiver_recover=true;d.feedback_sequence=73;d.source_discarded=5;
+        d.sequence_gaps=2;d.age_expired=3;d.queue_overflows=4;
+        if(!sender.send_diagnostics("rate-peer",d)||!owner.dispatch(*control,control->control.back())||!observed.rate_details||
+           !observed.automatic_cbr||!observed.quality_limited||!observed.receiver_recover||observed.target_bitrate_bps!=180000000||
+           observed.actual_bitrate_bps!=175000000||observed.average_qp!=20||observed.rate_reason!=2||observed.receiver_service_us!=2100||
+           observed.receiver_queue_us!=10||observed.feedback_sequence!=73||observed.source_discarded!=5||observed.sequence_gaps!=2||observed.age_expired!=3||observed.queue_overflows!=4){
+            result="Automatic-rate source extension roundtrip failed";return false;
+        }
+        const auto full_diagnostics=control->control.back();truncated=full_diagnostics;truncated.pop_back();trailing=full_diagnostics;trailing.push_back(0);
+        if(owner.dispatch(*control,truncated)||owner.dispatch(*control,trailing)){result="Malformed automatic-rate diagnostics accepted";return false;}
+        // Old peers receive exactly their previous layouts; new peers also
+        // accept old messages without inventing rate measurements.
+        control->peer.features&=~FeatureAutoRate;
+        if(owner.dispatch(*control,full_feedback)||owner.dispatch(*control,full_diagnostics)||
+           !sender.send_feedback("rate-peer",f)||control->control.back().size()!=30||!owner.dispatch(*control,control->control.back())||received.rate_details||
+           !sender.send_diagnostics("rate-peer",d)||control->control.back().size()!=45||!owner.dispatch(*control,control->control.back())||observed.rate_details||!observed.encode_details){
+            result="Automatic-rate legacy capability gating failed";return false;
+        }
+        control->peer.features|=FeatureAutoRate;
+        if(!owner.dispatch(*control,control->control.back())||observed.rate_details){result="Legacy diagnostic rejected by new peer";return false;}
+        d.average_qp=52;f.received_millihz=4000001;
+        if(sender.send_diagnostics("rate-peer",d)||sender.send_feedback("rate-peer",f)){result="Automatic-rate metric bounds failed";return false;}
+        d.average_qp=UINT32_MAX;d.rate_reason=8;
+        if(sender.send_diagnostics("rate-peer",d)){result="Automatic-rate reason bounds failed";return false;}
+    }
+    {
+        // Session termination must preserve the connection and the reciprocal
+        // stream, reject malformed input, and never send unknown legacy commands.
+        Transport sender;auto& owner=*sender.impl_;
+        auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        auto video=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        control->ready=video->ready=true;video->channel=1;
+        control->peer.id=video->peer.id="kick-peer";
+        control->peer.features=video->peer.features=FeatureAutomaticStream|FeatureHostKick;
+        owner.connected["kick-peer"]={control,video};
+        unsigned notices=0,stops=0;uint64_t ended_session=0;std::string ended_peer;
+        owner.callbacks.host_ended=[&](const std::string& peer,uint64_t session){++notices;ended_peer=peer;ended_session=session;};
+        owner.callbacks.stop_stream=[&](const std::string& peer){if(peer=="kick-peer")++stops;};
+        EncodedFrame frame;frame.session=41;frame.width=frame.height=2;frame.keyframe=true;frame.data={1,2,3};
+        if(!sender.send_frame("kick-peer",frame)||sender.end_stream("kick-peer",0)||
+            !sender.end_stream("kick-peer",42)||!video->video||video->wait_keyframe||
+            !owner.dispatch(*control,control->control.back())||ended_session!=42||
+            !sender.end_stream("kick-peer",41)||video->video||!video->wait_keyframe||
+            !owner.dispatch(*control,control->control.back())||ended_session!=41||ended_peer!="kick-peer"||
+            !owner.dispatch(*control,Bytes{Stop})||notices!=2||stops!=1||control->closed||video->closed){
+            result="Session-scoped host kick disrupted another stream or failed delivery";return false;
+        }
+        const auto valid=control->control.back();auto truncated=valid,trailing=valid;
+        truncated.pop_back();trailing.push_back(0);Bytes zero{HostEnded};u64(zero,0);
+        if(owner.dispatch(*control,truncated)||owner.dispatch(*control,trailing)||owner.dispatch(*control,zero)||
+            owner.dispatch(*video,valid)||notices!=2){result="Malformed host kick accepted";return false;}
+        control->peer.features=0;const auto count=control->control.size();
+        if(sender.end_stream("kick-peer",41)||control->control.size()!=count||owner.dispatch(*control,valid)||notices!=2){
+            result="Host kick capability gating failed";return false;
+        }
+        if(sender.begin_input("kick-peer",41)||sender.input_ready("kick-peer",41)||sender.send_input("kick-peer",InputPacket{41,1,1,{InputKind::ReleaseAll}})){
+            result="Dedicated input did not reject a legacy channel set";return false;
+        }
+        auto input=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);input->ready=true;input->channel=2;input->peer.id="kick-peer";
+        input->peer.features=FeatureDedicatedInput;input->input_receive_session=41;input->input_send.reset(77);input->input_enabled=true;
+        owner.connected["kick-peer"].input=input;control->ready=false;
+        if(!sender.end_stream("kick-peer",41)||input->input_receive_session||!input->input_enabled||input->input_send.session()!=77||input->control.empty()||input->control.back()[0]!=InputRevoke){
+            result="Dedicated revoke depended on control capacity or canceled reciprocal input";return false;
+        }
+    }
+    {
+        Impl owner;Impl::Conn c(&owner,INVALID_SOCKET);c.channel=1;c.ready=true;
+        const auto now=Clock::now();
+        // Full queues invalidate the entire dependent tail. A keyframe may
+        // replace an unsent predecessor; a P-frame must never do so.
+        if(!c.enqueue(Bytes{1},true)||c.enqueue(Bytes{2})||c.video||!c.wait_keyframe||c.enqueue(Bytes{3})||
+            !c.enqueue(Bytes{4},true)||c.wait_keyframe||!c.enqueue(Bytes{5},true)){
+            result="Bounded video queue dependency recovery failed";return false;
+        }
+        c.video->queued_at=now;
+        auto packet=c.take_video(now+kVideoQueueAge-std::chrono::microseconds(1));
+        if(!packet||*packet!=Bytes{5}||c.video){result="Fresh queued video was lost";return false;}
+        if(!c.enqueue(Bytes{6})){result="Valid P-frame chain did not resume after IDR";return false;}
+        c.video->queued_at=now;
+        if(c.take_video(now+kVideoQueueAge)||!c.wait_keyframe||c.enqueue(Bytes{7})||!c.enqueue(Bytes{8},true)){
+            result="Stale video did not drop dependent frames until a new IDR";return false;
+        }
+        // Exercise the production writer's expiry branch and verify callbacks
+        // can take the queue lock: recovery and readiness must be outside it.
+        c.video->queued_at=Clock::now()-kVideoQueueAge;
+        unsigned recovery=0,readiness=0;owner.running=true;
+        owner.callbacks.request_keyframe=[&](const std::string&){std::lock_guard lock(c.queue_mutex);++recovery;owner.running=false;};
+        owner.callbacks.frame_ready=[&](const std::string&){std::lock_guard lock(c.queue_mutex);++readiness;};
+        c.write_loop();
+        if(recovery!=1||readiness!=1||c.video||!c.wait_keyframe){result="Expired video recovery notification failed";return false;}
+    }
+    {
+        // Race an idle writer against close. Shutdown publication shares the
+        // condition-variable mutex, so neither ordering may lose its wake.
+        Impl owner;owner.running=true;
+        for(unsigned round=0;round<32;++round){
+            Impl::Conn c(&owner,INVALID_SOCKET);c.channel=1;c.ready=true;
+            std::unique_lock hold(c.queue_mutex);
+            std::thread writer([&]{c.write_loop();});
+            std::thread closer([&]{c.close();});
+            hold.unlock();closer.join();writer.join();
+        }
+    }
+    {
+        Agreement first,second;Bytes a,b;Key ka{},kb{};
+        if(!first.generate(a)||!second.generate(b)||a==b||!first.derive(b,ka)||!second.derive(a,kb)||!equal_key(ka,kb)){result="Ephemeral ECDH agreement failed";return false;}
+        b[0]^=1;if(first.derive(b,kb)){result="Invalid ECDH public key accepted";return false;}
+        Transport left,right;std::string error,id;std::mutex guard;std::condition_variable changed;bool text=false,frame=false,renamed=false;
+        bool ready_notified=false;TransportCallbacks received,sending;
+        sending.frame_ready=[&](const std::string& peer){
+            // Query readiness from the callback to catch accidental invocation
+            // while the transport's queue/map locks are still held.
+            const bool available=left.frame_ready(peer);
+            std::lock_guard lock(guard);ready_notified=available;changed.notify_all();
+        };
+        received.clipboard=[&](const std::string&,const std::wstring& value){std::lock_guard lock(guard);text=value==L"keyless";changed.notify_all();};
+        received.frame=[&](const std::string&,EncodedFrame value){std::lock_guard lock(guard);frame=value.data==Bytes({1,2,3});changed.notify_all();};
+        received.peer=[&](const Peer& peer){std::lock_guard lock(guard);if(peer.name=="Renamed without disconnect")renamed=true;changed.notify_all();};
+        if(!left.start({"lan-a","LAN A","",0,false,true},sending,error)||!right.start({"lan-b","LAN B","",0,false,true},received,error)||
+            !left.connect("127.0.0.1",right.impl_->cfg.port,id,error)){result="Keyless dual-channel handshake: "+error;return false;}
+        left.rename("Renamed without disconnect");EncodedFrame picture;picture.width=2;picture.height=2;picture.keyframe=true;picture.data={1,2,3};
+        bool ok=left.send_clipboard(id,L"keyless")&&left.send_frame(id,picture);
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(3),[&]{return text&&frame&&renamed&&ready_notified;})&&ok;}
+        Transport legacy;const auto old_key=generate_group_key();
+        if(!legacy.start({"legacy","Legacy",old_key,0,false},{},error)||legacy.connect("127.0.0.1",right.impl_->cfg.port,id,error))ok=false;
+        if(!ok){result="Keyless encrypted channels, live rename, or legacy isolation failed";return false;}
+    }
+    {
+        auto hello=make_hello({"feature-test","Features","Test1234",47980,false},0);
+        Peer peer;uint8_t channel=9;
+        if(!parse_hello(hello,peer,channel)||!(peer.features&FeatureDesktopAux)||!(peer.features&FeatureAutomaticStream)||!(peer.features&FeatureHostKick)||!(peer.features&FeatureAutoRate)||!(peer.features&FeatureDedicatedInput)){result="Feature negotiation failed";return false;}
+        std::fill(hello.end()-32,hello.end(),uint8_t(42));peer={};
+        if(!parse_hello(hello,peer,channel)||peer.features){result="Legacy challenge compatibility failed";return false;}
+        auto input_hello=make_hello({"feature-test","Features","Test1234",47980,false},2);peer={};
+        if(!parse_hello(input_hello,peer,channel)||channel!=2){result="Dedicated input channel capability negotiation failed";return false;}
+        input_hello[input_hello.size()-21]&=uint8_t(0xffu^FeatureDedicatedInput);peer={};
+        if(parse_hello(input_hello,peer,channel)){result="Legacy peer accepted a dedicated input channel";return false;}
+    }
+    std::string key = generate_group_key(); if (key.empty()) { result = "System random generator failed."; return false; }
+    Key expected{},derived{},legacy{},upper{},invalid{};
+    decode_key("3c1602eaf0017fef59a19ed8e27de9fe448a8a9ffdee338b784b484aaf6b3040",expected);
+    const std::string legacy_text(64,'a');decode_key(legacy_text,legacy);
+    if(key.size()!=8||!valid_network_key(key)||!derive_network_key("Studio42",derived)||!equal_key(expected,derived)||
+       !derive_network_key("studio42",upper)||equal_key(upper,derived)||
+       !derive_network_key(legacy_text,derived)||!equal_key(legacy,derived)||
+       !derive_network_key(std::string(64,'A'),upper)||!equal_key(legacy,upper)||
+       derive_network_key("",invalid)||derive_network_key("abc",invalid)||derive_network_key("with space",invalid)||
+       derive_network_key(std::string(65,'x'),invalid)||derive_network_key(std::string("abcd\0x",6),invalid)) {
+        result="Network Key derivation, case sensitivity, legacy compatibility or validation failed.";return false;
+    }
+    key[0]='A'; // A case-only difference must fail the actual network handshake.
+    // Exercise the real Windows GCM implementation, including tag and AAD tampering.
+    Key material{}; if(!derive_network_key(key,material)){result="Network Key derivation failed.";return false;}
+    Cipher cipher; if (!cipher.init(material)) { result = "AES-GCM initialization failed."; return false; }
+    Bytes aad; u32(aad,3); u64(aad,1); Bytes plain{1,2,3}, encrypted, decrypted; std::array<uint8_t,16> tag{};
+    if (!cipher.crypt(true,aad,plain,encrypted,tag) || !cipher.crypt(false,aad,encrypted,decrypted,tag) || decrypted != plain) { result = "AES-GCM roundtrip failed."; return false; }
+    auto badtag = tag; badtag[0] ^= 1; if (cipher.crypt(false,aad,encrypted,decrypted,badtag)) { result = "Tampered AES-GCM tag accepted."; return false; }
+    auto bad_aad = aad; bad_aad.back() ^= 1; if (cipher.crypt(false,bad_aad,encrypted,decrypted,tag)) { result = "Tampered packet counter accepted."; return false; }
+    std::mutex mutex; std::condition_variable cv; int state = 0; bool received_frame = false, returned_text = false, input_order = false, got_stop = false, got_release = false, got_uncapped = false;
+    Transport a,b,wrong;
+    bool got_snapshot=false,got_cursor=false,got_diagnostics=false,got_encode_diagnostics=false,got_host_ended=false;int snapshot_count=0,cursor_count=0;
+    TransportCallbacks bcb;
+    bcb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); if (s == L"Hive \x4e2d\x6587 \xd83d\xde80") state = 1; cv.notify_all(); };
+    bcb.input = [&](const std::string&,const InputEvent& e) { std::lock_guard lock(mutex); if (e.kind == InputKind::ReleaseAll) got_release = true; else { input_order = state == 1 && e.kind == InputKind::Key && e.a == 30; state = 2; } cv.notify_all(); };
+    bcb.start_stream = [&](const std::string&,const StreamSettings& s) { std::lock_guard lock(mutex); if (state == 2 && s.fps == 237 && s.bitrate_mbps == 80) state = 3; else if (state == 3 && s.fps == 0 && s.bitrate_mbps == 80) got_uncapped = true; cv.notify_all(); };
+    bcb.stop_stream = [&](const std::string&) { std::lock_guard lock(mutex); got_stop = true; cv.notify_all(); };
+    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.keyframe && f.data == Bytes({0,0,0,1,42,99}); cv.notify_all(); };
+    TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
+    acb.host_ended=[&](const std::string& peer,uint64_t session){std::lock_guard lock(mutex);got_host_ended=peer=="test-b"&&session==91;cv.notify_all();};
+    acb.diagnostics=[&](const std::string&,const SourceDiagnostics& d){std::lock_guard lock(mutex);const bool base=d.session==91&&d.encoded_millihz==59940&&d.encode_us==1234&&d.capture_wait_us==5678&&d.send_wait_us_per_second==9000&&d.feedback_age_us==11000&&d.network_extra_us==13000;if(d.encode_details)got_encode_diagnostics=base&&d.color_us==500&&d.nvenc_us==734&&d.encode_age_us==10000;else got_diagnostics=base;cv.notify_all();};
+    bcb.snapshot_request=[&](const std::string& peer,uint64_t request){b.send_snapshot(peer,{request,{0xff,0xd8,42,0xff,0xd9}});};
+    acb.snapshot=[&](const std::string&,Snapshot snapshot){std::lock_guard lock(mutex);++snapshot_count;got_snapshot=snapshot.request==901&&snapshot.jpeg==Bytes({0xff,0xd8,42,0xff,0xd9});cv.notify_all();};
+    acb.cursor=[&](const std::string&,CursorState cursor){std::lock_guard lock(mutex);++cursor_count;
+        got_cursor=cursor.position_revision==77&&cursor.x==12345&&cursor.y==54321&&
+            (cursor_count==1?(cursor.visible&&cursor.width==2&&cursor.hotspot_x==1&&cursor.mask==Bytes(8,0xff)):
+             (!cursor.visible&&cursor.width==0));cv.notify_all();};
+    std::string error,id; TransportConfig acfg{"test-a","Transport A",key,0,false}, bcfg{"test-b","Transport B",key,0,false};
+    if (!a.start(acfg,acb,error) || !b.start(bcfg,bcb,error) || !a.connect("127.0.0.1",b.impl_->cfg.port,id,error) || id != "test-b") { result = "Loopback connection failed: " + error; return false; }
+    if(!a.connect("127.0.0.1",b.impl_->cfg.port,id,error)||id!="test-b"||
+       !b.connect("127.0.0.1",a.impl_->cfg.port,id,error)||id!="test-a") {
+        result="Connecting by IP did not reuse the existing authenticated pair.";return false;
+    }
+    std::string wrong_key=key;wrong_key[0]='a';
+    TransportConfig wcfg{"test-wrong","Wrong key",wrong_key,0,false};
+    if (!wrong.start(wcfg,{},error)) { result = "Wrong-key test setup failed."; return false; }
+    if (wrong.connect("127.0.0.1",b.impl_->cfg.port,id,error) || !wrong.peers().empty()) { result = "Wrong Network Key was accepted."; return false; }
+    CursorState cursor;cursor.x=12345;cursor.y=54321;cursor.position_revision=77;cursor.width=2;cursor.height=1;cursor.hotspot_x=1;cursor.mask=Bytes(8,0xff);
+    bool ok=a.request_snapshot("test-b",901)&&b.send_cursor("test-a",cursor)&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000})&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000,500,734,10000,true});
+    {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_snapshot&&got_cursor&&got_diagnostics&&got_encode_diagnostics;})&&ok;
+        ok=ok&&state==0&&snapshot_count==1;}
+    cursor.width=cursor.height=cursor.hotspot_x=0;cursor.mask.clear();cursor.visible=false;
+    ok=b.send_cursor("test-a",cursor)&&ok;
+    ok = a.send_clipboard("test-b",L"Hive \x4e2d\x6587 \xd83d\xde80") && a.send_input("test-b",{InputKind::Key,30,0,0}) && a.request_stream("test-b",{237,80}) && a.request_stream("test-b",{0,80}) && ok;
+    EncodedFrame frame; frame.width = 1920; frame.height = 1080; frame.sequence = 42; frame.capture_time_us = 123456; frame.keyframe = true; frame.data = {0,0,0,1,42,99};
+    const auto token_before_kick=a.connection_token("test-b");
+    ok = ok && a.send_frame("test-b",frame) && b.send_clipboard("test-a",L"return") && b.end_stream("test-a",91); a.stop_stream("test-b");
+    {
+        std::unique_lock lock(mutex); ok = cv.wait_for(lock,std::chrono::seconds(5),[&] { return state == 3 && got_uncapped && input_order && received_frame && returned_text && got_stop && got_host_ended && got_cursor && cursor_count==2; }) && ok;
+    }
+    ok=ok&&token_before_kick&&a.connection_token("test-b")==token_before_kick&&a.frame_ready("test-b")&&b.frame_ready("test-a");
+    {
+        const auto deadline=Clock::now()+std::chrono::milliseconds(500);
+        auto timing=a.video_send_diagnostics("test-b");
+        while(timing.available&&!timing.completed_packets&&Clock::now()<deadline){Sleep(1);timing=a.video_send_diagnostics("test-b");}
+        if(!timing.available||!timing.connection||!timing.submitted_packets||!timing.completed_packets||timing.completed_bytes<frame.data.size()+28||
+            timing.sample_age_us==UINT32_MAX||timing.failed_packets||a.video_send_diagnostics("missing-peer").available){
+            result="Encrypted video loopback did not expose valid local sender timings";return false;
+        }
+    }
+    std::wstring oversized(kMaxClipboard/2+1,L'x'), malformed(1,wchar_t(0xd800));
+    ok=ok&&!a.request_stream("test-b",{0,0,0,1})&&!a.request_stream("test-b",{0,0,2000001,1})&&
+        !a.send_health("test-b",{1,60000,60001,0})&&!a.send_health("test-b",{1,60000,60000,8})&&!a.send_feedback("test-b",{})&&!a.send_diagnostics("test-b",{})&&!a.send_diagnostics("test-b",{1,4000001})&&!a.send_diagnostics("test-b",{1,60000,0,0,1000001});
+    ok = ok && !a.send_clipboard("test-b",oversized) && !a.send_clipboard("test-b",malformed) && !a.send_input("test-b",{InputKind(999),0,0,0});
+    frame.data.resize(kMaxFrame+1); ok = ok && !a.send_frame("test-b",frame);
+    cursor.width=257;ok=ok&&!b.send_cursor("test-a",cursor)&&!a.request_snapshot("test-b",0)&&!b.send_snapshot("test-a",{901,Bytes(MaxSnapshotBytes+1)});
+    auto before = std::chrono::steady_clock::now(); wrong.stop(); ok = a.send_input("test-b",{InputKind::ReleaseAll}) && ok; a.stop();
+    { std::unique_lock lock(mutex); ok = cv.wait_for(lock,std::chrono::milliseconds(500),[&] { return got_release; }) && ok; }
+    b.stop();
+    ok = ok && std::chrono::steady_clock::now()-before < std::chrono::seconds(3);
+    {
+        // The receiving parser deliberately stops draining the video socket
+        // after one valid encrypted packet. A full-size subsequent packet must
+        // hit the bounded write deadline, cancel safely and tear down both
+        // channels, rather than queue old motion for later playback.
+        std::mutex guard;std::condition_variable changed;bool blocked=false,release=false,disconnected=false;unsigned frames=0;
+        Transport sender,receiver;
+        struct Unblock {std::mutex& guard;std::condition_variable& changed;bool& release;~Unblock(){std::lock_guard lock(guard);release=true;changed.notify_all();}} unblock{guard,changed,release};
+        TransportCallbacks sending,receiving;
+        sending.peer=[&](const Peer& peer){if(!peer.authenticated){std::lock_guard lock(guard);disconnected=true;changed.notify_all();}};
+        receiving.frame=[&](const std::string&,EncodedFrame){
+            std::unique_lock lock(guard);++frames;blocked=true;changed.notify_all();
+            changed.wait_for(lock,std::chrono::seconds(3),[&]{return release;});
+        };
+        std::string failure,peer;
+        if(!sender.start({"stalled-a","Stalled sender","",0,false,true},sending,failure)||
+            !receiver.start({"stalled-b","Stalled receiver","",0,false,true},receiving,failure)||
+            !sender.connect("127.0.0.1",receiver.impl_->cfg.port,peer,failure)){
+            result="Stalled video setup failed: "+failure;return false;
+        }
+        auto video=receiver.impl_->find("stalled-a",true);
+        const int receive_buffer=4096;
+        if(!video||setsockopt(video->socket.load(),SOL_SOCKET,SO_RCVBUF,reinterpret_cast<const char*>(&receive_buffer),sizeof(receive_buffer))){
+            result="Stalled video receive buffer setup failed";return false;
+        }
+        EncodedFrame initial;initial.width=initial.height=2;initial.keyframe=true;initial.data={1,2,3};
+        bool stalled_ok=sender.send_frame("stalled-b",initial);
+        {std::unique_lock lock(guard);stalled_ok=changed.wait_for(lock,std::chrono::seconds(1),[&]{return blocked;})&&stalled_ok;}
+        EncodedFrame large=initial;large.sequence=1;large.data.resize(kMaxFrame,42);
+        const auto began=Clock::now();stalled_ok=sender.send_frame("stalled-b",large)&&stalled_ok;
+        {std::unique_lock lock(guard);stalled_ok=changed.wait_for(lock,std::chrono::seconds(1),[&]{return disconnected;})&&stalled_ok;release=true;changed.notify_all();}
+        const auto elapsed=Clock::now()-began;
+        stalled_ok=stalled_ok&&elapsed<std::chrono::seconds(1)&&!sender.connection_token("stalled-b");
+        sender.stop();receiver.stop();
+        {std::lock_guard lock(guard);stalled_ok=stalled_ok&&frames==1;}
+        if(!stalled_ok){result="Stalled encrypted video did not cancel within its deadline, close both channels, or discard unsent replay";return false;}
+    }
+    result = ok ? "PASS: dedicated encrypted input with clipboard/start handshake, eight completed-injection credits, bounded edge-safe motion merge, submitted-send/ACK latency metrics, blocked-control independence, session finish without replay, negative/missing ACK recovery, and reciprocal input preserved across an urgent kick plus late control notice; legacy input/capability compatibility; short Network Key derivation/reference vector, authenticated three-channel loopback, wrong-key and AES-GCM tamper rejection; stream/frame/diagnostic bounds; host kick/session isolation; bounded shutdown; 50 ms unsent-video expiry and IDR recovery; local WSASend metrics; stalled 16 MiB video write canceled within 1 s." : "Transport loopback, ordering, bounds, or shutdown failed.";
+    return ok;
+}
+}

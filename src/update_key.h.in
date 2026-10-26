@@ -1,0 +1,5 @@
+#pragma once
+namespace hive::update {
+constexpr char PublicModulus[]="@HIVEDESK_UPDATE_MODULUS@";
+constexpr char PublicExponent[]="@HIVEDESK_UPDATE_EXPONENT@";
+}

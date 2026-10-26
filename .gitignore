@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/dist/
+/settings/bin/
+/settings/obj/
+/.local/
+*.user
+*.pdb
+*.log
+*.dpapi
+*.pfx
+*.p12
+.env
+.env.*
