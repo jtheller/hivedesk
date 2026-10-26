@@ -1,0 +1,3 @@
+# Signatures cover exact bytes; Windows checkout conversion must not alter them.
+tests/fixtures/update/update.manifest -text
+*.sig binary
