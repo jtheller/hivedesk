@@ -3,6 +3,7 @@
 #include "hivedesk/input_channel.h"
 #include <array>
 #include <algorithm>
+#include <system_error>
 
 namespace hive::broker {
 constexpr uint32_t InputMaxBytes=128;
@@ -37,13 +38,26 @@ inline bool read_input_ack(const Bytes& bytes,InputAck& ack){
 inline uint32_t input_elapsed_us(uint64_t from,uint64_t to){
     return from&&to>=from?uint32_t(std::min<uint64_t>(UINT32_MAX,to-from)):0;
 }
+// A desktop can change between attachment and SendInput. Retry one rejected
+// Windows operation only, within the original age/authority checks. Accepted
+// input is never retried and this cannot extend the 100ms freshness limit.
+template<class Operation,class Fresh,class Pause>
+bool retry_desktop_input(Operation&& operation,Fresh&& fresh,Pause&& pause){
+    for(unsigned attempt=0;attempt<2;++attempt){
+        if(!fresh())return false;
+        try{return operation();}
+        catch(const std::system_error&){if(attempt||!fresh())throw;pause();}
+    }
+    return false;
+}
+struct IgnoreInputError {void operator()(const std::string&)const{}};
 
 // The sole injection owner runs on a windowless, hook-free desktop thread.
 // Its pipe, queue and ACKs never share media IPC or a MediaHost lock. Callbacks
 // keep injection mockable without any production mode that bypasses identity.
-template<class Authorize,class Inject,class Release>
+template<class Authorize,class Inject,class Release,class ReportError=IgnoreInputError>
 bool serve_input(HANDLE pipe,DWORD expected_pid,const std::atomic<bool>& stopped,
-    Authorize&& authorize,Inject&& inject,Release&& release){
+    Authorize&& authorize,Inject&& inject,Release&& release,ReportError report_error={}){
     struct Cleanup {Release& release;~Cleanup(){try{release();}catch(...){}}} cleanup{release};
     Kind kind{};Bytes bytes;ULONG client_pid=0;
     if(!expected_pid||!GetNamedPipeClientProcessId(pipe,&client_pid)||client_pid!=expected_pid||
@@ -57,14 +71,21 @@ bool serve_input(HANDLE pipe,DWORD expected_pid,const std::atomic<bool>& stopped
         if(kind!=Input||!read_input_packet(bytes,packet)||packet.session!=session||packet.sequence<=completed||!authorize(session))return false;
         InputAck ack;ack.session=session;ack.sequence=packet.sequence;ack.capture_time_us=packet.capture_time_us;
         const auto started=input_now_us();ack.host_queue_us=input_elapsed_us(packet.received_time_us,started);
+        std::string problem;
         try{
             if(packet.received_time_us&&packet.received_time_us<=started&&started-packet.received_time_us<=InputMaxQueueUs)
                 ack.injected=inject(packet);
-        }catch(...){ack.injected=false;}
+        }catch(const std::system_error& error){problem="Windows error "+std::to_string(error.code().value())+": "+error.what();}
+        catch(const std::exception& error){problem=error.what();}
+        catch(...){problem="Unknown desktop input failure";}
         // Only after the injection call returns. This measures Windows input
         // acceptance, never application handling, GPU rendering or scanout.
         ack.inject_us=input_elapsed_us(started,input_now_us());completed=packet.sequence;
-        if(!ack.injected){try{release();}catch(...){}}
+        if(!ack.injected){
+            try{release();}catch(...){}
+            if(problem.empty())problem="Input rejected: session revoked, event expired, or desktop unavailable";
+            try{report_error(problem);}catch(...){}
+        }
         if(!send_input_message(pipe,InputComplete,input_ack_bytes(ack),&stopped))return false;
         if(!ack.injected){
             // DisconnectNamedPipe discards unread outbound data. Keep the

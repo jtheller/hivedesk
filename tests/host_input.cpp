@@ -35,8 +35,8 @@ struct InputServer {
     std::vector<INPUT> observed;
     std::future<bool> worker;
     std::atomic<unsigned> released=0;
-    InputServer(uint64_t session=7,DWORD pid=GetCurrentProcessId(),std::function<void()> before={}):authorized(session){
-        worker=std::async(std::launch::async,[this,pid,before=std::move(before)]{
+    InputServer(uint64_t session=7,DWORD pid=GetCurrentProcessId(),std::function<void()> before={},std::function<void(const std::string&)> report={}):authorized(session){
+        worker=std::async(std::launch::async,[this,pid,before=std::move(before),report=std::move(report)]{
             const bool result=broker::serve_input(pipe.server,pid,stopped,
                 [&](uint64_t session){return authorized.load()==session;},
                 [&](const InputPacket& packet){
@@ -46,7 +46,7 @@ struct InputServer {
                 },[&]{
                     const std::lock_guard lock(state_mutex);
                     state.release([&](INPUT& input){observed.push_back(input);return true;});++released;
-                });
+                },[&](const std::string& problem){if(report)report(problem);});
             DisconnectNamedPipe(pipe.server);return result;
         });
     }
@@ -145,8 +145,36 @@ void binding_and_release_check(){
         input.stop();racing_send.get();require(!input.held()&&input.released==1,"Concurrent send/stop or restart retained held input");
     }
 }
+void desktop_error_and_retry_check(){
+    unsigned calls=0,pauses=0;bool fresh=true;
+    const auto denied=[]()->bool{throw std::system_error(ERROR_ACCESS_DENIED,std::system_category(),"Attach input desktop");};
+    require(broker::retry_desktop_input([&]{if(++calls==1)return denied();return true;},[&]{return fresh;},[&]{++pauses;}),"Transient desktop rejection did not recover");
+    require(calls==2&&pauses==1,"Desktop retry duplicated accepted input");
+    calls=pauses=0;bool rejected=false;
+    try{broker::retry_desktop_input([&]()->bool{++calls;return denied();},[&]{return fresh;},[&]{++pauses;});}catch(const std::system_error& error){rejected=error.code().value()==ERROR_ACCESS_DENIED;}
+    require(rejected&&calls==2&&pauses==1,"Persistent denial lost error or retried without bound");
+    calls=pauses=0;
+    require(!broker::retry_desktop_input([&]()->bool{++calls;return denied();},[&]{return fresh;},[&]{++pauses;fresh=false;}),"Expired/revoked packet retried after desktop switch");
+    require(calls==1&&pauses==1,"Expired input operation ran again");
+    fresh=true;calls=pauses=0;
+    require(broker::retry_desktop_input([&]{++calls;return true;},[&]{return fresh;},[&]{++pauses;})&&calls==1&&pauses==0,"Normal input incurred retry delay");
+    Pipe pipe;std::atomic<bool> stopped=false;
+    auto worker=std::async(std::launch::async,[&]{return broker::serve_input(pipe.server,GetCurrentProcessId(),stopped,
+        [](uint64_t session){return session==7;},[&](const InputPacket&)->bool{return denied();},[]{},
+        [&](const std::string& problem){require(problem.find("Windows error 5")!=std::string::npos,"Desktop error number was swallowed");
+            require(broker::send_input_message(pipe.server,broker::Notice,broker::Bytes(problem.begin(),problem.end()),&stopped),"Independent input error notice failed");});});
+    struct Stop {std::atomic<bool>& stopped;HANDLE pipe;~Stop(){stopped=true;CancelIoEx(pipe,nullptr);}} stop{stopped,pipe.server};
+    broker::Bytes bytes;broker::u64(bytes,7);broker::Kind kind;
+    require(broker::send_input_message(pipe.client,broker::InputStart,bytes,&stopped)&&broker::receive(pipe.client,kind,bytes,&stopped,broker::InputMaxBytes)&&kind==broker::InputStarted,"Error test startup failed");
+    InputPacket packet{7,1,100,{InputKind::Key,0x1e,0,0},input_now_us()};
+    require(broker::send_input_message(pipe.client,broker::Input,broker::input_packet_bytes(packet),&stopped),"Error test send failed");
+    require(broker::receive(pipe.client,kind,bytes,&stopped,broker::InputMaxBytes)&&kind==broker::Notice,"Error report missing before rejection ACK");
+    InputAck ack;require(broker::receive(pipe.client,kind,bytes,&stopped,broker::InputMaxBytes)&&kind==broker::InputComplete&&broker::read_input_ack(bytes,ack)&&!ack.injected,"Failure notice hid input rejection ACK");
+    pipe.disconnect();require(worker.wait_for(std::chrono::seconds(2))==std::future_status::ready&&!worker.get(),"Failed input owner did not close");
+}
+
 }
 int main(){try{
-    state_check();wire_check();blocked_media_check();completion_check();binding_and_release_check();
-    std::puts("PASS host input: real independent pipe under blocked video, process/session/sequence binding, post-injection ACK, expiry, release retries, revoke/close and restarts. Fake sender only; no desktop input injected.");return 0;
+    state_check();wire_check();blocked_media_check();completion_check();binding_and_release_check();desktop_error_and_retry_check();
+    std::puts("PASS host input: real independent pipe under blocked video, process/session/sequence binding, post-injection ACK, expiry, release retries, revoke/close, desktop retries/error notices and restarts. Fake sender only; no desktop input injected.");return 0;
 }catch(const std::exception& error){std::printf("FAIL host input: %s\n",error.what());return 1;}}

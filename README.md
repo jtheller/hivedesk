@@ -5,6 +5,10 @@ Windows-native personal LAN desktop switching. This is an early hardware-tested 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+Alpha.29 fixes the input desktop access mask and preserves video frame sequence
+numbers across lock/unlock capture restarts. Upgrade the controlled computer;
+live PIN-screen acceptance still needs a user-operated lock/unlock check.
+
 Alpha.28 adds a live ~16ms diagnostic HUD, metric warning colors and a translucent,
 click-through background. Update both computers for fast source diagnostics.
 

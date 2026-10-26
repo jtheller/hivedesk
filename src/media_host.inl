@@ -5,6 +5,7 @@ struct MediaHost::Impl {
     std::condition_variable changed;
     FrameTimer pacing_timer;
     std::thread worker;
+    CaptureSequence sequence;
     StreamFeedback feedback{};
     uint64_t session=0,feedback_time=0,feedback_sequence=0,last_recovery=0;
     void wake(){changed.notify_all();pacing_timer.notify();}
@@ -16,6 +17,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
     stop();
     if(!output){error="Missing encoded-frame callback.";return false;}
     if(settings.session&&(settings.receiver_millihz<1000||settings.receiver_millihz>2000000)){error="Invalid receiver refresh rate.";return false;}
+    impl_->sequence.begin(settings.session);
     {std::lock_guard lock(impl_->wait_mutex);impl_->stop=false;impl_->keyframe=true;impl_->feedback={};impl_->session=settings.session;impl_->feedback_time=impl_->feedback_sequence=impl_->last_recovery=0;}
     std::promise<std::string> initialized;auto ready=initialized.get_future();
     impl_->worker=std::thread([this,settings,output=std::move(output),ready_to_send=std::move(ready_to_send),health=std::move(health),diagnostics=std::move(diagnostics),initialized=std::move(initialized)]()mutable{
@@ -106,7 +108,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                 }catch(...){fail(std::current_exception());}});
                 log(std::string("Video pipeline: ")+(encoder.asynchronous()?"NVENC async events":"NVENC synchronous output worker")+", 4 IO slots / 2 in flight, bounded fresh-frame delivery.");
                 initialized.set_value({});announced=true;
-                bool have_picture=false;uint64_t sequence=0;
+                bool have_picture=false;
                 auto deadline=Clock::now(),last_keyframe=deadline;
                 SendBackpressure send_pressure;
                 uint64_t diagnostic_since=now_us(),last_health=0,last_report_stamp=0,network_floor=UINT64_MAX;
@@ -221,10 +223,11 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         if((forced&&completed.reserved()!=0)||!completed.reserve_completion()){if(forced)impl_->keyframe=true;continue;}
                     }
                     bool submitted=false,completion_queued=false;
+                    const auto sequence=impl_->sequence.next();
                     try{submitted=encoder.submit_texture(capture.texture(),sequence,forced||sequence==0,now_us(),&completion_queued);}
-                    catch(...){if(!completion_queued){std::lock_guard lock(impl_->wait_mutex);completed.cancel_completion();}throw;}
+                    catch(...){if(completion_queued)impl_->sequence.submitted();else{std::lock_guard lock(impl_->wait_mutex);completed.cancel_completion();}throw;}
                     if(submitted){
-                        ++sequence;if(forced)last_keyframe=Clock::now();deadline=advance_frame_deadline(deadline,capture_started,interval);
+                        impl_->sequence.submitted();if(forced)last_keyframe=Clock::now();deadline=advance_frame_deadline(deadline,capture_started,interval);
                     }else{
                         std::lock_guard lock(impl_->wait_mutex);completed.cancel_completion();if(forced)impl_->keyframe=true;
                     }

@@ -57,19 +57,29 @@ struct Session {
             }
             CloseHandle(operation.hEvent);
             if(connected&&!input_stopping&&!parent_gone){
-                InputDesktop desktop;bool first_input=true;
+                InputDesktop desktop(DesktopUse::Input);bool first_input=true;
                 broker::serve_input(input_pipe,client_pid,input_stopping,
                     [this](uint64_t session){return !input_stopping&&!parent_gone&&input_session.load()==session;},
                     [&](const InputPacket& packet){
-                        const bool changed=desktop.attach();
-                        if(changed||first_input){inject_input({InputKind::ReleaseAll});first_input=false;}
-                        // Desktop switches can themselves stall. Recheck age
-                        // after attachment before admitting the actual event.
-                        if(input_now_us()-packet.received_time_us>broker::InputMaxQueueUs)return false;
-                        inject_input(packet.event);return true;
+                        const auto fresh=[&]{const auto now=input_now_us();return !input_stopping&&!parent_gone&&input_session.load()==packet.session&&
+                            packet.received_time_us&&now>=packet.received_time_us&&now-packet.received_time_us<=broker::InputMaxQueueUs;};
+                        return broker::retry_desktop_input([&]{
+                            if(desktop.attach())first_input=true;
+                            if(first_input){inject_input({InputKind::ReleaseAll});first_input=false;}
+                            // Attachment/release can stall. Recheck authority
+                            // and original age immediately before injection.
+                            if(!fresh())return false;
+                            inject_input(packet.event);return true;
+                        },fresh,[]{Sleep(1);});
                     },[&]{
                         try{desktop.attach();}catch(...){}
                         release_injected_input();
+                    },[&](const std::string& error){
+                        auto message=error+" [desktop="+narrow(desktop_name(GetThreadDesktop(GetCurrentThreadId())))+"]";
+                        if(message.size()>broker::InputMaxBytes)message.resize(broker::InputMaxBytes);
+                        // Use the independent input pipe, so a blocked video
+                        // write cannot hide the rejection. No key/PIN content.
+                        broker::send_input_message(input_pipe,broker::Notice,broker::Bytes(message.begin(),message.end()),&input_stopping);
                     });
             }
             // Closing the dedicated pipe makes an input failure visible to the
@@ -99,10 +109,12 @@ struct Session {
             while(!stopping){
                 Sleep(100);if(stopping)break;
                 std::lock_guard lock(media_mutex);
-                if(active&&(captured_desktop!=input_desktop_name()||!media.running())){
+                const auto desktop=input_desktop_name();
+                if(active&&(captured_desktop!=desktop||!media.running())){
+                    const auto previous_desktop=captured_desktop;
                     media.stop();if(stopping)break;std::string error;start_media(error);
                     if(!error.empty()&&error!=previous_error)notice("Capture restart: "+error);
-                    if(error.empty()&&!previous_error.empty())notice("Capture resumed.");previous_error=error;
+                    if(error.empty())notice("Capture resumed: "+narrow(previous_desktop)+" -> "+narrow(captured_desktop)+"; preserving stream frame sequence.");previous_error=error;
                     if(!error.empty())Sleep(150);
                 }
             }

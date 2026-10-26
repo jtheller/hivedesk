@@ -8,6 +8,7 @@
 #include "frame_timer.h"
 #include "source_queue.h"
 #include "capture_updates.h"
+#include "capture_sequence.h"
 #include "viewer_queue.h"
 #include <d3d11.h>
 #include <dxgi1_6.h>

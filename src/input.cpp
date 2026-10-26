@@ -2,6 +2,7 @@
 #include "input_state.h"
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 
 namespace hive {namespace {
 std::mutex injected_mutex;
@@ -16,6 +17,6 @@ void release_injected_input(){
 void inject_input(const InputEvent& event){
     const std::lock_guard lock(injected_mutex);
     SetLastError(ERROR_SUCCESS);
-    if(!injected.apply(event,send))throw std::runtime_error("Input injection denied: "+std::to_string(GetLastError()));
+    if(!injected.apply(event,send))throw std::system_error(GetLastError(),std::system_category(),"SendInput rejected on attached desktop");
 }
 }

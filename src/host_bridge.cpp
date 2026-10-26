@@ -94,6 +94,10 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
                     if(kind!=broker::InputStarted||!payload.empty())break;
                     announced=true;input_promise->set_value(true);continue;
                 }
+                if(kind==broker::Notice){
+                    if(payload.empty())break;
+                    log("Desktop input: "+std::string(payload.begin(),payload.end()));continue;
+                }
                 InputAck ack;
                 if(kind!=broker::InputComplete||!broker::read_input_ack(payload,ack)||ack.session!=impl_->input_session.load()||ack.sequence<=completed)break;
                 completed=ack.sequence;
