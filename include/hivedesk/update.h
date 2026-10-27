@@ -9,6 +9,7 @@
 namespace hive::update {
 constexpr wchar_t PendingEvent[]=L"Global\\HiveDesk.Update.Pending.v1";
 constexpr wchar_t StartupMutex[]=L"Global\\HiveDesk.Update.Startup.v1";
+constexpr wchar_t CheckEvent[]=L"Global\\HiveDesk.Update.Check.v1";
 struct Version {
     std::array<uint32_t,5> parts{};
     auto operator<=>(const Version&) const = default;
@@ -31,6 +32,10 @@ bool is_system();
 bool system_owned(HANDLE);
 HANDLE create_system_event(const wchar_t*);
 HANDLE create_system_mutex(const wchar_t*,bool user_access=false);
+HANDLE create_system_check_event();
+// Only wakes the existing SYSTEM worker; never stages or installs in the caller.
+bool request_check();
+bool signal_check_event(HANDLE);
 std::filesystem::path private_cache();
 void log(const std::string&);
 void launch_worker(HANDLE& process); // SYSTEM service only, copies runner out of install tree.

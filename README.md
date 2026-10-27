@@ -5,6 +5,10 @@ Windows-native personal LAN desktop switching. This is an early hardware-tested 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+Alpha.32 adds **Check for updates** beside the Settings version. It verifies the
+latest signed release immediately and requests an earlier automatic update check
+when a newer version is available. Installation still waits for idle connections.
+
 Alpha.31 separates encoder throughput from frame latency, carries encoded-output
 completion timing to distinguish source work from network backlog, and makes
 source status reporting nonblocking. Receiver decode, color conversion and

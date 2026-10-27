@@ -49,12 +49,15 @@ template<class Sink>void request(const std::wstring& url,uint64_t limit,Sink sin
     for(;;){DWORD count=0;require(WinHttpReadData(req.value,buffer.data(),DWORD(buffer.size()),&count)!=FALSE,"Release read failed");if(!count)break;
         total+=count;require(total<=limit&&GetTickCount64()-started<10*60*1000,"Release download exceeded size/time bound");sink(buffer.data(),count);}
 }
-HANDLE object(const wchar_t* name,bool mutex,bool users){
+HANDLE object(const wchar_t* name,bool mutex,bool users,bool check=false){
     // Users may observe the event, and briefly acquire the startup barrier.
-    const wchar_t* descriptor=users?L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00120001;;;AU)":
+    // The check event is separate: authenticated users may signal and inspect
+    // its owner, but cannot wait on it and consume another user's request.
+    const wchar_t* descriptor=check?L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00020002;;;AU)":
+        users?L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00120001;;;AU)":
         L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00120000;;;AU)";
     PSECURITY_DESCRIPTOR security=nullptr;require(ConvertStringSecurityDescriptorToSecurityDescriptorW(descriptor,SDDL_REVISION_1,&security,nullptr)!=FALSE,"Update object ACL failed");
-    SECURITY_ATTRIBUTES attrs{sizeof(attrs),security,FALSE};HANDLE handle=mutex?CreateMutexW(&attrs,FALSE,name):CreateEventW(&attrs,TRUE,FALSE,name);LocalFree(security);
+    SECURITY_ATTRIBUTES attrs{sizeof(attrs),security,FALSE};HANDLE handle=mutex?CreateMutexW(&attrs,FALSE,name):CreateEventW(&attrs,check?FALSE:TRUE,FALSE,name);LocalFree(security);
     require(handle!=nullptr,"Update coordination object unavailable");if(!system_owned(handle)){CloseHandle(handle);throw std::runtime_error("Update coordination object has wrong owner");}return handle;
 }
 }
@@ -116,6 +119,9 @@ bool system_owned(HANDLE handle){PSID owner=nullptr;PSECURITY_DESCRIPTOR securit
 bool pending(){Handle event{OpenEventW(SYNCHRONIZE|READ_CONTROL,FALSE,PendingEvent)};return event.value&&system_owned(event.value)&&WaitForSingleObject(event.value,0)==WAIT_OBJECT_0;}
 HANDLE create_system_event(const wchar_t* name){return object(name,false,false);}
 HANDLE create_system_mutex(const wchar_t* name,bool users){return object(name,true,users);}
+HANDLE create_system_check_event(){return object(CheckEvent,false,false,true);}
+bool signal_check_event(HANDLE event){return event&&event!=INVALID_HANDLE_VALUE&&system_owned(event)&&SetEvent(event)!=FALSE;}
+bool request_check(){Handle event{OpenEventW(EVENT_MODIFY_STATE|READ_CONTROL,FALSE,CheckEvent)};return signal_check_event(event.value);}
 StartupGuard::StartupGuard(){
     if(!is_installed_agent())return;handle_=OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE|READ_CONTROL,FALSE,StartupMutex);
     if(!handle_){allowed_=!pending();return;}if(!system_owned(handle_)){allowed_=false;return;}

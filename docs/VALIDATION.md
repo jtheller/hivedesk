@@ -1,5 +1,26 @@
 # Alpha validation
 
+## Alpha 32 manual update check
+
+- Settings adds one action beside the version without changing its fixed size.
+  The native helper verifies the signed public release; newer versions signal a
+  separate SYSTEM-owned event that wakes the existing update worker. The current
+  idle-session admission, download verification and installation path are reused.
+- Release native compilation and 25/25 CTest checks passed. The update test adds
+  invalid/untrusted wake-handle rejection without changing those events' state.
+  The actual helper successfully verified the public release and returned the
+  structured current-version result.
+- The managed bridge checks passed LF/CRLF status parsing, malformed/version
+  rejection, async completion, failed helper exit, timeout, caller cancellation,
+  a stuck task and missing helper. No test starts the installed SYSTEM updater.
+- Actual WinUI light/dark self-tests run on a private non-input desktop and check
+  the version/button bounds, disabled busy state, duplicate-request prevention,
+  current/requested/unavailable/error messages and existing preference controls.
+  The launcher never switches desktops or sends keyboard/mouse input.
+- No new live privileged wake/download/install cycle is claimed by these tests.
+  Alpha.31 rendering behavior is unchanged; physical rendering cadence remains
+  a separate two-computer measurement.
+
 ## Alpha 31 pipeline scheduling and freshness
 
 - Encoder capacity is observed only when GPU slots block the producer beyond

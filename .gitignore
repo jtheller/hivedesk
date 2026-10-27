@@ -3,6 +3,8 @@
 /dist/
 /settings/bin/
 /settings/obj/
+/tests/settings_update/bin/
+/tests/settings_update/obj/
 /.local/
 *.user
 *.pdb

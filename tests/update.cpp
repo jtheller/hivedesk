@@ -39,7 +39,17 @@ int main(int argc,char** argv){try{
     require(!update::idle_for_update(false,false,true,false),"Pending reconnect could be interrupted");
     require(!update::idle_for_update(false,false,false,true),"Queued selection could be interrupted");
     require(!update::idle_for_update(true,true,true,true),"Reciprocal session could be interrupted");
-    HANDLE untrusted=CreateEventW(nullptr,TRUE,TRUE,nullptr);require(untrusted!=nullptr,"Event fixture failed");
-    if(!update::is_system())require(!update::system_owned(untrusted),"Unprivileged update request trusted");CloseHandle(untrusted);
-    std::cout<<"PASS updater: numeric versions, pinned release signature, tamper/truncation/path rejection, SHA256, idle session policy and coordination owner validation\n";return 0;
+    require(!update::signal_check_event(nullptr)&&!update::signal_check_event(INVALID_HANDLE_VALUE),"Invalid update wake handle accepted");
+    HANDLE untrusted=CreateEventW(nullptr,FALSE,FALSE,nullptr);require(untrusted!=nullptr,"Event fixture failed");
+    if(!update::is_system()){
+        require(!update::system_owned(untrusted),"Unprivileged update request trusted");
+        require(!update::signal_check_event(untrusted),"Unprivileged update wake event trusted");
+        require(WaitForSingleObject(untrusted,0)==WAIT_TIMEOUT,"Rejected update wake modified an untrusted event");
+    }else{
+        // This is an anonymous fixture, never the installed worker's event.
+        require(update::signal_check_event(untrusted)&&update::signal_check_event(untrusted),"Trusted update wake rejected");
+        require(WaitForSingleObject(untrusted,0)==WAIT_OBJECT_0&&WaitForSingleObject(untrusted,0)==WAIT_TIMEOUT,"Update requests did not coalesce");
+    }
+    CloseHandle(untrusted);
+    std::cout<<"PASS updater: numeric versions, pinned release signature, tamper/truncation/path rejection, SHA256, idle session policy and manual-check event owner validation\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL update: "<<error.what()<<'\n';return 1;}}

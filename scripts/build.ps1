@@ -45,6 +45,8 @@ foreach ($libraryEntry in $assets.libraries.PSObject.Properties) {
 if (-not $SkipTests) {
     ctest --test-dir (Join-Path $projectRoot 'build') --output-on-failure
     if ($LASTEXITCODE) { throw 'Verification failed.' }
+    & $dotnet run --project (Join-Path $projectRoot 'tests\settings_update\HiveDesk.Settings.UpdateCheck.csproj') -c Release --artifacts-path (Join-Path $projectRoot 'build\settings-update-tests')
+    if ($LASTEXITCODE) { throw 'Settings update bridge verification failed.' }
     foreach ($theme in @('light','dark')) {
         $report = Join-Path $projectRoot ('build\winui-' + $theme + '-test.txt')
         $probe = Start-Process -FilePath (Join-Path $settingsOutput 'HiveDesk.Settings.exe') -ArgumentList @('--self-test',('--'+$theme),('--report="'+$report+'"')) -PassThru

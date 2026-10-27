@@ -68,7 +68,30 @@ bool processes_present(const std::filesystem::path& root,Users& users){
     return found;
 }
 bool still_installed(const std::filesystem::path& root){return !root.empty()&&root==update::installed_directory()&&std::filesystem::exists(root/L"HiveDesk.exe");}
-bool wait_installed(const std::filesystem::path& root,unsigned seconds){for(unsigned i=0;i<seconds;++i){if(!still_installed(root))return false;Sleep(1000);}return true;}
+bool wait_installed(const std::filesystem::path& root,unsigned seconds,HANDLE check=nullptr){
+    for(unsigned i=0;i<seconds;++i){
+        if(!still_installed(root))return false;
+        if(!check){Sleep(1000);continue;}
+        const auto result=WaitForSingleObject(check,1000);
+        if(result==WAIT_OBJECT_0)return still_installed(root);
+        if(result!=WAIT_TIMEOUT)throw std::runtime_error("Cannot wait for update check request");
+    }
+    return still_installed(root);
+}
+int check_now(){
+    const auto manifest=latest();
+    // Packaged helpers sit beside HiveDesk.exe. Standalone development helpers
+    // can compare their own build version, but a damaged installed tree must
+    // not silently report itself up to date.
+    const auto root=update::module_directory();
+    const auto running=std::filesystem::exists(root/L"HiveDesk.exe")||update::is_installed_agent()
+        ?update::installed_version(root):std::string(HIVEDESK_VERSION);
+    update::Version local,remote;
+    if(!update::parse_version(running,local)||!update::parse_version(manifest.version,remote))throw std::runtime_error("Cannot compare update versions");
+    const char* status=remote<=local?"current":update::request_check()?"requested":"unavailable";
+    std::cout<<"HiveDesk-Update-Check-1\nstatus="<<status<<"\nversion="<<manifest.version<<'\n';
+    return 0;
+}
 void install(const update::Manifest& manifest,const std::filesystem::path& package,const std::filesystem::path& root,HANDLE gate,HANDLE event){
     Users users;Barrier barrier{gate,event};if(!barrier.take()){update::log("Startup barrier busy; update deferred");return;}
     // Every installed app admits no new sessions once it accepts this request,
@@ -111,9 +134,9 @@ int run(){
     Handle singleton(update::create_system_mutex(L"Global\\HiveDesk.Update.Worker.v1"));
     const auto acquired=WaitForSingleObject(singleton.value,0);if(acquired!=WAIT_OBJECT_0&&acquired!=WAIT_ABANDONED)return 0;
     const auto root=update::installed_directory();if(!still_installed(root))return 0;
-    Handle gate(update::create_system_mutex(update::StartupMutex,true)),event(update::create_system_event(update::PendingEvent));ResetEvent(event.value);
+    Handle gate(update::create_system_mutex(update::StartupMutex,true)),event(update::create_system_event(update::PendingEvent)),check(update::create_system_check_event());ResetEvent(event.value);
     const auto cache=update::private_cache();update::log("Updater " HIVEDESK_VERSION " started");
-    if(!wait_installed(root,60+GetCurrentProcessId()%31))return 0;
+    if(!wait_installed(root,60+GetCurrentProcessId()%31,check.value))return 0;
     for(;;){
         bool attempt_finished=false;
         try{
@@ -129,12 +152,13 @@ int run(){
             }
         }catch(const std::exception& error){update::log(std::string("Update check deferred: ")+error.what());}
         if(attempt_finished)return 0;
-        if(!wait_installed(root,15*60))return 0;
+        if(!wait_installed(root,15*60,check.value))return 0;
     }
 }
 }
 int wmain(int argc,wchar_t** argv){
     try{
+        if(argc==2&&wcscmp(argv[1],L"--check-now")==0)return check_now();
         if(argc==2&&wcscmp(argv[1],L"--check-only")==0){const auto m=latest();std::cout<<"Verified release "<<m.version<<", "<<m.file<<", "<<m.size<<" bytes\n";return 0;}
         if(argc==3&&wcscmp(argv[1],L"--verify-release")==0){const std::filesystem::path root=argv[2];const auto m=update::verify_manifest(read(root/L"update.manifest"),read(root/L"update.manifest.sig"));update::verify_package(m,root/std::wstring(m.file.begin(),m.file.end()));std::cout<<"PASS signed installer "<<m.version<<'\n';return 0;}
         if(argc!=1)throw std::runtime_error("Unsupported updater arguments");return run();
