@@ -2,6 +2,7 @@
 #include "types.h"
 #include <filesystem>
 #include <string>
+#include <vector>
 namespace hive {
 struct AppConfig {
     std::string device_id;
@@ -9,6 +10,7 @@ struct AppConfig {
     std::string group_key;
     StreamSettings stream;
     DesktopPreferences desktop;
+    std::vector<std::string> device_order;
     uint16_t port = 47980;
     bool first_run = true;
 };

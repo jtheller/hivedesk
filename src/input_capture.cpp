@@ -38,7 +38,7 @@ struct InputCapture::Impl {
     struct Route {std::shared_ptr<const InputCaptureState> state;uint64_t id;bool enabled;};
     Route snapshot() {
         std::lock_guard lock(mutex);
-        return {state,route,state->remote&&blocked_route!=route&&!stopping};
+        return {state,route,state->remote&&blocked_route!=route&&!stopping&&(!state->windowed||GetForegroundWindow()==state->viewer)};
     }
     void observe_route(uint64_t id) {
         if(observed_route==id)return;
@@ -79,10 +79,12 @@ struct InputCapture::Impl {
         post(CaptureAction::ReturnLocal,target.state->generation);
     }
     static bool own_surface(const InputCaptureState& s,POINT p) {
-        return (s.panel_visible&&PtInRect(&s.panel_rect,p))||(s.settings_visible&&PtInRect(&s.settings_rect,p));
+        return s.panel_dragging||(s.panel_visible&&PtInRect(&s.panel_rect,p))||(s.settings_visible&&PtInRect(&s.settings_rect,p));
     }
     static bool map_absolute(const InputCaptureState& s,POINT point,InputEvent& event) {
-        double width=s.screen_width,height=s.screen_height,content_width=width,content_height=height;
+        double width=s.windowed?s.viewer_rect.right-s.viewer_rect.left:s.screen_width,height=s.windowed?s.viewer_rect.bottom-s.viewer_rect.top:s.screen_height;
+        if(s.windowed){point.x-=s.viewer_rect.left;point.y-=s.viewer_rect.top;}
+        double content_width=width,content_height=height;
         if(s.remote_width&&s.remote_height){const double scale=std::min(width/s.remote_width,height/s.remote_height);content_width=s.remote_width*scale;content_height=s.remote_height*scale;}
         const double left=(width-content_width)*.5,top=(height-content_height)*.5;
         const bool inside=point.x>=left&&point.x<left+content_width&&point.y>=top&&point.y<top+content_height;
@@ -124,7 +126,7 @@ struct InputCapture::Impl {
         if(msg==WM_MOUSEMOVE){std::lock_guard lock(s->mutex);++s->pointer.revision;s->pointer.point=m.pt;s->pointer.motion_tick=GetTickCount64();}
         if(!route.enabled)return CallNextHookEx(nullptr,code,msg,data);
         const int released=msg==WM_LBUTTONUP?1:msg==WM_RBUTTONUP?2:msg==WM_MBUTTONUP?3:msg==WM_XBUTTONUP?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;
-        if(own_surface(*route.state,m.pt)) {
+        if(own_surface(*route.state,m.pt)||(route.state->windowed&&(!PtInRect(&route.state->viewer_rect,m.pt)||GetAncestor(WindowFromPoint(m.pt),GA_ROOTOWNER)!=route.state->viewer))) {
             if(released&&s->buttons[size_t(released)]){s->buttons[size_t(released)]=false;s->emit(route,{InputKind::Button,released,1},now);return 1;}
             return CallNextHookEx(nullptr,code,msg,data);
         }
@@ -136,7 +138,7 @@ struct InputCapture::Impl {
         }
         if(!route.state->relative){
             InputEvent position{};const bool inside=map_absolute(*route.state,m.pt,position);
-            if(!inside&&!(released&&s->buttons[size_t(released)]))return 1;
+            if(!inside&&!(released&&s->buttons[size_t(released)]))return route.state->windowed?CallNextHookEx(nullptr,code,msg,data):1;
             s->emit(route,position,now);
         }
         InputEvent event{};
@@ -156,7 +158,7 @@ struct InputCapture::Impl {
         if(message==WM_INPUT&&s){
             const auto route=s->snapshot();s->observe_route(route.id);
             RAWINPUT input{};UINT bytes=sizeof(input);
-            if(route.enabled&&route.state->relative&&!route.state->settings_visible&&GetRawInputData(reinterpret_cast<HRAWINPUT>(l),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))!=UINT(-1)
+            if(route.enabled&&route.state->relative&&!route.state->settings_visible&&!route.state->panel_visible&&!route.state->panel_dragging&&GetRawInputData(reinterpret_cast<HRAWINPUT>(l),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))!=UINT(-1)
                 &&input.header.dwType==RIM_TYPEMOUSE&&input.header.hDevice&&!(input.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
                 const LONG dx=input.data.mouse.lLastX,dy=input.data.mouse.lLastY;
                 if(dx||dy)s->emit(route,{InputKind::Relative,dx,dy},input_now_us());
@@ -222,7 +224,12 @@ void InputCapture::stop(){
 }
 void InputCapture::update(InputCaptureState state){
     auto next=std::make_shared<InputCaptureState>(std::move(state));auto& s=*impl_;std::lock_guard lock(s.mutex);
-    if(next->generation!=s.state->generation||next->session!=s.state->session||next->peer!=s.state->peer||next->remote!=s.state->remote){++s.route;s.queue.clear();}
+    const bool same_session=next->generation==s.state->generation&&next->session==s.state->session&&next->peer==s.state->peer;
+    const bool focus_changed=same_session&&next->remote!=s.state->remote;
+    if(!same_session||focus_changed){++s.route;s.queue.clear();}
+    // Focus loss releases keys/buttons even without another physical event.
+    // Also release on regain so a rapid deactivate/activate cannot discard it.
+    if(focus_changed&&next->session){s.queue.push({{InputKind::ReleaseAll},s.route,input_now_us()});s.wake.notify_one();}
     s.state=std::move(next);
 }
 bool InputCapture::raw_mouse_available()const{std::lock_guard lock(impl_->mutex);return impl_->raw_available;}
@@ -302,6 +309,21 @@ bool InputCapture::worker_self_test(std::string& result){
             require(diagnostics.overflows==1&&diagnostics.queue_depth==1&&diagnostics.queue_peak==256,"saturated worker did not bound and replace its edge tail");
             probe.release();require(probe.wait(2),"overflow emergency release did not wake worker");
             {std::lock_guard lock(probe.mutex);require(probe.received.size()==2&&probe.received[1].event.kind==InputKind::ReleaseAll,"overflow replayed stale key transitions");}
+        }
+        {
+            InputCaptureState geometry;geometry.windowed=true;geometry.viewer_rect={300,200,1100,650};geometry.remote_width=1920;geometry.remote_height=1080;
+            InputEvent mapped{};require(Impl::map_absolute(geometry,{700,425},mapped)&&std::abs(mapped.a-32768)<100&&std::abs(mapped.b-32768)<100,"Windowed pointer did not map client origin/scale");
+            require(!Impl::map_absolute(geometry,{700,180},mapped),"Title bar was treated as remote content");
+            geometry.remote_width=1080;geometry.remote_height=1920;
+            require(!Impl::map_absolute(geometry,{310,425},mapped)&&Impl::map_absolute(geometry,{700,425},mapped),"Windowed letterbox mapping failed");
+            geometry.panel_dragging=true;require(Impl::own_surface(geometry,{1800,900}),"A dragged card leaked input outside the sidebar");
+        }
+        {
+            Probe probe;probe.capture.update(route);start(probe);emit(probe,{InputKind::Key,0x1e,0});require(probe.wait(1),"Focus test initial input failed");
+            auto inactive=route;inactive.remote=false;probe.capture.update(inactive);require(probe.wait(2),"Focus loss did not release remote input without another event");
+            {std::lock_guard lock(probe.mutex);require(probe.received[1].event.kind==InputKind::ReleaseAll&&probe.received[1].peer==route.peer&&probe.received[1].session==route.session,"Focus release targeted the wrong session");}
+            probe.capture.update(route);require(probe.wait(3),"Focus regain lost the release barrier");
+            {std::lock_guard lock(probe.mutex);require(probe.received[2].event.kind==InputKind::ReleaseAll,"Focus regain replayed held input");}
         }
         result="input worker without hooks: owner-independent dispatch, immutable peer/session handoff, expired/overflow release, bounded wake/stop/join";return true;
     }catch(const std::exception& error){result=error.what();return false;}

@@ -72,6 +72,7 @@ struct Smoke {
     }
     void click_card(int index) {
         const int tile_height=(px(200)-2*px(12))*9/16;
+        SendMessageW(panel, WM_LBUTTONDOWN, 0, MAKELPARAM(px(100), px(12)+index*(tile_height+px(16))+tile_height/2));
         SendMessageW(panel, WM_LBUTTONUP, 0, MAKELPARAM(px(100), px(12)+index*(tile_height+px(16))+tile_height/2));
     }
     void stop() { if (owner) PostMessageW(owner, WM_CLOSE, 0, 0); else PostQuitMessage(1); }

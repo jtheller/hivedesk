@@ -15,6 +15,7 @@ struct ShellConfig {
     std::string group_key;
     StreamSettings stream;
     DesktopPreferences desktop;
+    std::vector<std::string> device_order;
 };
 struct ShellCallbacks {
     std::function<void(const std::string&)> select_peer;
@@ -36,6 +37,7 @@ struct ShellCallbacks {
     std::function<bool(const std::wstring&,const DesktopPreferences&)> save_preferences;
     std::function<bool()> restart_video;
     std::function<bool()> restart;
+    std::function<bool(const std::vector<std::string>&)> save_order;
 };
 class Shell {
 public:

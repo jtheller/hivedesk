@@ -15,8 +15,8 @@ int main(){try{
     }cleanup{root,previous};
     require(SetEnvironmentVariableW(L"LOCALAPPDATA",root.c_str())!=FALSE,"Isolate preference storage");
     auto config=hive::load_config();require(!config.desktop.relative_mouse,"Relative input unexpectedly enabled by default");
-    config.name=L"Preference test";config.desktop.relative_mouse=true;config.desktop.debug_overlay=true;hive::save_config(config);
-    auto loaded=hive::load_config();require(loaded.desktop.relative_mouse&&loaded.desktop.debug_overlay&&loaded.name==config.name,"Relative input preference did not persist with existing settings");
+    config.device_order={"offline-device","device-c","device-a"};config.name=L"Preference test";config.desktop.relative_mouse=true;config.desktop.debug_overlay=true;hive::save_config(config);
+    auto loaded=hive::load_config();require(loaded.device_order==config.device_order,"Computer order did not survive settings reload");require(loaded.desktop.relative_mouse&&loaded.desktop.debug_overlay&&loaded.name==config.name,"Relative input preference did not persist with existing settings");
     loaded.desktop.relative_mouse=false;hive::save_config(loaded);require(!hive::load_config().desktop.relative_mouse,"Relative input preference did not disable");
     const auto ini=root/L"HiveDesk"/L"settings.ini";
     require(WritePrivateProfileStringW(L"HiveDesk",L"RelativeMouse",nullptr,ini.c_str())!=FALSE,"Prepare legacy preferences");

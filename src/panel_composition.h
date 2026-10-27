@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 #include <stdexcept>
 #include <algorithm>
+#include <vector>
 
 // UI-thread-owned retained surface. DWM evaluates opacity on its composition
 // clock; no WM_TIMER animation, moving HWNDs, or per-frame bitmap uploads.
@@ -27,6 +28,8 @@ class PanelComposition {
     HWND window_=nullptr;
     ULONG_PTR revision_=0;
     bool detached_=false;
+    std::vector<Ptr<IDCompositionVisual>> card_layers_;
+    ULONGLONG cards_started_=0;
     float fade_from_=0,fade_to_=0,fade_seconds_=0;
     ULONGLONG fade_start_=0;
     static void check(HRESULT result) { if(FAILED(result))throw std::runtime_error("Switcher GPU composition failed."); }
@@ -35,10 +38,11 @@ class PanelComposition {
         const float t=fade_seconds_>0?std::clamp(float(GetTickCount64()-fade_start_)/(1000*fade_seconds_),0.0f,1.0f):1.0f;
         const float remaining=1-t;return fade_to_+(fade_from_-fade_to_)*remaining*remaining*remaining;
     }
-    Ptr<IDCompositionAnimation> tween(float from,float to,float duration) {
+    Ptr<IDCompositionAnimation> tween(float from,float to,float duration,float delay=0) {
         const float delta=to-from;Ptr<IDCompositionAnimation> motion;check(device_->CreateAnimation(&motion));
-        check(motion->AddCubic(0,from,3*delta/duration,-3*delta/(duration*duration),delta/(duration*duration*duration)));
-        check(motion->End(duration,to));return motion;
+        if(delay>0)check(motion->AddCubic(0,from,0,0,0));
+        check(motion->AddCubic(delay,from,3*delta/duration,-3*delta/(duration*duration),delta/(duration*duration*duration)));
+        check(motion->End(delay+duration,to));return motion;
     }
     void fade(float from,float to,float duration) {
         fade_from_=from;fade_to_=to;fade_seconds_=animations()?duration:0;fade_start_=GetTickCount64();
@@ -46,6 +50,52 @@ class PanelComposition {
         else check(opacity_->SetOpacity(to));
     }
 public:
+    void finish_cards(bool commit=true) {
+        if(card_layers_.empty())return;
+        for(auto& layer:card_layers_)check(visual_->RemoveVisual(layer.Get()));card_layers_.clear();cards_started_=0;
+        check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));
+        check(clip_->SetTop(0.0f));check(clip_->SetBottom(float(height_)));check(list_clip_->SetTop(float(height_)));
+        if(commit)check(device_->Commit());
+    }
+    // All layers share the same bitmap. Only DWM transforms/opacity animate;
+    // snapshot arrivals can update it without restarting the 240 ms timeline.
+    void reveal_cards(const std::vector<RECT>& cards,COLORREF background) {
+        if(!animations()||cards.empty())return;
+        finish_cards(false);check(preview_->SetContent(nullptr));check(list_->SetContent(nullptr));
+        const auto layer=[&](const RECT& bounds,int index){
+            if(bounds.right<=bounds.left||bounds.bottom<=bounds.top)return;
+            Ptr<IDCompositionVisual> v;check(device_->CreateVisual(&v));check(v->SetContent(surface_.Get()));
+            const D2D_RECT_F clip{float(bounds.left),float(bounds.top),float(bounds.right),float(bounds.bottom)};check(v->SetClip(clip));
+            if(index>=0){
+                const float delay=cards.size()>1?.06f*index/float(cards.size()-1):0;
+                const float duration=.24f-delay;
+                auto movement=tween(-float(bounds.right-bounds.left)*.28f,0,duration,delay);check(v->SetOffsetX(movement.Get()));
+                Ptr<IDCompositionEffectGroup> effect;check(device_->CreateEffectGroup(&effect));
+                auto opacity=tween(0,1,duration,delay);check(effect->SetOpacity(opacity.Get()));check(v->SetEffect(effect.Get()));
+            }
+            check(visual_->AddVisual(v.Get(),TRUE,nullptr));card_layers_.push_back(std::move(v));
+        };
+        // An opaque, solid backing remains behind moving/fading cards. Cutting
+        // holes out of the original bitmap would fade through to the desktop.
+        Ptr<IDCompositionSurface> backing;check(device_->CreateSurface(1,1,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED,&backing));
+        Ptr<IDXGISurface> texture;POINT offset{};check(backing->BeginDraw(nullptr,IID_PPV_ARGS(&texture),&offset));
+        Ptr<ID2D1RenderTarget> canvas;
+        const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+        HRESULT result=factory_->CreateDxgiSurfaceRenderTarget(texture.Get(),&properties,&canvas);
+        if(SUCCEEDED(result)){
+            Ptr<ID2D1SolidColorBrush> brush;result=canvas->CreateSolidColorBrush(D2D1::ColorF(GetRValue(background)/255.f,GetGValue(background)/255.f,GetBValue(background)/255.f,1),&brush);
+            if(SUCCEEDED(result)){canvas->BeginDraw();canvas->FillRectangle(D2D1::RectF(float(offset.x),float(offset.y),float(offset.x+1),float(offset.y+1)),brush.Get());result=canvas->EndDraw();}
+        }
+        const auto end=backing->EndDraw();check(result);check(end);
+        Ptr<IDCompositionVisual> back;Ptr<IDCompositionScaleTransform> scale;
+        check(device_->CreateVisual(&back));check(back->SetContent(backing.Get()));check(device_->CreateScaleTransform(&scale));
+        check(scale->SetScaleX(float(width_)));check(scale->SetScaleY(float(height_)));check(back->SetTransform(scale.Get()));
+        check(visual_->AddVisual(back.Get(),TRUE,nullptr));card_layers_.push_back(std::move(back));
+        for(size_t i=0;i<cards.size();++i)layer(cards[i],int(i));
+        cards_started_=GetTickCount64();check(device_->Commit());
+        SetPropW(window_,L"HiveDesk.CardAnimationMs",reinterpret_cast<HANDLE>(240));
+        SetPropW(window_,L"HiveDesk.AnimatedCards",reinterpret_cast<HANDLE>(cards.size()));
+    }
     // A full-screen waiting surface must never fade through to the previous
     // machine. Keep an opaque neutral backing while only the snapshot fades in.
     void cover(float width,float height,bool entering,bool discard=false) {
@@ -95,6 +145,7 @@ public:
         SetPropW(window,L"HiveDesk.Composited",reinterpret_cast<HANDLE>(1));
     }
     void present(const void* bgra,UINT width,UINT height,bool commit=true) {
+        if(!card_layers_.empty()&&(width!=width_||height!=height_||GetTickCount64()-cards_started_>=240))finish_cards(false);
         if(width!=width_||height!=height_) {
             surface_.Reset();check(device_->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED,&surface_));
             check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));width_=width;height_=height;
@@ -125,6 +176,7 @@ public:
         SetPropW(window_,L"HiveDesk.SurfaceRevision",reinterpret_cast<HANDLE>(++revision_));
     }
     void show(float width,float height,float previous_height,bool entering,bool reversing) {
+        finish_cards(false);RemovePropW(window_,L"HiveDesk.CardAnimationMs");RemovePropW(window_,L"HiveDesk.AnimatedCards");
         check(clip_->SetLeft(0.0f));check(clip_->SetTop(0.0f));check(clip_->SetRight(width));
         check(list_clip_->SetLeft(0.0f));check(list_clip_->SetRight(width));check(list_clip_->SetBottom(height));
         if(entering){

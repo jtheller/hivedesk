@@ -21,6 +21,7 @@ int main(){SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
     HWND owner=FindWindowW(L"HiveDesk.Owner",nullptr),panel=FindWindowW(L"HiveDesk.Switcher",nullptr);require(owner&&panel,"Missing shell windows");
     SendMessageW(owner,WM_HOTKEY,81,0);pump(250);
     const auto px=[&](int value){return MulDiv(value,GetDpiForWindow(panel),96);};const int tile_height=(px(200)-2*px(12))*9/16;
+    SendMessageW(panel,WM_LBUTTONDOWN,0,MAKELPARAM(px(100),px(12)+tile_height+px(16)+tile_height/2));
     SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),px(12)+tile_height+px(16)+tile_height/2));
     shell.update_health("debug-test",{1,144000,60000,hive::PressureDecode});
     hive::SourceDiagnostics source{1,59940,3200,2400,4000,38000,1200,1200,2000,12000,true};

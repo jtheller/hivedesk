@@ -13,7 +13,8 @@ struct InputCaptureState {
     uint64_t generation=0,session=0;
     std::string peer;
     bool remote=false,relative=false,settings_visible=false,panel_visible=false,panel_summoned=false,recording_hotkey=false;
-    RECT panel_rect{},settings_rect{};
+    bool windowed=false,panel_dragging=false;HWND viewer{};
+    RECT panel_rect{},settings_rect{},viewer_rect{};
     uint32_t screen_width=1,screen_height=1,remote_width=0,remote_height=0;
     uint32_t hotkey_key=0,hotkey_modifiers=0;
 };

@@ -4,6 +4,7 @@
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <fstream>
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -56,6 +57,9 @@ AppConfig load_config() {
     config.desktop.tray_icon=GetPrivateProfileIntW(L"HiveDesk",L"TrayIcon",1,path.c_str())!=0;
     config.desktop.debug_overlay=GetPrivateProfileIntW(L"HiveDesk",L"DebugOverlay",0,path.c_str())!=0;
     config.desktop.relative_mouse=GetPrivateProfileIntW(L"HiveDesk",L"RelativeMouse",0,path.c_str())!=0;
+    std::istringstream order(narrow(read_ini(path,L"DeviceOrder")));std::string id;
+    while(order>>id)if(id.size()<=128&&config.device_order.size()<256&&
+        std::find(config.device_order.begin(),config.device_order.end(),id)==config.device_order.end())config.device_order.push_back(id);
     config.desktop.hotkey_modifiers=GetPrivateProfileIntW(L"HiveDesk",L"HotkeyModifiers",3,path.c_str());
     config.desktop.hotkey_key=GetPrivateProfileIntW(L"HiveDesk",L"HotkeyKey",'H',path.c_str());
     if(!valid_hive_hotkey(config.desktop.hotkey_modifiers,config.desktop.hotkey_key)){config.desktop.hotkey_modifiers=3;config.desktop.hotkey_key='H';}
@@ -69,6 +73,7 @@ void save_config(const AppConfig& config) {
     const auto path=data_directory()/L"settings.ini";
     auto write=[&](const wchar_t* key,const std::wstring& value){if(!WritePrivateProfileStringW(L"HiveDesk",key,value.c_str(),path.c_str()))throw std::runtime_error("Unable to save settings");};
     write(L"DeviceId",widen(config.device_id)); write(L"Name",config.name);
+    std::string order;for(const auto& id:config.device_order){if(!order.empty())order+=' ';order+=id;}write(L"DeviceOrder",widen(order));
     write(L"Startup",config.desktop.startup?L"1":L"0");write(L"TrayIcon",config.desktop.tray_icon?L"1":L"0");
     write(L"DebugOverlay",config.desktop.debug_overlay?L"1":L"0");
     write(L"RelativeMouse",config.desktop.relative_mouse?L"1":L"0");

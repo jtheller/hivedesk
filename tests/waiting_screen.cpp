@@ -1,4 +1,6 @@
 #include "hivedesk/shell.h"
+#include "../src/viewer_geometry.h"
+#include <cmath>
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
@@ -26,8 +28,9 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_NAME,station,sizeof(station),&size)!=FALSE,"Read test station");
     USEROBJECTFLAGS flags{};require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)!=FALSE&&!(flags.dwFlags&WSF_VISIBLE),"Refuse UI probe on an interactive window station");
     hive::Shell shell;hive::ShellConfig config;config.device_name=L"Waiting test";config.desktop.tray_icon=false;
-    hive::ShellCallbacks callbacks;unsigned selected=0;
-    callbacks.select_peer=[&](const std::string&){++selected;};
+    hive::ShellCallbacks callbacks;unsigned selected=0;std::vector<std::string> saved_order;std::string last_selected;bool allow_save=true;
+    callbacks.select_peer=[&](const std::string& id){++selected;last_selected=id;};
+    callbacks.save_order=[&](const std::vector<std::string>& order){if(!allow_save)return false;saved_order=order;return true;};
     std::string error;require(shell.create(GetModuleHandleW(nullptr),config,std::move(callbacks),error),error.c_str());
     shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Computer C","",47980,true}});
     const auto owner=find(L"HiveDesk.Owner"),panel=find(L"HiveDesk.Switcher");
@@ -38,6 +41,7 @@ int probe(){
     const auto select=[&](int index){
         SendMessageW(owner,WM_HOTKEY,81,0);
         const int tile=(px(200)-2*px(12))*9/16;
+        SendMessageW(panel,WM_LBUTTONDOWN,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));
         SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));
         waiting=find(L"HiveDesk.Waiting");
     };
@@ -102,6 +106,60 @@ int probe(){
         SendMessageW(owner,WM_HOTKEY,81,0);pump(260);
     }
     shell.show_local();
+    const int tile=(px(200)-2*px(12))*9/16,stride=tile+px(16);
+    const auto center=[&](int row){return px(12)+row*stride+tile/2;};
+    const auto drag=[&](int row,int x,int y){
+        SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(row)));
+        SendMessageW(panel,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(x,y));
+        SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(x,y));
+    };
+    SendMessageW(owner,WM_HOTKEY,81,0);
+    BOOL animations=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
+    if(animations)require(ULONG_PTR(GetPropW(panel,L"HiveDesk.CardAnimationMs"))==240&&ULONG_PTR(GetPropW(panel,L"HiveDesk.AnimatedCards"))==4,"Hotkey cards did not use the bounded stagger animation");
+    const auto before_drag=selected;
+    drag(3,px(100),center(1)-tile/2); // C before A.
+    require(selected==before_drag&&saved_order==std::vector<std::string>({"c","a","b"}),"Reordering selected a computer or saved the wrong order");
+    // Discovery returns map/ID order again; the saved visual order must win.
+    shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Computer C","",47980,true}});
+    SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));
+    SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
+    require(last_selected=="c","Discovery reset the user's computer order");shell.show_local();
+    SendMessageW(owner,WM_HOTKEY,81,0);allow_save=false;drag(1,px(100),center(3)+tile/2);
+    require(saved_order==std::vector<std::string>({"c","a","b"}),"Failed persistence changed saved order");allow_save=true;
+    // Escape/capture loss must cancel without opening the drop target.
+    const auto before_cancel=selected;
+    SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));
+    SendMessageW(panel,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(px(400),center(1)));
+    SendMessageW(panel,WM_CANCELMODE,0,0);SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
+    require(selected==before_cancel,"Canceled drag became a click");
+    // B has a real 16:10 snapshot, and dropping outside creates a fresh lease.
+    const auto old=shell.viewer_surface();drag(3,px(520),px(260));
+    const auto floating=shell.viewer_surface();waiting=find(L"HiveDesk.Waiting");
+    require(floating&&floating->peer=="b"&&floating->window!=old->window&&shown(waiting),"Drag out failed to open the chosen machine on a fresh surface");
+    const auto style=GetWindowLongW(floating->window,GWL_STYLE);
+    require((style&WS_THICKFRAME)&&(style&WS_CAPTION)&&!(style&WS_MAXIMIZEBOX),"Floating viewer is not a resizable framed window");
+    RECT client{},outer{};GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
+    require(std::abs(double(client.right)/client.bottom-1.6)<.01,"Window did not use the native snapshot aspect");
+    shell.set_remote_size(1080,1920);GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
+    require(std::abs(double(client.right)/client.bottom-.5625)<.01,"First frame did not correct the provisional window aspect");
+    const LONG fx=outer.right-outer.left-client.right,fy=outer.bottom-outer.top-client.bottom;
+    for(UINT edge=WMSZ_LEFT;edge<=WMSZ_BOTTOMRIGHT;++edge){
+        RECT proposal=outer;proposal.right+=px(170);proposal.bottom+=px(90);
+        const RECT before=proposal;SendMessageW(floating->window,WM_SIZING,edge,reinterpret_cast<LPARAM>(&proposal));
+        const double w=proposal.right-proposal.left-fx,h=proposal.bottom-proposal.top-fy;
+        require(std::abs(h-w/.5625)<=1,"A resize edge broke the source aspect ratio");
+        if(edge==WMSZ_LEFT||edge==WMSZ_TOPLEFT||edge==WMSZ_BOTTOMLEFT)require(proposal.right==before.right,"Left resize moved the opposite edge");
+        if(edge==WMSZ_TOP||edge==WMSZ_TOPLEFT||edge==WMSZ_TOPRIGHT)require(proposal.bottom==before.bottom,"Top resize moved the opposite edge");
+    }
+    SetWindowPos(floating->window,nullptr,px(300),px(140),px(480),px(400),SWP_NOZORDER|SWP_NOACTIVATE);
+    GetClientRect(floating->window,&client);require(std::abs(double(client.right)/client.bottom-.5625)<.01,"Programmatic/snap resize bypassed aspect constraint");
+    POINT origin{};ClientToScreen(floating->window,&origin);RECT cover{};GetWindowRect(waiting,&cover);GetClientRect(floating->window,&client);
+    require(cover.left==origin.x&&cover.top==origin.y&&cover.right-cover.left==client.right&&cover.bottom-cover.top==client.bottom,"Waiting snapshot did not follow the floating client area");
+    shell.show_remote("b",L"Computer B",30,floating->window);pump(260);
+    GetClientRect(floating->window,&client);require(std::abs(double(client.right)/client.bottom-.5625)<.01&&!shown(waiting),"First-frame reveal changed the floating size or left its cover");
+    SendMessageW(floating->window,WM_CLOSE,0,0);require(!shown(floating->window),"Closing floating viewer did not return locally");
+    SendMessageW(owner,WM_HOTKEY,81,0);SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
+    require(!(GetWindowLongW(shell.viewer_window(),GWL_STYLE)&WS_THICKFRAME),"Normal click inherited floating mode");shell.show_local();
     return 0;
 }
 }

@@ -140,8 +140,13 @@ public:
                 return true; // Helper posts close and enforces its own deadline.
             } catch(...) {return false;}
         };
+        callbacks.save_order=[this](const std::vector<std::string>& order){
+            const std::lock_guard lock(config_mutex_);auto next=config_;next.device_order=order;
+            try{hive::save_config(next);}catch(const std::exception& e){status(e.what());return false;}
+            config_=std::move(next);return true;
+        };
         std::string error;
-        if(!shell_.create(instance,{config_.name,config_.group_key,config_.stream,config_.desktop},std::move(callbacks),error))throw std::runtime_error(error);
+        if(!shell_.create(instance,{config_.name,config_.group_key,config_.stream,config_.desktop,config_.device_order},std::move(callbacks),error))throw std::runtime_error(error);
         const bool initially_show_settings=(config_.first_run||open_settings)&&!video_restart_pending_;
         kick_worker_=std::thread([this]{kick_work();});
         worker_=std::thread([this]{work();});

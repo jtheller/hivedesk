@@ -1,5 +1,6 @@
 #include "hivedesk/shell.h"
 #include "panel_composition.h"
+#include "viewer_geometry.h"
 #include "debug_model.h"
 #include <optional>
 #include "hivedesk/network_key.h"
@@ -76,6 +77,46 @@ struct Shell::Impl {
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
     ShellConfig config; ShellCallbacks callbacks; std::vector<Peer> peers;
     std::string active_id,previous_id,pending_id;
+    bool windowed=false,sizing_viewer=false,dragging=false;HWND drag_focus{};
+    int pressed_card=-1,drop_slot=-1;POINT drag_origin{};std::string dragged_peer;ULONGLONG last_drag_scroll=0;
+    double window_ratio=16.0/9;
+    RECT viewer_client() const {RECT r{};GetClientRect(viewer,&r);MapWindowPoints(viewer,nullptr,reinterpret_cast<POINT*>(&r),2);return r;}
+    void sort_peers(){
+        const auto rank=[&](const std::string& id){return std::find(config.device_order.begin(),config.device_order.end(),id)-config.device_order.begin();};
+        std::stable_sort(peers.begin(),peers.end(),[&](const Peer& a,const Peer& b){const auto ar=rank(a.id),br=rank(b.id);return ar==br?a.id<b.id:ar<br;});
+    }
+    void cancel_drag(){
+        const auto restore=drag_focus;drag_focus=nullptr;pressed_card=-1;dragging=false;drop_slot=-1;dragged_peer.clear();
+        if(GetCapture()==panel)ReleaseCapture();
+        if(restore&&IsWindow(restore)&&GetForegroundWindow()==panel)SetForegroundWindow(restore);
+        publish_input();InvalidateRect(panel,nullptr,FALSE);
+    }
+    void reorder_peer(const std::string& id,int slot){
+        auto next=peers;const auto it=std::find_if(next.begin(),next.end(),[&](const Peer& p){return p.id==id;});if(it==next.end())return;
+        const auto from=int(it-next.begin());auto moved=*it;next.erase(it);if(slot>from)--slot;slot=std::clamp(slot,0,int(next.size()));next.insert(next.begin()+slot,std::move(moved));
+        auto order=config.device_order;
+        // Keep offline devices in their saved slots; replace the online subsequence.
+        for(const auto& peer:peers)if(std::find(order.begin(),order.end(),peer.id)==order.end())order.push_back(peer.id);
+        size_t i=0;for(auto& key:order)if(std::any_of(peers.begin(),peers.end(),[&](const Peer& p){return p.id==key;}))key=next[i++].id;
+        if(callbacks.save_order&&!callbacks.save_order(order)){status=L"Could not save computer order.";return;}
+        config.device_order=std::move(order);peers=std::move(next);InvalidateRect(panel,nullptr,FALSE);
+    }
+    void size_to_source(){
+        if(!windowed||!remote_width||!remote_height)return;
+        window_ratio=double(remote_width)/remote_height;RECT r{};GetWindowRect(viewer,&r);
+        RECT frame{};AdjustWindowRectExForDpi(&frame,DWORD(GetWindowLongW(viewer,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(viewer,GWL_EXSTYLE)),GetDpiForWindow(viewer));
+        constrain_viewer(r,WMSZ_BOTTOMRIGHT,frame.right-frame.left,frame.bottom-frame.top,window_ratio,px(240));
+        RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
+        if(r.bottom-r.top>work_area.bottom-work_area.top){r.bottom=r.top+work_area.bottom-work_area.top;constrain_viewer(r,WMSZ_BOTTOM,frame.right-frame.left,frame.bottom-frame.top,window_ratio,1);}
+        const LONG w=r.right-r.left,h=r.bottom-r.top;r.left=std::clamp(r.left,work_area.left,std::max(work_area.left,work_area.right-w));r.top=std::clamp(r.top,work_area.top,std::max(work_area.top,work_area.bottom-h));
+        SetWindowPos(viewer,nullptr,r.left,r.top,w,h,SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    void sync_viewer_ui(){
+        if(!viewer)return;
+        if(waiting_visible&&!IsIconic(viewer)){const auto r=viewer_client();SetWindowPos(waiting,HWND_TOP,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_SHOWWINDOW);try{paint_waiting(false);}catch(const std::exception&){local(true);}}
+        else if(waiting_visible)ShowWindow(waiting,SW_HIDE);
+        publish_input();
+    }
     std::map<std::string,HBITMAP> thumbnails;
     std::map<std::string,HBITMAP> full_snapshots;
     std::map<std::string,HBITMAP> prior_thumbnails;
@@ -113,7 +154,8 @@ struct Shell::Impl {
     }
     void publish_input() {
         InputCaptureState state;state.generation=generation.load();state.session=input_session;state.peer=active_id;
-        state.remote=remote&&!reconnecting&&!shutting_down;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
+        state.remote=remote&&!reconnecting&&!shutting_down&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
+        state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel_visible=panel&&IsWindowVisible(panel);state.panel_summoned=panel_summoned;
         state.settings_visible=settings&&IsWindowVisible(settings);
         if(state.panel_visible)GetWindowRect(panel,&state.panel_rect);if(state.settings_visible)GetWindowRect(settings,&state.settings_rect);
@@ -126,12 +168,12 @@ struct Shell::Impl {
         if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;}
     }
     void hide_panel(bool animate=false) {
-        panel_summoned=false;
+        cancel_drag();panel_summoned=false;
         if(animate&&panel_mode&&!panel_closing){panel_closing=true;SetTimer(owner,2,composition.hide(),nullptr);publish_input();return;}
         if(animate&&panel_closing)return;
         panel_closing=false;KillTimer(owner,2);panel_mode=0;outside_since=0;hovered=-1;
         if(panel)ShowWindow(panel,SW_HIDE);
-        publish_input();
+        confine_mouse();publish_input();
     }
     void collect_viewers() {
         std::erase_if(retired_viewers,[](const auto& surface){
@@ -139,12 +181,22 @@ struct Shell::Impl {
             DestroyWindow(surface->window);return true;
         });
     }
-    bool replace_viewer(const std::string& peer) {
+    bool replace_viewer(const std::string& peer,POINT drop) {
         // A reused flip-model HWND can expose its last DWM image before the
         // asynchronous waiting-cover commit. Never show that HWND again for a
         // new selection, even if its render worker is still finishing a frame.
-        const HWND next=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,
-            0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
+        const DWORD style=windowed?(WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX):WS_POPUP;
+        RECT bounds{0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};
+        if(windowed){
+            RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
+            int w=std::min(px(1100),int((work_area.right-work_area.left)*.72)),h=int(w/window_ratio);
+            if(h>(work_area.bottom-work_area.top)*.75){h=int((work_area.bottom-work_area.top)*.75);w=int(h*window_ratio);}
+            bounds={0,0,w,h};AdjustWindowRectExForDpi(&bounds,style,FALSE,WS_EX_APPWINDOW,UINT(dpi));
+            w=bounds.right-bounds.left;h=bounds.bottom-bounds.top;
+            bounds.left=std::clamp(drop.x-w/2,work_area.left,std::max(work_area.left,work_area.right-w));bounds.top=std::clamp(drop.y-px(24),work_area.top,std::max(work_area.top,work_area.bottom-h));bounds.right=bounds.left+w;bounds.bottom=bounds.top+h;
+        }
+        const HWND next=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",style,
+            bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,nullptr,nullptr,instance,this);
         if(!next)return false;
         const HWND next_waiting=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,
             L"HiveDesk.Waiting",L"HiveDesk connection",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),
@@ -174,7 +226,7 @@ struct Shell::Impl {
         if(waiting)ShowWindow(waiting,SW_HIDE);
     }
     void paint_waiting(bool entering) {
-        const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+        const auto client=viewer_client();const int width=std::max(1L,client.right-client.left),height=std::max(1L,client.bottom-client.top);
         BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;
         info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* pixels=nullptr;
         HDC dc=CreateCompatibleDC(nullptr);HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
@@ -217,21 +269,21 @@ struct Shell::Impl {
         active_id=id;remote=true;reconnecting=true;input_session=0;publish_input();
         reset_remote_cursor();
         try{
-            const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+            const auto r=viewer_client();const int width=r.right-r.left,height=r.bottom-r.top;
             waiting_composition.cover(float(width),float(height),false,true);
-            SetWindowPos(waiting,HWND_TOP,0,0,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+            SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
             paint_waiting(true);
         }catch(const std::exception&){
             // Never expose the previous swap chain if composition failed.
             local(true);status=L"Could not display the connection screen.";return;
         }
         waiting_visible=true;
-        const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
-        SetWindowPos(waiting,HWND_TOP,0,0,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-        SetWindowPos(viewer,HWND_TOP,0,0,width,height,SWP_SHOWWINDOW);
+        const auto r=viewer_client();const int width=r.right-r.left,height=r.bottom-r.top;
+        SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SetWindowPos(viewer,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
         // Showing an owner can change its owned popup visibility. Reassert the
         // prepared cover after the viewer becomes visible, before activation.
-        SetWindowPos(waiting,HWND_TOP,0,0,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
         SetForegroundWindow(viewer);SetFocus(viewer);SetCursor(LoadCursorW(nullptr,IDC_ARROW));
     }
     void reset_remote_cursor() {
@@ -246,7 +298,8 @@ struct Shell::Impl {
     }
     void apply_remote_cursor() {
         POINT point{};GetCursorPos(&point);
-        if(remote&&WindowFromPoint(point)==viewer)
+        const auto r=viewer_client();
+        if(remote&&WindowFromPoint(point)==viewer&&PtInRect(&r,point))
             SetCursor(selected_remote_cursor());
     }
     void apply_remote_position() {
@@ -257,12 +310,14 @@ struct Shell::Impl {
         POINT point{};GetCursorPos(&point);
         // Never pull against recent local movement or take the pointer out of our UI.
         if(own_surface(point)||GetTickCount64()-last_local_motion<100)return;
-        const double width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+        const auto client=viewer_client();
+        if(windowed&&(GetForegroundWindow()!=viewer||sizing_viewer||!PtInRect(&client,point)))return;
+        const double width=client.right-client.left,height=client.bottom-client.top;
         const double scale=std::min(width/remote_width,height/remote_height);
         const double x=(width-remote_width*scale)/2+(remote_pointer.x/65535.0)*(remote_width-1)*scale;
         const double y=(height-remote_height*scale)/2+(remote_pointer.y/65535.0)*(remote_height-1)*scale;
         INPUT input{};input.type=INPUT_MOUSE;input.mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE;
-        input.mi.dx=LONG((x+.5)*65536/width);input.mi.dy=LONG((y+.5)*65536/height);input.mi.dwExtraInfo=InputMarker;
+        input.mi.dx=LONG((client.left+x+.5)*65536/GetSystemMetrics(SM_CXSCREEN));input.mi.dy=LONG((client.top+y+.5)*65536/GetSystemMetrics(SM_CYSCREEN));input.mi.dwExtraInfo=InputMarker;
         SendInput(1,&input,sizeof(input));
     }
     void sample_cursor() {
@@ -295,13 +350,15 @@ struct Shell::Impl {
         if(prior_focus&&IsWindow(prior_focus))SetForegroundWindow(prior_focus);prior_focus=nullptr;
         if(notify&&callbacks.return_local)callbacks.return_local();
     }
-    void select(const std::string& id) {
+    void select(const std::string& id,bool as_window=false,POINT drop={}) {
         if(id.empty()){local(true);return;}
-        if(id==active_id&&remote&&!reconnecting){hide_panel();return;}
+        if(id==active_id&&remote&&!reconnecting&&as_window==windowed){hide_panel();if(IsIconic(viewer))ShowWindow(viewer,SW_RESTORE);SetForegroundWindow(viewer);confine_mouse();publish_input();return;}
         auto it=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==id;});
         if(it==peers.end()){status=L"Computer is no longer in the device list.";InvalidateRect(panel,nullptr,FALSE);return;}
         ++generation;input_session=0;publish_input();
-        if(!replace_viewer(id)){local(true);status=L"Could not create the desktop window.";return;}
+        windowed=as_window;window_ratio=16.0/9;
+        if(const auto snapshot=full_snapshots.find(id);snapshot!=full_snapshots.end()){BITMAP b{};GetObjectW(snapshot->second,sizeof(b),&b);if(b.bmWidth>0&&b.bmHeight>0)window_ratio=double(b.bmWidth)/b.bmHeight;}
+        if(!replace_viewer(id,drop)){local(true);status=L"Could not create the desktop window.";return;}
         remote=false;reconnecting=false;publish_input();
         reset_remote_cursor();
         remote_width=remote_height=0;selection_armed=true;pending_id=id;ReleaseCapture();ClipCursor(nullptr);hide_panel();
@@ -320,15 +377,14 @@ struct Shell::Impl {
             waiting_fading=true;
             try{SetTimer(owner,4,waiting_composition.hide(),nullptr);}catch(const std::exception&){hide_waiting();}
         }
-        SetWindowPos(viewer,HWND_TOP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),SWP_SHOWWINDOW);
+        SetWindowPos(viewer,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
         SetForegroundWindow(viewer);SetFocus(viewer);confine_mouse();hide_panel();apply_remote_position();apply_remote_cursor();
         publish_input();
     }
     void confine_mouse() {
-        if(!remote){ClipCursor(nullptr);return;}
-        int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
-        RECT r{0,0,width,height};
-        if(relative_mode){int x=width/2,y=height/2;r={x,y,x+1,y+1};SetCursorPos(x,y);}
+        if(!remote||reconnecting||panel_mode||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
+        RECT r=viewer_client();
+        if(relative_mode){int x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;r={x,y,x+1,y+1};SetCursorPos(x,y);}
         ClipCursor(&r);
     }
     void set_relative(bool enabled) {
@@ -377,7 +433,7 @@ struct Shell::Impl {
         if(SUCCEEDED(DwmGetColorizationColor(&value,&opaque)))accent=RGB((value>>16)&255,(value>>8)&255,value&255);
         if(panel)InvalidateRect(panel,nullptr,FALSE);
     }
-    void show_panel(int mode) {
+    void show_panel(int mode,bool hotkey=false) {
         if(settings&&IsWindowVisible(settings))return;
         if(panel_mode==mode&&!panel_closing)return;
         const bool entering=panel_mode==0,reversing=panel_closing;const int previous_height=panel_height;
@@ -388,10 +444,13 @@ struct Shell::Impl {
         // update-region state and can leave the previous surface after a failed
         // connection. Commit this image and its new clips/opacity together.
         if(!paint_panel(false)){hide_panel();return;}
-        try{composition.show(float(panel_width),float(panel_height),float(previous_height),entering,reversing);}
+        try{composition.show(float(panel_width),float(panel_height),float(previous_height),entering,reversing);
+            if(hotkey&&entering){std::vector<RECT> cards;for(int i=scroll;i<=int(peers.size())&&i<scroll+visible_tiles();++i){const int y=px(12)+(i-scroll)*tile_stride();cards.push_back({px(12),y,panel_width-px(12),y+tile_height()});}composition.reveal_cards(cards,RGB(GetRValue(accent)*16/100,GetGValue(accent)*16/100,GetBValue(accent)*16/100));}
+        }
         catch(const std::exception&){hide_panel();return;}
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
         publish_input();
+        confine_mouse();
         if(entering&&callbacks.panel_opened)callbacks.panel_opened();
     }
     int card_at(POINT p) const {
@@ -425,9 +484,10 @@ struct Shell::Impl {
         if(health_badge) {
             if(remote&&!waiting_visible&&(reconnecting||warning||config.desktop.debug_overlay)&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
-                const int width=px(reconnecting?280:config.desktop.debug_overlay?460:136),height=px(!reconnecting&&config.desktop.debug_overlay?474:30);RECT bounds{};GetWindowRect(health_badge,&bounds);
-                const int inset=px(16);
-                if(!IsWindowVisible(health_badge)||bounds.left!=inset||bounds.top!=inset||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOPMOST,inset,inset,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);InvalidateRect(health_badge,nullptr,FALSE);}
+                const auto client=viewer_client();
+                const int width=std::min(px(reconnecting?280:config.desktop.debug_overlay?460:136),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&config.desktop.debug_overlay?474:30),std::max(px(30),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
+                const int left=client.left+px(16),top=client.top+px(16);
+                if(!IsWindowVisible(health_badge)||bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOP,left,top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);InvalidateRect(health_badge,nullptr,FALSE);}
                 if(config.desktop.debug_overlay||reconnecting)InvalidateRect(health_badge,nullptr,FALSE);
             }else if(IsWindowVisible(health_badge))ShowWindow(health_badge,SW_HIDE);
         }
@@ -448,6 +508,13 @@ struct Shell::Impl {
         if(!panel_mode){if(corner)show_panel(1);return;}
         if(panel_closing){if(p.x>=0&&p.x<panel_width&&p.y>=0&&p.y<panel_height)show_panel(panel_mode);return;}
         if(panel_mode==1&&p.x>=0&&p.x<px(42)&&p.y>px(32))show_panel(2);
+        if(pressed_card>=0){
+            if(dragging&&p.x>=0&&p.x<panel_width&&now-last_drag_scroll>=120){
+                const int direction=p.y<px(36)?-1:p.y>panel_height-px(36)?1:0;
+                const int next=std::clamp(scroll+direction,0,std::max(0,int(peers.size())+1-visible_tiles()));
+                if(next!=scroll){scroll=next;drop_slot=std::clamp(int((p.y-px(12)+tile_stride()/2)/tile_stride())+scroll-1,0,int(peers.size()));InvalidateRect(panel,nullptr,FALSE);}last_drag_scroll=now;
+            }return;
+        }
         if(!panel_summoned&&(p.x<0||p.x>panel_width+px(40)||p.y<0||p.y>panel_height+px(30))) {if(!outside_since)outside_since=now;if(now-outside_since>250)hide_panel(true);}else outside_since=0;
     }
     bool paint_panel(bool commit=true) {
@@ -499,6 +566,7 @@ struct Shell::Impl {
         };
         if(panel_mode==1)card(preview_index(),px(12));
         else for(int i=scroll;i<=static_cast<int>(peers.size())&&i<scroll+visible_tiles();++i)card(i,px(12)+(i-scroll)*tile_stride());
+        if(dragging&&drop_slot>=0){const int y=px(12)+(drop_slot+1-scroll)*tile_stride()-px(8);fill(dc,{px(12),y,panel_width-px(12),y+px(3)},accent);}
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
         bool rendered=false;
         try{composition.present(pixels,width,height,commit);rendered=true;}
@@ -643,7 +711,7 @@ struct Shell::Impl {
             if(message==s->taskbar_created&&s->taskbar_created){s->tray_present=false;s->tray();return 0;}
             switch(message) {
             case WM_HOTKEY:
-                if(int(w)==s->hotkey_id){if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2);s->panel_summoned=s->panel_mode!=0;}s->publish_input();}return 0;
+                if(int(w)==s->hotkey_id){if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;}s->publish_input();}return 0;
             case CaptureActionMessage:{
                 const auto action=CaptureAction(w);
                 if(action==CaptureAction::KickController){if(!s->shutting_down&&s->callbacks.kick_controller)s->callbacks.kick_controller();return 0;}
@@ -653,7 +721,7 @@ struct Shell::Impl {
                 case CaptureAction::Failed:s->local(true);s->status=L"Input channel stalled. Returned to this computer.";break;
                 case CaptureAction::HidePanel:s->hide_panel();break;
                 case CaptureAction::HidePanelAnimated:s->hide_panel(true);break;
-                case CaptureAction::Summon:if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2);s->panel_summoned=s->panel_mode!=0;}s->publish_input();break;
+                case CaptureAction::Summon:if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;}s->publish_input();break;
                 default:break;
                 }return 0;
             }
@@ -668,7 +736,7 @@ struct Shell::Impl {
                 std::shared_ptr<ClipboardJob> job;{std::lock_guard lock(s->jobs_mutex);auto it=s->jobs.find(static_cast<uint64_t>(w));if(it!=s->jobs.end())job=it->second;}
                 if(job){std::lock_guard lock(job->mutex);try{s->write_clipboard(job->value);job->done=true;}catch(const std::exception& e){job->error=e.what();}return job->done?1:0;}return 0;
             }
-            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel();else if(w==3){KillTimer(window,3);s->show_panel(2);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
+            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel();else if(w==3){KillTimer(window,3);s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
             case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:case WM_SETTINGCHANGE:s->system_color();return 0;
             case WM_CLIPBOARDUPDATE:s->read_clipboard(true);return 0;
             case TrayMessage:
@@ -683,13 +751,39 @@ struct Shell::Impl {
             case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
             case WM_ERASEBKGND:return 1;
             case WM_PAINT:s->paint_panel();return 0;
-            case WM_MOUSEMOVE:{POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};int h=s->card_at(p);if(h!=s->hovered){s->hovered=h;InvalidateRect(window,nullptr,FALSE);}return 0;}
-            case WM_LBUTTONUP:{
+            case WM_LBUTTONDOWN:{
+                POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};s->cancel_drag();s->pressed_card=s->card_at(p);s->drag_origin=p;
+                if(s->pressed_card>0)s->dragged_peer=s->peers[s->pressed_card-1].id;
+                if(s->pressed_card>=0){
+                    // Background/no-activate windows cannot retain capture
+                    // outside their bounds. Activate only for the gesture.
+                    s->drag_focus=GetForegroundWindow();SetForegroundWindow(window);SetCapture(window);s->composition.finish_cards();s->publish_input();
+                }return 0;
+            }
+            case WM_CAPTURECHANGED:case WM_CANCELMODE:s->cancel_drag();return 0;
+            case WM_MOUSEMOVE:{
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
-                int index=s->card_at(p);if(index==0)s->select({});else if(index>0&&index<=static_cast<int>(s->peers.size()))s->select(s->peers[index-1].id);return 0;
+                if(s->pressed_card>0&&!s->dragging&&(abs(p.x-s->drag_origin.x)>=GetSystemMetrics(SM_CXDRAG)||abs(p.y-s->drag_origin.y)>=GetSystemMetrics(SM_CYDRAG))){s->dragging=true;if(s->panel_mode==1)s->show_panel(2);}
+                if(s->dragging){
+                    const bool outside=p.x>=s->panel_width;
+                    s->drop_slot=outside?-1:std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
+                    SetCursor(LoadCursorW(nullptr,outside?IDC_SIZEALL:IDC_SIZENS));InvalidateRect(window,nullptr,FALSE);return 0;
+                }
+                int h=s->card_at(p);if(h!=s->hovered){s->hovered=h;InvalidateRect(window,nullptr,FALSE);}return 0;
+            }
+            case WM_LBUTTONUP:{
+                POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};const bool dragged=s->dragging;const auto id=s->dragged_peer;const int slot=std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
+                const int pressed=s->pressed_card,index=s->card_at(p);s->cancel_drag();
+                if(dragged){
+                    if(p.x>=s->panel_width){ClientToScreen(window,&p);s->select(id,true,p);}
+                    else if(slot>=0&&p.x>=0&&p.y>=0&&p.y<s->panel_height)s->reorder_peer(id,slot);
+                }else if(pressed>=0&&pressed==index){
+                    if(index==0)s->select({});else if(index>0&&index<=int(s->peers.size())&&s->peers[index-1].id==id)s->select(id);
+                }
+                return 0;
             }
             case WM_RBUTTONUP:s->tray_menu();return 0;
-            case WM_MOUSEWHEEL:{int visible=s->visible_tiles();s->scroll=std::clamp(s->scroll-GET_WHEEL_DELTA_WPARAM(w)/WHEEL_DELTA,0,std::max(0,static_cast<int>(s->peers.size())+1-visible));InvalidateRect(window,nullptr,FALSE);return 0;}
+            case WM_MOUSEWHEEL:{s->composition.finish_cards();int visible=s->visible_tiles();s->scroll=std::clamp(s->scroll-GET_WHEEL_DELTA_WPARAM(w)/WHEEL_DELTA,0,std::max(0,static_cast<int>(s->peers.size())+1-visible));InvalidateRect(window,nullptr,FALSE);return 0;}
             }
         }
         if(window==s->settings) {
@@ -716,7 +810,28 @@ struct Shell::Impl {
         }
         if(window==s->viewer) {
             switch(message){
-            case WM_SETCURSOR:if(s->remote){s->apply_remote_cursor();return TRUE;}break;
+            case WM_SETCURSOR:if(s->remote&&LOWORD(l)==HTCLIENT){s->apply_remote_cursor();return TRUE;}break;
+            case WM_ACTIVATE:s->publish_input();s->confine_mouse();if(LOWORD(w)==WA_INACTIVE)ShowWindow(s->health_badge,SW_HIDE);break;
+            case WM_ENTERMENULOOP:case WM_ENTERSIZEMOVE:s->sizing_viewer=true;s->publish_input();ClipCursor(nullptr);ShowWindow(s->health_badge,SW_HIDE);return 0;
+            case WM_EXITMENULOOP:case WM_EXITSIZEMOVE:s->sizing_viewer=false;s->size_to_source();s->sync_viewer_ui();s->confine_mouse();return 0;
+            case WM_SIZING:if(s->windowed){
+                RECT frame{};AdjustWindowRectExForDpi(&frame,DWORD(GetWindowLongW(window,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(window,GWL_EXSTYLE)),GetDpiForWindow(window));
+                RECT previous{};GetWindowRect(window,&previous);
+                constrain_viewer(*reinterpret_cast<RECT*>(l),UINT(w),frame.right-frame.left,frame.bottom-frame.top,s->window_ratio,s->px(240),&previous);return TRUE;
+            }break;
+            case WM_GETMINMAXINFO:if(s->windowed){
+                RECT r{0,0,s->px(240),LONG(std::lround(s->px(240)/s->window_ratio))};AdjustWindowRectExForDpi(&r,DWORD(GetWindowLongW(window,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(window,GWL_EXSTYLE)),GetDpiForWindow(window));
+                auto* info=reinterpret_cast<MINMAXINFO*>(l);info->ptMinTrackSize={r.right-r.left,r.bottom-r.top};return 0;
+            }break;
+            case WM_WINDOWPOSCHANGING:if(s->windowed&&!s->sizing_viewer&&!IsIconic(window)){
+                auto* position=reinterpret_cast<WINDOWPOS*>(l);
+                if(!(position->flags&SWP_NOSIZE)&&position->cx>=s->px(240)&&position->cy>GetSystemMetrics(SM_CYMINIMIZED)){
+                    RECT frame{};AdjustWindowRectExForDpi(&frame,DWORD(GetWindowLongW(window,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(window,GWL_EXSTYLE)),GetDpiForWindow(window));
+                    position->cy=LONG(std::lround(std::max(1L,position->cx-(frame.right-frame.left))/s->window_ratio))+frame.bottom-frame.top;
+                }
+            }break;
+            case WM_SYSCOMMAND:if(s->windowed&&(w&0xfff0)==SC_MAXIMIZE)return 0;break;
+            case WM_MOVE:case WM_SIZE:s->sync_viewer_ui();break;
             case WM_CLOSE:s->local(true);return 0;case WM_ERASEBKGND:return 1;case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(window,&ps);EndPaint(window,&ps);return 0;}}
         }
         return DefWindowProcW(window,message,w,l);
@@ -788,7 +903,7 @@ bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks c
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
 HWND Shell::viewer_window()const{const auto surface=viewer_surface();return surface?surface->window:nullptr;}
 std::shared_ptr<const ViewerSurface> Shell::viewer_surface()const{return impl_->viewer_surface.load();}
-void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl_,peers]{s->peers=peers;s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));InvalidateRect(s->panel,nullptr,FALSE);});}
+void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl_,peers]{if(s->pressed_card>=0&&!s->dragged_peer.empty()&&std::none_of(peers.begin(),peers.end(),[&](const Peer& p){return p.id==s->dragged_peer;}))s->cancel_drag();if(s->peers.size()!=peers.size())s->composition.finish_cards();s->peers=peers;s->sort_peers();s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));InvalidateRect(s->panel,nullptr,FALSE);});}
 void Shell::show_remote(const std::string& peer,const std::wstring& label,uint64_t session,HWND surface){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,peer,label,session,g,surface]{if(g==s->generation.load()&&(!surface||surface==s->viewer))s->show_remote_ui(peer,label,session);});}
 void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->generation.load();impl_->dispatch([s=impl_,peer,g]{
     if(g!=s->generation.load()||!s->selection_armed||s->pending_id!=peer||s->reconnecting)return;
@@ -796,7 +911,7 @@ void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->gener
     // local()/Escape still invalidates every delayed UI completion.
     s->begin_waiting(peer,true);
 });}
-void Shell::set_remote_size(uint32_t width,uint32_t height){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,width,height,g]{if(g==s->generation.load()){s->remote_width=width;s->remote_height=height;s->publish_input();}});}
+void Shell::set_remote_size(uint32_t width,uint32_t height){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,width,height,g]{if(g==s->generation.load()){s->remote_width=width;s->remote_height=height;s->size_to_source();s->publish_input();}});}
 void Shell::show_local(){impl_->dispatch([s=impl_]{s->local(false);});}
 void Shell::quit(){impl_->dispatch([s=impl_]{PostMessageW(s->owner,WM_CLOSE,0,0);});}
 void Shell::set_status(const std::wstring& status){impl_->dispatch([s=impl_,status]{s->status=status;InvalidateRect(s->panel,nullptr,FALSE);});}
