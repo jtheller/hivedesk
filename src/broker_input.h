@@ -7,7 +7,7 @@
 
 namespace hive::broker {
 constexpr uint32_t InputMaxBytes=128;
-constexpr uint64_t InputMaxQueueUs=100000;
+constexpr uint64_t InputMaxQueueUs=SessionStallUs;
 inline bool send_input_message(HANDLE pipe,Kind kind,const Bytes& payload,const std::atomic<bool>* cancel){
     if(payload.size()>InputMaxBytes)return false;
     std::array<uint8_t,12+InputMaxBytes> message{};
@@ -40,7 +40,7 @@ inline uint32_t input_elapsed_us(uint64_t from,uint64_t to){
 }
 // A desktop can change between attachment and SendInput. Retry one rejected
 // Windows operation only, within the original age/authority checks. Accepted
-// input is never retried and this cannot extend the 100ms freshness limit.
+// input is never retried and this cannot extend the session stall watchdog.
 template<class Operation,class Fresh,class Pause>
 bool retry_desktop_input(Operation&& operation,Fresh&& fresh,Pause&& pause){
     for(unsigned attempt=0;attempt<2;++attempt){

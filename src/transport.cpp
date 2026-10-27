@@ -41,10 +41,10 @@ constexpr uint32_t kMaxClipboard = 1024 * 1024;
 constexpr uint32_t kMaxPacket = kMaxFrame + 64;
 constexpr uint16_t kDiscoveryPort = 47979;
 constexpr size_t kMaxConnections = 128;
-// These are latency budgets, not extra playback buffering. A stalled TCP write
-// cannot be skipped midway: abort that connection rather than flush old video.
+// Unsent freshness is tuning; the seconds-long write watchdog is session failure
+// policy. TCP cannot skip an already submitted packet halfway through.
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
-constexpr auto kVideoWriteBudget = std::chrono::milliseconds(150);
+constexpr auto kVideoWriteBudget = SessionStallTimeout;
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
     InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23 };
@@ -375,7 +375,7 @@ struct Transport::Impl {
                     if(!completed)return; // Partial/error completion invalidates the whole byte stream.
                 }
                 if(!pending.empty()&&Clock::now()>=pending.front()->deadline){
-                    owner->status("Video send exceeded 150 ms; reconnecting for a fresh desktop.");return;
+                    owner->status("Video send stalled for 2 s; reconnecting for a fresh desktop.");return;
                 }
                 if(pending.size()<2){
                     std::optional<Bytes> payload;Clock::time_point queued_at{};bool taken=false;
@@ -431,7 +431,7 @@ struct Transport::Impl {
                 // closesocket only initiates cancellation. The event must finish
                 // before stack OVERLAPPED / ciphertext / WSABUF storage is freed.
                 WaitForSingleObject(send_complete,INFINITE);
-                owner->status("Input send exceeded 100 ms; releasing remote control.");
+                owner->status("Input send stalled for 2 s; releasing remote control.");
                 return false;
             }
             DWORD sent=0,flags=0;
@@ -444,7 +444,7 @@ struct Transport::Impl {
             return sent==total&&Clock::now()<=deadline;
         }
         bool write_packet(const Bytes& b) {
-            const auto deadline=Clock::now()+std::chrono::milliseconds(100);
+            const auto deadline=Clock::now()+SessionStallTimeout;
             if (tx_seq == UINT64_MAX) return false;
             Bytes head; u32(head,uint32_t(b.size())); u64(head,++tx_seq);
             Bytes cipher; std::array<uint8_t,16> tag{};
@@ -478,7 +478,7 @@ struct Transport::Impl {
                         input_stalled=input_send.expired(input_now_us());
                     } else queue_cv.wait(lock,writable);
                     if (closed || !owner->running) break;
-                    if(input_stalled){lock.unlock();owner->status("Input completion exceeded 100 ms; releasing remote control.");close(true);break;}
+                    if(input_stalled){lock.unlock();owner->status("Input completion stalled for 2 s; releasing remote control.");close(true);break;}
                     if(!writable())continue;
                     if(channel==2&&control.empty()) {b=input_bytes(input_send.take(input_now_us()));control_inflight=true;}
                     else { b = std::move(control.front()); control.pop_front(); control_bytes -= b.size(); control_inflight = true; }
@@ -1113,7 +1113,8 @@ bool Transport::self_test(std::string& result) {
         std::array<InputPacket,8> sent{};
         for(size_t i=0;i<sent.size();++i){if(!queue.writable()){result="Input credit exhausted before its bound";return false;}sent[i]=queue.take(1200+i);if(sent[i].event.kind!=kinds[i]){result="Motion crossed an input edge";return false;}}
         if(sent[0].event.a!=3||sent[3].event.a!=7||sent[3].event.b!=-15||sent[3].capture_time_us!=1000||queue.writable()||
-            !put({InputKind::Absolute,7,8},1300)||queue.writable()||queue.expired(101199)||!queue.expired(101200)) {
+            !put({InputKind::Absolute,7,8},1300)||queue.writable()||queue.expired(501200)||
+            queue.expired(1200+InputSendWindow::deadline_us-1)||!queue.expired(1200+InputSendWindow::deadline_us)) {
             result="Input motion merge, eight-packet credit, or completion deadline failed";return false;
         }
         const auto& last=sent.back();
@@ -1151,6 +1152,9 @@ bool Transport::self_test(std::string& result) {
         incoming.input_begin=[&](const std::string&,uint64_t session){std::lock_guard lock(guard);ordered=clipboard&&started&&session==901;return ordered;};
         incoming.input_packet=[&](const std::string& peer,const InputPacket& packet){
             {std::lock_guard lock(guard);++packets;last_sequence=packet.sequence;received_clock=received_clock&&packet.received_time_us&&packet.received_time_us<=input_now_us();changed.notify_all();}
+            // Model cross-region RTT / temporary host scheduling delay without
+            // injecting real desktop input. It must not revoke the session.
+            if(packet.sequence==10)Sleep(400);
             receiver.send_input_ack(peer,{packet.session,packet.sequence,packet.capture_time_us,7,11,true});
         };
         outgoing.input_ack=[&](const std::string&,const InputAck& ack){std::lock_guard lock(guard);if(ack.injected&&ack.host_queue_us==7&&ack.inject_us==11)++acks;changed.notify_all();};
@@ -1167,7 +1171,7 @@ bool Transport::self_test(std::string& result) {
         {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(2),[&]{return blocked;})){result="Control isolation setup failed";return false;}}
         auto packet=InputPacket{901,10,input_now_us(),{InputKind::Key,30,0}};packet.received_time_us=UINT64_MAX;
         bool ok=sender.send_input(id,packet);packet.sequence=11;packet.capture_time_us=input_now_us();packet.event.b=1;ok=sender.send_input(id,packet)&&ok;
-        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::milliseconds(500),[&]{return acks==2;})&&ok;ok=ok&&packets==2&&last_sequence==11&&ordered&&received_clock;unblock=true;changed.notify_all();}
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(1),[&]{return acks==2;})&&ok;ok=ok&&packets==2&&last_sequence==11&&ordered&&received_clock;unblock=true;changed.notify_all();}
         auto stats=sender.input_diagnostics(id);
         ok=ok&&stats.ready&&stats.dedicated&&stats.sent==2&&stats.acknowledged==2&&stats.samples==2&&stats.host_queue_p95_us==7&&stats.inject_p95_us==11;
         ok=ok&&sender.end_input(id,901)&&!sender.input_ready(id,901)&&!sender.send_input(id,packet);
@@ -1236,7 +1240,9 @@ bool Transport::self_test(std::string& result) {
             !sender.connect("127.0.0.1",receiver.impl_->cfg.port,id,error)||!sender.begin_input(id,902)){result="Input stall setup: "+error;return false;}
         const auto deadline=Clock::now()+std::chrono::seconds(2);while(!sender.input_ready(id,902)&&Clock::now()<deadline)Sleep(1);
         if(!sender.send_input(id,InputPacket{902,1,input_now_us(),{InputKind::Relative,1,2}})){result="Input stall packet was not admitted";return false;}
-        {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(1),[&]{return disconnected;})){result="Stalled input was replayable beyond its completion budget";return false;}}
+        {std::unique_lock lock(guard);
+            if(changed.wait_for(lock,std::chrono::milliseconds(400),[&]{return disconnected;})){result="Subsecond input delay revoked control";return false;}
+            if(!changed.wait_for(lock,SessionStallTimeout+std::chrono::seconds(1),[&]{return disconnected;})){result="Stalled input was replayable beyond its completion budget";return false;}}
         if(sender.connection_token(id)){result="Input stall did not close the authenticated channel set";return false;}
     }
     {
@@ -1719,7 +1725,7 @@ bool Transport::self_test(std::string& result) {
         sending.peer=[&](const Peer& peer){if(!peer.authenticated){std::lock_guard lock(guard);disconnected=true;changed.notify_all();}};
         receiving.frame=[&](const std::string&,EncodedFrame){
             std::unique_lock lock(guard);++frames;blocked=true;changed.notify_all();
-            changed.wait_for(lock,std::chrono::seconds(3),[&]{return release;});
+            changed.wait_for(lock,SessionStallTimeout+std::chrono::seconds(3),[&]{return release;});
         };
         std::string failure,peer;
         if(!sender.start({"stalled-a","Stalled sender","",0,false,true},sending,failure)||
@@ -1739,7 +1745,7 @@ bool Transport::self_test(std::string& result) {
         const auto began=Clock::now();stalled_ok=sender.send_frame("stalled-b",large)&&stalled_ok;
         auto sending_video=sender.impl_->find("stalled-b",true);
         const auto wait_flight=[&](unsigned count){
-            while(sending_video&&sending_video->video_inflight<count&&Clock::now()-began<std::chrono::milliseconds(120))Sleep(1);
+            while(sending_video&&sending_video->video_inflight<count&&Clock::now()-began<std::chrono::milliseconds(500))Sleep(1);
             return sending_video&&sending_video->video_inflight==count;
         };
         stalled_ok=wait_flight(1)&&stalled_ok;
@@ -1748,16 +1754,18 @@ bool Transport::self_test(std::string& result) {
         // A third frame may occupy only the single unsent slot, never Winsock.
         initial.sequence=3;stalled_ok=sender.send_frame("stalled-b",initial)&&stalled_ok;
         stalled_ok=!sender.frame_ready("stalled-b")&&sending_video&&sending_video->video_inflight==2&&stalled_ok;
-        {std::unique_lock lock(guard);stalled_ok=changed.wait_for(lock,std::chrono::seconds(1),[&]{return disconnected;})&&stalled_ok;release=true;changed.notify_all();}
+        {std::unique_lock lock(guard);
+            stalled_ok=!changed.wait_for(lock,std::chrono::milliseconds(400),[&]{return disconnected;})&&stalled_ok;
+            stalled_ok=changed.wait_for(lock,SessionStallTimeout+std::chrono::seconds(1),[&]{return disconnected;})&&stalled_ok;release=true;changed.notify_all();}
         const auto elapsed=Clock::now()-began;
-        stalled_ok=stalled_ok&&elapsed<std::chrono::seconds(1)&&!sender.connection_token("stalled-b");
+        stalled_ok=stalled_ok&&elapsed>=SessionStallTimeout&&elapsed<SessionStallTimeout+std::chrono::seconds(1)&&!sender.connection_token("stalled-b");
         sender.stop();receiver.stop();
         if(sending_video){const auto stats=sending_video->video_send.snapshot(transport_us());
             stalled_ok=stalled_ok&&stats.submitted_packets==3&&stats.completed_packets==1&&stats.failed_packets==2&&!sending_video->video_inflight;}
         {std::lock_guard lock(guard);stalled_ok=stalled_ok&&frames==1;}
         if(!stalled_ok){result="Stalled encrypted video did not cancel within its deadline, close both channels, or discard unsent replay";return false;}
     }
-    result = ok ? "PASS: dedicated encrypted input with clipboard/start handshake, eight completed-injection credits, bounded edge-safe motion merge, submitted-send/ACK latency metrics, blocked-control independence, session finish without replay, negative/missing ACK recovery, and reciprocal input preserved across an urgent kick plus late control notice; legacy input/capability compatibility; timed-video source completion, both mixed-version directions, malformed timing bounds and 32-bit feature advertisement; short Network Key derivation/reference vector, authenticated three-channel loopback, wrong-key and AES-GCM tamper rejection; stream/frame/diagnostic bounds; host kick/session isolation; bounded shutdown; 50 ms unsent-video expiry and IDR recovery; local WSASend metrics; stalled 16 MiB video write canceled within 1 s." : "Transport loopback, ordering, bounds, or shutdown failed.";
+    result = ok ? "PASS: dedicated encrypted input with clipboard/start handshake, eight completed-injection credits, bounded edge-safe motion merge, submitted-send/ACK latency metrics, blocked-control independence, session finish without replay, negative/missing ACK recovery, and reciprocal input preserved across an urgent kick plus late control notice; legacy input/capability compatibility; timed-video source completion, both mixed-version directions, malformed timing bounds and 32-bit feature advertisement; short Network Key derivation/reference vector, authenticated three-channel loopback, wrong-key and AES-GCM tamper rejection; stream/frame/diagnostic bounds; host kick/session isolation; bounded shutdown; 50 ms unsent-video expiry and IDR recovery; local WSASend metrics; 400 ms delayed input ACKs preserved; stalled 16 MiB video writes canceled after the 2 s watchdog." : "Transport loopback, ordering, bounds, or shutdown failed.";
     return ok;
 }
 }

@@ -13,7 +13,7 @@ namespace hive {
 class InputSendWindow {
 public:
     static constexpr size_t capacity=128,credit=8,sample_capacity=256;
-    static constexpr uint64_t deadline_us=100000,sample_age_us=2000000;
+    static constexpr uint64_t deadline_us=SessionStallUs,sample_age_us=2000000;
     struct Pending { InputPacket packet;uint64_t queued_at=0; };
     struct Flight { InputPacket packet;uint64_t sent_at=0;uint32_t capture_to_send=0; };
     void reset(uint64_t session) { *this=InputSendWindow{};session_=session; }

@@ -1,5 +1,6 @@
 #pragma once
 #include "hivedesk/types.h"
+#include "hivedesk/session_watchdog.h"
 #include <algorithm>
 #include <cstdint>
 #include <deque>
@@ -90,7 +91,7 @@ class ViewerQueue {
 public:
     static constexpr size_t MaxPending = 4;
     static constexpr uint64_t MaxAgeUs = 50000;
-    static constexpr uint64_t RecoveryTimeoutUs = 2000000;
+    static constexpr uint64_t RecoveryTimeoutUs = SessionStallUs;
     static constexpr uint64_t BacklogEvidenceUs = 250000;
     struct Pending {
         EncodedFrame frame;

@@ -191,9 +191,9 @@ struct InputCapture::Impl {
                 if(input.generation!=route||(!target.enabled&&input.event.kind!=InputKind::ReleaseAll))continue;
             }
             const auto now=input_now_us();
-            // More than 100 ms of queued input is no longer interactive. Never
-            // replay that burst or silently discard its key/button releases.
-            if(input.event.kind!=InputKind::ReleaseAll&&now>input.captured_us&&now-input.captured_us>100000){fail_route(target,true);continue;}
+            // Tolerate transient scheduling delays; only seconds-old input
+            // revokes the route rather than replaying a severely stalled burst.
+            if(input.event.kind!=InputKind::ReleaseAll&&now>input.captured_us&&now-input.captured_us>SessionStallUs){fail_route(target,true);continue;}
             {
                 std::lock_guard lock(mutex);
                 if(input.generation!=route||(blocked_route==route&&input.event.kind!=InputKind::ReleaseAll))continue;
@@ -277,7 +277,17 @@ bool InputCapture::worker_self_test(std::string& result){
         }
         {
             Probe probe;probe.capture.update(route);start(probe);
-            emit(probe,{InputKind::Key,0x1e,0},input_now_us()-200000);
+            emit(probe,{InputKind::Key,0x1e,0},input_now_us()-400000);
+            emit(probe,{InputKind::Key,0x1e,1},input_now_us()-300000);
+            require(probe.wait(2),"subsecond input delay revoked route");
+            {std::lock_guard lock(probe.mutex);require(probe.received.size()==2&&
+                probe.received[0].event.kind==InputKind::Key&&probe.received[0].event.b==0&&
+                probe.received[1].event.kind==InputKind::Key&&probe.received[1].event.b==1,"delayed key edges lost ordering");}
+            require(!probe.capture.diagnostics().expired&&probe.capture.impl_->snapshot().enabled,"subsecond input blocked route");
+        }
+        {
+            Probe probe;probe.capture.update(route);start(probe);
+            emit(probe,{InputKind::Key,0x1e,0},input_now_us()-SessionStallUs-1000);
             require(probe.wait(1),"expired input did not produce emergency release");
             {std::lock_guard lock(probe.mutex);require(probe.received.size()==1&&probe.received[0].event.kind==InputKind::ReleaseAll,"expired key was replayed");}
             require(probe.capture.diagnostics().expired==1&&!probe.capture.impl_->snapshot().enabled,"expired route was not blocked");

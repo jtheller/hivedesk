@@ -123,6 +123,11 @@ void completion_check(){
     require(begun&&reached&&held&&completed&&ack.injected&&ack.inject_us>=20000&&!input.held(),"ACK preceded injection completion or shutdown did not release");
 }
 void binding_and_release_check(){
+    {InputServer input;InputAck ack;require(input.begin()&&
+        input.send(1,{InputKind::Key,0x1e,0,0},7,input_now_us()-400000)&&input.ack(ack)&&ack.injected&&input.held()&&
+        ack.host_queue_us>=400000,"Subsecond broker queue delay revoked input");
+        require(input.send(2,{InputKind::Key,0x1e,1,0},7,input_now_us()-300000)&&input.ack(ack)&&ack.injected&&!input.held(),
+            "Delayed key-up failed to release held input");}
     {InputServer input;require(!input.begin(8)&&input.finished()&&input.injected()==0,"Old session bound to input pipe");}
     {InputServer input(7,GetCurrentProcessId()+1);require(!input.begin()&&input.finished()&&input.injected()==0,"Wrong process bound to input pipe");}
     {InputServer input;InputAck ack;require(input.begin()&&input.send(1,{InputKind::Key,0x1e,0,0},8)&&!input.ack(ack)&&

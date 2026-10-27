@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "session_watchdog.h"
 #include <chrono>
 #include <cstdint>
 

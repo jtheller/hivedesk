@@ -95,7 +95,7 @@ impersonator. No universal shared password is embedded in the application.
   At most eight packets await completed-injection ACKs; pending input is bounded
   to 128 network events and 256 capture events. Adjacent absolute motion replaces
   old positions, while relative motion accumulates; neither crosses a key,
-  button, wheel or release boundary. A 100 ms input stall/expiry closes the input
+  button, wheel or release boundary. A 2 s input stall/expiry closes the input
   session and releases held keys/buttons instead of replaying stale input.
   Clipboard handoff completes before input is enabled on a newly selected
   computer. Later clipboard work stays on the control path and does not block
@@ -177,7 +177,7 @@ impersonator. No universal shared password is embedded in the application.
   image, software-rendered cursor changes and requested recovery IDRs still work.
   Pacing retains its scheduled phase across normal wake-up jitter and skips
   missed ticks after a stall instead of accumulating delay or catching up.
-  Video TCP writes use one overlapped packet and a 150 ms deadline; a stalled
+  Video TCP writes allow two overlapped packets and a 2 s watchdog; a stalled
   partial write closes the connection instead of replaying old bytes later.
   The viewer rejects aged backlog before decoding and presentation, retains only
   the latest prepared picture while Present is busy, and retries that picture
