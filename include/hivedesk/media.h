@@ -22,6 +22,7 @@ public:
     // directly rather than waiting for the compatibility timeout.
     void notify_ready();
     bool running() const;
+    std::string failure() const;
     void feedback(const StreamFeedback&);
 private: struct Impl; std::unique_ptr<Impl> impl_;
 };

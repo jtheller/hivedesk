@@ -77,6 +77,7 @@ struct Shell::Impl {
     ShellConfig config; ShellCallbacks callbacks; std::vector<Peer> peers;
     std::string active_id,previous_id,pending_id;
     std::map<std::string,HBITMAP> thumbnails;
+    std::map<std::string,HBITMAP> full_snapshots;
     std::map<std::string,HBITMAP> prior_thumbnails;
     std::map<std::string,ULONGLONG> thumbnail_fades;
     std::string cursor_controller;
@@ -179,13 +180,18 @@ struct Shell::Impl {
         HDC dc=CreateCompatibleDC(nullptr);HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
         if(!dc||!bitmap){if(bitmap)DeleteObject(bitmap);if(dc)DeleteDC(dc);throw std::runtime_error("Could not create waiting screen");}
         const auto previous=SelectObject(dc,bitmap);fill(dc,{0,0,width,height},Background);
-        const auto snapshot=thumbnails.find(pending_id);
-        if(snapshot!=thumbnails.end()){
-            HDC source=CreateCompatibleDC(dc);const auto prior=SelectObject(source,snapshot->second);
-            const double scale=std::min(double(width)/SnapshotWidth,double(height)/SnapshotHeight);
-            const int w=int(SnapshotWidth*scale),h=int(SnapshotHeight*scale);
+        const auto full=full_snapshots.find(pending_id),thumb=thumbnails.find(pending_id);
+        const HBITMAP snapshot=full!=full_snapshots.end()?full->second:thumb!=thumbnails.end()?thumb->second:nullptr;
+        RemovePropW(waiting,L"HiveDesk.SnapshotWidth");RemovePropW(waiting,L"HiveDesk.SnapshotHeight");
+        if(snapshot){
+            BITMAP dimensions{};GetObjectW(snapshot,sizeof(dimensions),&dimensions);
+            SetPropW(waiting,L"HiveDesk.SnapshotWidth",reinterpret_cast<HANDLE>(ULONG_PTR(dimensions.bmWidth)));
+            SetPropW(waiting,L"HiveDesk.SnapshotHeight",reinterpret_cast<HANDLE>(ULONG_PTR(dimensions.bmHeight)));
+            HDC source=CreateCompatibleDC(dc);const auto prior=SelectObject(source,snapshot);
+            const double scale=std::min(double(width)/dimensions.bmWidth,double(height)/dimensions.bmHeight);
+            const int w=int(dimensions.bmWidth*scale),h=int(dimensions.bmHeight*scale);
             SetStretchBltMode(dc,HALFTONE);SetBrushOrgEx(dc,0,0,nullptr);
-            StretchBlt(dc,(width-w)/2,(height-h)/2,w,h,source,0,0,SnapshotWidth,SnapshotHeight,SRCCOPY);
+            StretchBlt(dc,(width-w)/2,(height-h)/2,w,h,source,0,0,dimensions.bmWidth,dimensions.bmHeight,SRCCOPY);
             SelectObject(source,prior);DeleteDC(source);
         }
         auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==pending_id;});
@@ -195,7 +201,7 @@ struct Shell::Impl {
         fill(dc,{left,badge.top,left+px(3),bottom},accent);
         draw_text(dc,title_font,label,{left+px(16),badge.top+px(5),badge.right-px(12),badge.top+px(38)},Text);
         std::wstring message=waiting_retry?L"Reconnecting":L"Connecting";
-        if(snapshot!=thumbnails.end())message+=L"  \x00b7  Snapshot";
+        if(snapshot)message+=L"  \x00b7  Snapshot";
         message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
         draw_text(dc,small_font,message,{left+px(16),badge.top+px(39),badge.right-px(12),bottom-px(5)},Muted);
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
@@ -378,8 +384,12 @@ struct Shell::Impl {
         panel_closing=false;KillTimer(owner,2);panel_mode=mode;hovered=-1;outside_since=0;
         panel_width=px(200);panel_height=mode==1?tile_height()+px(24):GetSystemMetrics(SM_CYSCREEN);
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE);
-        InvalidateRect(panel,nullptr,FALSE);UpdateWindow(panel);
-        composition.show(float(panel_width),float(panel_height),float(previous_height),entering,reversing);
+        // Upload even while hidden. UpdateWindow alone depends on visibility /
+        // update-region state and can leave the previous surface after a failed
+        // connection. Commit this image and its new clips/opacity together.
+        if(!paint_panel(false)){hide_panel();return;}
+        try{composition.show(float(panel_width),float(panel_height),float(previous_height),entering,reversing);}
+        catch(const std::exception&){hide_panel();return;}
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
         publish_input();
         if(entering&&callbacks.panel_opened)callbacks.panel_opened();
@@ -440,13 +450,13 @@ struct Shell::Impl {
         if(panel_mode==1&&p.x>=0&&p.x<px(42)&&p.y>px(32))show_panel(2);
         if(!panel_summoned&&(p.x<0||p.x>panel_width+px(40)||p.y<0||p.y>panel_height+px(30))) {if(!outside_since)outside_since=now;if(now-outside_since>250)hide_panel(true);}else outside_since=0;
     }
-    void paint_panel() {
+    bool paint_panel(bool commit=true) {
         PAINTSTRUCT ps{};BeginPaint(panel,&ps);RECT r{};GetClientRect(panel,&r);
         const int width=std::max(1L,r.right),height=std::max(1L,r.bottom);
         BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;
         info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
         void* pixels=nullptr;HDC dc=CreateCompatibleDC(nullptr);HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
-        if(!dc||!bitmap){if(dc)DeleteDC(dc);if(bitmap)DeleteObject(bitmap);EndPaint(panel,&ps);return;}
+        if(!dc||!bitmap){if(dc)DeleteDC(dc);if(bitmap)DeleteObject(bitmap);EndPaint(panel,&ps);return false;}
         HGDIOBJ old=SelectObject(dc,bitmap);
         auto shade=[&](int amount){return RGB(GetRValue(accent)*amount/100,GetGValue(accent)*amount/100,GetBValue(accent)*amount/100);};
         fill(dc,r,shade(16));
@@ -490,8 +500,17 @@ struct Shell::Impl {
         if(panel_mode==1)card(preview_index(),px(12));
         else for(int i=scroll;i<=static_cast<int>(peers.size())&&i<scroll+visible_tiles();++i)card(i,px(12)+(i-scroll)*tile_stride());
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
-        try{composition.present(pixels,width,height);}catch(const std::exception&){OutputDebugStringW(L"HiveDesk Switcher composition update failed\n");}
+        bool rendered=false;
+        try{composition.present(pixels,width,height,commit);rendered=true;}
+        catch(const std::exception&){
+            // A failed DComp device/surface must recover independently of a
+            // later successful video connection. Rebuild and upload once.
+            try{composition=PanelComposition{};composition.create(panel);composition.present(pixels,width,height,false);
+                composition.show(float(width),float(height),0,true,false);rendered=true;}
+            catch(const std::exception& e){OutputDebugStringA(e.what());}
+        }
         SelectObject(dc,old);DeleteObject(bitmap);DeleteDC(dc);EndPaint(panel,&ps);
+        return rendered;
     }
 
     void read_clipboard(bool notify) {
@@ -756,6 +775,7 @@ struct Shell::Impl {
         retired_viewers.clear();viewer_surface.store(nullptr);
         if(owner){MSG m{};while(PeekMessageW(&m,owner,UiTask,UiTask,PM_REMOVE))delete reinterpret_cast<std::function<void()>*>(m.lParam);DestroyWindow(owner);}
         for(auto& item:thumbnails)DeleteObject(item.second);thumbnails.clear();
+        for(auto& item:full_snapshots)DeleteObject(item.second);full_snapshots.clear();
         for(auto& item:prior_thumbnails)DeleteObject(item.second);prior_thumbnails.clear();
         reset_remote_cursor();
         if(debug_font)DeleteObject(debug_font);
@@ -787,13 +807,41 @@ void Shell::show_settings(){impl_->dispatch([s=impl_]{s->settings_ui();});}
 bool Shell::prepare_video_restart(){return impl_->settings_restart.prepare();}
 void Shell::cancel_video_restart(){impl_->settings_restart.cancel();}
 void Shell::update_thumbnail(const std::string& peer,Thumbnail thumbnail) {
-    if(thumbnail.bgra.size()!=size_t(SnapshotWidth)*SnapshotHeight*4)return;
+    if(!valid_snapshot_dimensions(thumbnail.width,thumbnail.height)||thumbnail.bgra.size()!=size_t(thumbnail.width)*thumbnail.height*4)return;
     impl_->dispatch([s=impl_,peer,thumbnail=std::move(thumbnail)] {
         if(std::none_of(s->peers.begin(),s->peers.end(),[&](const Peer& p){return p.id==peer;}))return;
         BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=SnapshotWidth;info.bmiHeader.biHeight=-LONG(SnapshotHeight);
         info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* bits=nullptr;
         HBITMAP bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);if(!bitmap)return;
-        std::memcpy(bits,thumbnail.bgra.data(),thumbnail.bgra.size());
+        if(thumbnail.width==SnapshotWidth&&thumbnail.height==SnapshotHeight){
+            std::memcpy(bits,thumbnail.bgra.data(),thumbnail.bgra.size());
+            const auto old_full=s->full_snapshots.find(peer);
+            if(old_full!=s->full_snapshots.end()){DeleteObject(old_full->second);s->full_snapshots.erase(old_full);}
+        }
+        else {
+            info.bmiHeader.biWidth=thumbnail.width;info.bmiHeader.biHeight=-LONG(thumbnail.height);void* full_bits=nullptr;
+            HBITMAP full=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&full_bits,nullptr,0);
+            HDC source=CreateCompatibleDC(nullptr),target=CreateCompatibleDC(nullptr);
+            if(!full||!source||!target){if(full)DeleteObject(full);if(source)DeleteDC(source);if(target)DeleteDC(target);DeleteObject(bitmap);return;}
+            std::memcpy(full_bits,thumbnail.bgra.data(),thumbnail.bgra.size());
+            const auto old_source=SelectObject(source,full),old_target=SelectObject(target,bitmap);
+            std::memset(bits,0,size_t(SnapshotWidth)*SnapshotHeight*4);
+            const double scale=std::min(double(SnapshotWidth)/thumbnail.width,double(SnapshotHeight)/thumbnail.height);
+            const int w=std::max(1,int(thumbnail.width*scale)),h=std::max(1,int(thumbnail.height*scale));
+            SetStretchBltMode(target,HALFTONE);SetBrushOrgEx(target,0,0,nullptr);
+            const bool drawn=StretchBlt(target,(SnapshotWidth-w)/2,(SnapshotHeight-h)/2,w,h,source,0,0,thumbnail.width,thumbnail.height,SRCCOPY)!=FALSE;
+            GdiFlush();SelectObject(source,old_source);SelectObject(target,old_target);DeleteDC(source);DeleteDC(target);
+            if(!drawn){DeleteObject(full);DeleteObject(bitmap);return;}
+            auto& previous=s->full_snapshots[peer];if(previous)DeleteObject(previous);previous=full;
+            // Full images are only for the waiting screen; sidebar crossfades
+            // retain small bitmaps. Bound the full-resolution cache to 128 MiB.
+            size_t bytes=0;for(const auto& [id,image]:s->full_snapshots){BITMAP d{};GetObjectW(image,sizeof(d),&d);bytes+=size_t(d.bmWidth)*d.bmHeight*4;}
+            for(auto it=s->full_snapshots.begin();bytes>128*1024*1024&&it!=s->full_snapshots.end();){
+                if(it->first==peer){++it;continue;}
+                BITMAP d{};GetObjectW(it->second,sizeof(d),&d);bytes-=size_t(d.bmWidth)*d.bmHeight*4;
+                DeleteObject(it->second);it=s->full_snapshots.erase(it);
+            }
+        }
         auto prior=s->prior_thumbnails.find(peer);if(prior!=s->prior_thumbnails.end()){DeleteObject(prior->second);s->prior_thumbnails.erase(prior);}
         auto& cached=s->thumbnails[peer];if(cached)s->prior_thumbnails[peer]=cached;cached=bitmap;
         BOOL animations=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);

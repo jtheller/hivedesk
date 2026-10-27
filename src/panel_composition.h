@@ -24,6 +24,8 @@ class PanelComposition {
     Ptr<IDCompositionVisual> backdrop_;
     Ptr<IDCompositionScaleTransform> backdrop_scale_;
     UINT width_=0,height_=0;
+    HWND window_=nullptr;
+    ULONG_PTR revision_=0;
     bool detached_=false;
     float fade_from_=0,fade_to_=0,fade_seconds_=0;
     ULONGLONG fade_start_=0;
@@ -75,6 +77,7 @@ public:
         check(device_->Commit());
     }
     void create(HWND window) {
+        window_=window;
         check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&gpu_,nullptr,nullptr));
         Ptr<IDXGIDevice> dxgi;check(gpu_.As(&dxgi));
         check(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,factory_.GetAddressOf()));
@@ -115,6 +118,11 @@ public:
             }
         }
         const HRESULT end=surface_->EndDraw();check(result);check(end);if(commit)check(device_->Commit());
+        // Read-only UI diagnostics: confirms the uploaded surface, not WM_PAINT
+        // delivery or the HWND size. Useful on an invisible test window station.
+        SetPropW(window_,L"HiveDesk.SurfaceWidth",reinterpret_cast<HANDLE>(ULONG_PTR(width)));
+        SetPropW(window_,L"HiveDesk.SurfaceHeight",reinterpret_cast<HANDLE>(ULONG_PTR(height)));
+        SetPropW(window_,L"HiveDesk.SurfaceRevision",reinterpret_cast<HANDLE>(++revision_));
     }
     void show(float width,float height,float previous_height,bool entering,bool reversing) {
         check(clip_->SetLeft(0.0f));check(clip_->SetTop(0.0f));check(clip_->SetRight(width));

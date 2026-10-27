@@ -26,7 +26,7 @@ struct TransportCallbacks {
     std::function<void(const std::string&, const InputEvent&)> input;
     std::function<void(const std::string&, const std::wstring&)> clipboard;
     std::function<void(const std::string&)> status;
-    std::function<void(const std::string&, uint64_t)> snapshot_request;
+    std::function<void(const std::string&, uint64_t,bool)> snapshot_request;
     std::function<void(const std::string&, Snapshot)> snapshot;
     std::function<void(const std::string&, CursorState)> cursor;
     std::function<void(const std::string&, const StreamFeedback&)> feedback;

@@ -120,14 +120,19 @@ struct Session {
             if(!delivered){stopping=true;CancelIoEx(pipe,nullptr);}
         });
         std::thread monitor([this]{
-            std::string previous_error;
+            std::string previous_error,previous_pipeline_error;
             while(!stopping){
                 Sleep(100);if(stopping)break;
                 std::lock_guard lock(media_mutex);
                 const auto desktop=input_desktop_name();
                 if(active&&(captured_desktop!=desktop||!media.running())){
                     const auto previous_desktop=captured_desktop;
-                    media.stop();if(stopping)break;std::string error;start_media(error);
+                    media.stop();if(stopping)break;
+                    const auto pipeline_error=media.failure();
+                    if(!pipeline_error.empty()&&pipeline_error!=previous_pipeline_error)
+                        notice("Capture stopped: "+pipeline_error);
+                    previous_pipeline_error=pipeline_error;
+                    std::string error;start_media(error);
                     if(!error.empty()&&error!=previous_error)notice("Capture restart: "+error);
                     if(error.empty())notice("Capture resumed: "+narrow(previous_desktop)+" -> "+narrow(captured_desktop)+"; preserving stream frame sequence.");previous_error=error;
                     if(!error.empty())Sleep(150);

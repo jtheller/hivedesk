@@ -44,47 +44,56 @@ ComPtr<IWICImagingFactory> factory() {
     ComPtr<IWICImagingFactory> result;
     check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&result)),"Create snapshot image factory");return result;
 }
-std::vector<uint8_t> encode_jpeg(const uint8_t* bgra) {
+std::vector<uint8_t> encode_jpeg(const uint8_t* bgra,uint32_t width=SnapshotWidth,uint32_t height=SnapshotHeight,float image_quality=.78f) {
     Apartment apartment;auto imaging=factory();ComPtr<IStream> stream;
     check(CreateStreamOnHGlobal(nullptr,TRUE,&stream),"Create snapshot stream");
     ComPtr<IWICBitmapEncoder> encoder;check(imaging->CreateEncoder(GUID_ContainerFormatJpeg,nullptr,&encoder),"Create JPEG encoder");
     check(encoder->Initialize(stream.Get(),WICBitmapEncoderNoCache),"Initialize JPEG encoder");
     ComPtr<IWICBitmapFrameEncode> frame;ComPtr<IPropertyBag2> options;
     check(encoder->CreateNewFrame(&frame,&options),"Create JPEG frame");
-    PROPBAG2 property{};property.pstrName=const_cast<wchar_t*>(L"ImageQuality");VARIANT quality{};quality.vt=VT_R4;quality.fltVal=.78f;
+    PROPBAG2 property{};property.pstrName=const_cast<wchar_t*>(L"ImageQuality");VARIANT quality{};quality.vt=VT_R4;quality.fltVal=image_quality;
     check(options->Write(1,&property,&quality),"Set snapshot quality");check(frame->Initialize(options.Get()),"Initialize JPEG frame");
-    check(frame->SetSize(SnapshotWidth,SnapshotHeight),"Set snapshot dimensions");
+    check(frame->SetSize(width,height),"Set snapshot dimensions");
     WICPixelFormatGUID format=GUID_WICPixelFormat24bppBGR;check(frame->SetPixelFormat(&format),"Set JPEG pixel format");
     if(format!=GUID_WICPixelFormat24bppBGR)throw std::runtime_error("Unexpected JPEG pixel format");
-    std::vector<uint8_t> bgr(size_t(SnapshotWidth)*SnapshotHeight*3);
+    std::vector<uint8_t> bgr(size_t(width)*height*3);
     for(size_t i=0;i<bgr.size()/3;++i)std::memcpy(bgr.data()+i*3,bgra+i*4,3);
-    check(frame->WritePixels(SnapshotHeight,SnapshotWidth*3,UINT(bgr.size()),bgr.data()),"Encode snapshot pixels");
+    check(frame->WritePixels(height,width*3,UINT(bgr.size()),bgr.data()),"Encode snapshot pixels");
     check(frame->Commit(),"Commit JPEG frame");check(encoder->Commit(),"Commit JPEG stream");
     STATSTG stat{};check(stream->Stat(&stat,STATFLAG_NONAME),"Read JPEG size");
-    if(!stat.cbSize.QuadPart||stat.cbSize.QuadPart>MaxSnapshotBytes)throw std::runtime_error("Snapshot exceeds size limit");
+    if(!stat.cbSize.QuadPart||stat.cbSize.QuadPart>16*1024*1024)throw std::runtime_error("Snapshot exceeds size limit");
     check(stream->Seek({},STREAM_SEEK_SET,nullptr),"Rewind JPEG stream");
     std::vector<uint8_t> bytes(size_t(stat.cbSize.QuadPart));ULONG read=0;
     check(stream->Read(bytes.data(),ULONG(bytes.size()),&read),"Read JPEG bytes");
     if(read!=bytes.size())throw std::runtime_error("Incomplete JPEG output");return bytes;
 }
 }
-Snapshot capture_snapshot(uint64_t request) {
-    Screen screen;DC dc;Bitmap bitmap;void* pixels=nullptr;auto info=color_info(SnapshotWidth,SnapshotHeight);
+Snapshot capture_snapshot(uint64_t request,bool native) {
+    const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+    if(width<=0||height<=0)throw std::runtime_error("Primary display is unavailable");
+    const uint32_t out_width=native?uint32_t(width):SnapshotWidth,out_height=native?uint32_t(height):SnapshotHeight;
+    if(!valid_snapshot_dimensions(out_width,out_height))throw std::runtime_error("Primary snapshot dimensions exceed allocation bounds");
+    Screen screen;DC dc;Bitmap bitmap;void* pixels=nullptr;auto info=color_info(out_width,out_height);
     bitmap.value=CreateDIBSection(dc.value,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
     if(!screen.value||!dc.value||!bitmap.value)throw std::runtime_error("Allocate snapshot bitmap");
     Selection selected(dc.value,bitmap.value);
-    const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
-    if(width<=0||height<=0)throw std::runtime_error("Primary display is unavailable");
-    std::memset(pixels,0,size_t(SnapshotWidth)*SnapshotHeight*4);
-    const double scale=std::min(double(SnapshotWidth)/width,double(SnapshotHeight)/height);
+    std::memset(pixels,0,size_t(out_width)*out_height*4);
+    const double scale=std::min(double(out_width)/width,double(out_height)/height);
     const int w=std::max(1,int(width*scale)),h=std::max(1,int(height*scale));
     SetStretchBltMode(dc.value,HALFTONE);SetBrushOrgEx(dc.value,0,0,nullptr);
-    if(!StretchBlt(dc.value,(int(SnapshotWidth)-w)/2,(int(SnapshotHeight)-h)/2,w,h,screen.value,0,0,width,height,SRCCOPY|CAPTUREBLT))
+    if(!StretchBlt(dc.value,(int(out_width)-w)/2,(int(out_height)-h)/2,w,h,screen.value,0,0,width,height,SRCCOPY|CAPTUREBLT))
         throw std::runtime_error("Capture primary snapshot");
-    GdiFlush();return {request,encode_jpeg(static_cast<const uint8_t*>(pixels))};
+    GdiFlush();
+    // Keep physical pixels; reduce JPEG quality rather than shrink the desktop.
+    const size_t limit=native?MaxNativeSnapshotBytes:MaxSnapshotBytes;
+    for(float quality:{.78f,.60f,.42f,.25f,.10f}){
+        auto jpeg=encode_jpeg(static_cast<const uint8_t*>(pixels),out_width,out_height,quality);
+        if(jpeg.size()<=limit)return {request,std::move(jpeg),native};
+    }
+    throw std::runtime_error("Snapshot exceeds compressed size limit");
 }
 Thumbnail decode_snapshot(const Snapshot& snapshot) {
-    if(snapshot.jpeg.empty()||snapshot.jpeg.size()>MaxSnapshotBytes)throw std::runtime_error("Invalid snapshot size");
+    if(snapshot.jpeg.empty()||snapshot.jpeg.size()>(snapshot.native?MaxNativeSnapshotBytes:MaxSnapshotBytes))throw std::runtime_error("Invalid snapshot size");
     Apartment apartment;auto imaging=factory();ComPtr<IWICStream> stream;
     check(imaging->CreateStream(&stream),"Create JPEG input stream");
     check(stream->InitializeFromMemory(const_cast<BYTE*>(snapshot.jpeg.data()),DWORD(snapshot.jpeg.size())),"Read snapshot input");
@@ -94,10 +103,10 @@ Thumbnail decode_snapshot(const Snapshot& snapshot) {
     if(format!=GUID_ContainerFormatJpeg)throw std::runtime_error("Snapshot must be JPEG");
     ComPtr<IWICBitmapFrameDecode> frame;check(decoder->GetFrame(0,&frame),"Read snapshot frame");
     UINT width=0,height=0;check(frame->GetSize(&width,&height),"Read snapshot dimensions");
-    if(width!=SnapshotWidth||height!=SnapshotHeight)throw std::runtime_error("Unexpected snapshot dimensions");
+    if(!valid_snapshot_dimensions(width,height)||(!snapshot.native&&(width!=SnapshotWidth||height!=SnapshotHeight)))throw std::runtime_error("Unexpected snapshot dimensions");
     ComPtr<IWICFormatConverter> converter;check(imaging->CreateFormatConverter(&converter),"Create snapshot converter");
     check(converter->Initialize(frame.Get(),GUID_WICPixelFormat32bppBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom),"Convert snapshot pixels");
-    Thumbnail result;result.bgra.resize(size_t(width)*height*4);
+    Thumbnail result;result.width=width;result.height=height;result.bgra.resize(size_t(width)*height*4);
     check(converter->CopyPixels(nullptr,width*4,UINT(result.bgra.size()),result.bgra.data()),"Read snapshot pixels");return result;
 }
 bool read_cursor_shape(HCURSOR cursor,CursorState& state) {
@@ -138,6 +147,21 @@ bool desktop_aux_self_test(std::string& report) {
         for(size_t i=0;i<source.size();++i)if(std::abs(int(source[i])-int(decoded.bgra[i]))>3)throw std::runtime_error("Snapshot JPEG color mismatch");
         bool rejected=false;try{decode_snapshot({1,{0,1,2,3}});}catch(...){rejected=true;}
         if(!rejected)throw std::runtime_error("Malformed snapshot accepted");
+        // Non-16:9 native resolution must survive JPEG encoding/decoding;
+        // old peers still enforce their fixed thumbnail format.
+        const uint32_t native_width=1920,native_height=1200;
+        std::vector<uint8_t> native_pixels(size_t(native_width)*native_height*4,255);
+        for(uint32_t y=0;y<native_height;++y)for(uint32_t x=0;x<native_width;++x){
+            auto* pixel=native_pixels.data()+(size_t(y)*native_width+x)*4;
+            pixel[0]=pixel[1]=pixel[2]=((x/4)%2)?255:0;
+        }
+        Snapshot native{8,encode_jpeg(native_pixels.data(),native_width,native_height),true};
+        const auto full=decode_snapshot(native);
+        if(full.width!=native_width||full.height!=native_height||full.bgra.size()!=native_pixels.size())throw std::runtime_error("Native snapshot was resized");
+        for(uint32_t x=0;x<native_width;++x)if(std::abs(int(full.bgra[(size_t(300)*native_width+x)*4])-int(native_pixels[(size_t(300)*native_width+x)*4]))>12)
+            throw std::runtime_error("Native snapshot lost fine desktop detail");
+        native.native=false;rejected=false;try{decode_snapshot(native);}catch(...){rejected=true;}
+        if(!rejected||valid_snapshot_dimensions(0,1080)||valid_snapshot_dimensions(16384,16384))throw std::runtime_error("Snapshot allocation/legacy bounds failed");
         // Compare real native cursor rendering, including monochrome invert pixels.
         for(auto name:{IDC_ARROW,IDC_IBEAM,IDC_SIZEWE,IDC_HAND}){
             HCURSOR original=LoadCursorW(nullptr,name);CursorState shape;

@@ -84,6 +84,24 @@ int probe(){
     const auto old_six=six->window;six.reset();select(1);
     require(!IsWindow(old_six),"Retired renderer window leaked after lease release");
     shell.show_local();
+    // No first frame ever arrives. Reopen the switcher repeatedly while waiting
+    // and verify a fresh, correctly sized GPU upload before the panel is shown.
+    hive::Thumbnail native;native.width=1920;native.height=1200;
+    native.bgra.resize(size_t(native.width)*native.height*4,160);
+    shell.update_thumbnail("b",std::move(native));select(2);
+    require(ULONG_PTR(GetPropW(waiting,L"HiveDesk.SnapshotWidth"))==1920&&
+        ULONG_PTR(GetPropW(waiting,L"HiveDesk.SnapshotHeight"))==1200,"Full-screen snapshot reused the sidebar thumbnail");
+    for(unsigned i=0;i<3;++i){
+        const auto revision=ULONG_PTR(GetPropW(panel,L"HiveDesk.SurfaceRevision"));
+        ValidateRect(panel,nullptr);SendMessageW(owner,WM_HOTKEY,81,0);
+        RECT bounds{};GetClientRect(panel,&bounds);
+        require(shown(panel)&&ULONG_PTR(GetPropW(panel,L"HiveDesk.SurfaceRevision"))>revision&&
+            ULONG_PTR(GetPropW(panel,L"HiveDesk.SurfaceWidth"))==ULONG_PTR(bounds.right)&&
+            ULONG_PTR(GetPropW(panel,L"HiveDesk.SurfaceHeight"))==ULONG_PTR(bounds.bottom),
+            "Switcher reused a stale/mis-sized surface without a successful video connection");
+        SendMessageW(owner,WM_HOTKEY,81,0);pump(260);
+    }
+    shell.show_local();
     return 0;
 }
 }

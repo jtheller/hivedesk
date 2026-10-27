@@ -263,17 +263,18 @@ private:
             const auto target=hosting_.load();
             if(!closing_&&target&&!target->revoked&&target->peer==peer)host_.request_keyframe();
         };
-        callbacks.snapshot_request=[this](const std::string& peer,uint64_t request) {
+        callbacks.snapshot_request=[this](const std::string& peer,uint64_t request,bool native) {
             // One pending capture per peer; never block its keyboard/control reader.
             {const std::lock_guard lock(snapshot_mutex_);
                 auto [pending,inserted]=snapshot_pending_.try_emplace(peer,request);
                 if(!inserted){pending->second=request;return;}}
-            enqueue([this,peer,request] {
+            enqueue([this,peer,request,native] {
                 bool released=false;
                 try {
                     const auto now=std::chrono::steady_clock::now();
+                    auto& snapshot_cache_=snapshot_caches_[native?1:0];auto& snapshot_time_=snapshot_times_[native?1:0];
                     if(snapshot_cache_.jpeg.empty()||now-snapshot_time_>std::chrono::milliseconds(250)) {
-                        snapshot_cache_=hive::capture_snapshot(request);snapshot_time_=now;
+                        snapshot_cache_=hive::capture_snapshot(request,native);snapshot_time_=now;
                     }
                     auto snapshot=snapshot_cache_;
                     {const std::lock_guard lock(snapshot_mutex_);snapshot.request=snapshot_pending_.at(peer);snapshot_pending_.erase(peer);released=true;}
@@ -608,7 +609,7 @@ private:
     std::mutex snapshot_mutex_;std::map<std::string,uint64_t> snapshot_pending_;
     std::mutex snapshot_reply_mutex_;
     std::map<std::string,uint64_t> snapshot_requests_;uint64_t snapshot_sequence_=0;
-    hive::Snapshot snapshot_cache_;std::chrono::steady_clock::time_point snapshot_time_{};
+    std::array<hive::Snapshot,2> snapshot_caches_;std::array<std::chrono::steady_clock::time_point,2> snapshot_times_{};
     std::atomic<std::shared_ptr<const std::string>> active_,last_controlled_;
     std::atomic<std::shared_ptr<hive::HostControl>> hosting_;
     std::shared_ptr<const hive::ViewControl> view_control_; // Protected by view_intent_mutex_.

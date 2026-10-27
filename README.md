@@ -107,7 +107,11 @@ impersonator. No universal shared password is embedded in the application.
   password/PIN; Ctrl+Alt+Del secure-attention generation is not implemented.
 - Opening the switcher requests one fresh primary-screen snapshot per online peer.
   Cached previews appear immediately; replies fade in over 180 ms. Snapshots use
-  bounded 672x378 JPEGs with aspect fit, without starting a video/control session.
+  native-resolution JPEGs (up to 2 MiB, reducing JPEG quality before pixel size),
+  with capability-gated 672x378 fallback for older peers. Full-screen waiting
+  uses the native image; sidebar fades use separate small bitmaps. Native image
+  allocation is bounded to 8192 pixels per edge / 32 Mi pixels, with a 128 MiB
+  full-image cache. Snapshots do not start a video/control session.
   There is no periodic preview capture while the sidebar is closed or left open.
 - Remote native cursor shape, hotspot and visibility are synchronized separately
   from video. Absolute mouse motion stays local and immediate; host-side physical

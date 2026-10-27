@@ -8,6 +8,7 @@ struct MediaHost::Impl {
     CaptureSequence sequence;
     StreamFeedback feedback{};
     uint64_t session=0,feedback_time=0,feedback_sequence=0,last_recovery=0;
+    std::string failure;
     void wake(){changed.notify_all();pacing_timer.notify();}
 };
 MediaHost::MediaHost():impl_(std::make_unique<Impl>()){}
@@ -18,7 +19,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
     if(!output){error="Missing encoded-frame callback.";return false;}
     if(settings.session&&(settings.receiver_millihz<1000||settings.receiver_millihz>2000000)){error="Invalid receiver refresh rate.";return false;}
     impl_->sequence.begin(settings.session);
-    {std::lock_guard lock(impl_->wait_mutex);impl_->stop=false;impl_->keyframe=true;impl_->feedback={};impl_->session=settings.session;impl_->feedback_time=impl_->feedback_sequence=impl_->last_recovery=0;}
+    {std::lock_guard lock(impl_->wait_mutex);impl_->stop=false;impl_->failure.clear();impl_->keyframe=true;impl_->feedback={};impl_->session=settings.session;impl_->feedback_time=impl_->feedback_sequence=impl_->last_recovery=0;}
     std::promise<std::string> initialized;auto ready=initialized.get_future();
     impl_->worker=std::thread([this,settings,output=std::move(output),ready_to_send=std::move(ready_to_send),health=std::move(health),diagnostics=std::move(diagnostics),initialized=std::move(initialized)]()mutable{
         bool announced=false;
@@ -244,10 +245,12 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
             if(drain.joinable())drain.join();if(deliver.joinable())deliver.join();
             if(failure)std::rethrow_exception(failure);
         }catch(const std::exception& problem){
+            {std::lock_guard lock(impl_->wait_mutex);impl_->failure=problem.what();}
             if(!announced)initialized.set_value(problem.what());
             else{const std::string message=std::string("Media host stopped: ")+problem.what();log(message);OutputDebugStringA(message.c_str());}
             impl_->stop=true;
         }catch(...){
+            {std::lock_guard lock(impl_->wait_mutex);impl_->failure="Unknown media pipeline failure.";}
             if(!announced)initialized.set_value("Unknown media pipeline failure.");
             else log("Media host stopped: unknown pipeline callback failure.");
             impl_->stop=true;
@@ -257,6 +260,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
 }
 void MediaHost::stop(){{std::lock_guard lock(impl_->wait_mutex);impl_->stop=true;}impl_->wake();if(impl_->worker.joinable())impl_->worker.join();}
 bool MediaHost::running()const{return !impl_->stop.load();}
+std::string MediaHost::failure()const{std::lock_guard lock(impl_->wait_mutex);return impl_->failure;}
 void MediaHost::request_keyframe(){{std::lock_guard lock(impl_->wait_mutex);impl_->keyframe=true;}impl_->wake();}
 void MediaHost::notify_ready(){std::lock_guard lock(impl_->wait_mutex);impl_->changed.notify_all();}
 void MediaHost::feedback(const StreamFeedback& feedback){

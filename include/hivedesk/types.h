@@ -33,10 +33,15 @@ constexpr uint32_t FeatureDedicatedInput = 128;
 constexpr uint32_t FeatureFrameTiming = 256;
 constexpr uint32_t FeatureCursorComposition = 512;
 constexpr uint32_t FeatureBuildVersion = 1024;
+constexpr uint32_t FeatureNativeSnapshot = 2048;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
-struct Snapshot { uint64_t request = 0; std::vector<uint8_t> jpeg; };
-struct Thumbnail { std::vector<uint8_t> bgra; };
+constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;
+inline bool valid_snapshot_dimensions(uint32_t width,uint32_t height) {
+    return width&&height&&width<=8192&&height<=8192&&uint64_t(width)*height<=32*1024*1024;
+}
+struct Snapshot { uint64_t request = 0; std::vector<uint8_t> jpeg; bool native=false; };
+struct Thumbnail { std::vector<uint8_t> bgra; uint32_t width=SnapshotWidth,height=SnapshotHeight; };
 // Shape pixels retain native alpha and monochrome AND/XOR masks. Position is
 // primary-display normalized; revision changes only for host-side pointer moves.
 struct CursorState {

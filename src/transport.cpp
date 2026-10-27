@@ -47,7 +47,7 @@ constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 constexpr auto kVideoWriteBudget = SessionStallTimeout;
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -204,7 +204,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -459,7 +459,7 @@ struct Transport::Impl {
         bool read_packet(Bytes& b) {
             SOCKET s = socket.load(); Bytes head(12); if (!recv_all(s,head.data(),head.size())) return false;
             Reader r{head}; uint32_t n = r.dword(); uint64_t seq = r.qword();
-            if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:kMaxClipboard + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
+            if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:MaxNativeSnapshotBytes + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
             Bytes encrypted(n); std::array<uint8_t,16> tag{};
             if (!recv_all(s,encrypted.data(),encrypted.size()) || !recv_all(s,tag.data(),tag.size()) || !rx.crypt(false,head,encrypted,b,tag)) return false;
             rx_seq = seq; return true;
@@ -759,13 +759,18 @@ struct Transport::Impl {
             if(!(c.peer.features&FeatureStreamDiagnostics)||!valid_diagnostics(d)||!r.end())return false;
             if(callbacks.diagnostics)callbacks.diagnostics(c.peer.id,d);return true;
         }
+        case NativeSnapshotRequest:
         case SnapshotRequest: {
+            const bool native=b[0]==NativeSnapshotRequest;
+            if(native&&!(c.peer.features&FeatureNativeSnapshot))return false;
             const auto request=r.qword();if(!(c.peer.features&FeatureDesktopAux)||!request||!r.end())return false;
-            if(callbacks.snapshot_request)callbacks.snapshot_request(c.peer.id,request);return true;
+            if(callbacks.snapshot_request)callbacks.snapshot_request(c.peer.id,request,native);return true;
         }
+        case NativeSnapshotReply:
         case SnapshotReply: {
-            Snapshot snapshot;snapshot.request=r.qword();
-            if(!(c.peer.features&FeatureDesktopAux)||!r.good||!snapshot.request||b.size()==r.at||b.size()-r.at>MaxSnapshotBytes)return false;
+            Snapshot snapshot;snapshot.request=r.qword();snapshot.native=b[0]==NativeSnapshotReply;
+            if(snapshot.native&&!(c.peer.features&FeatureNativeSnapshot))return false;
+            if(!(c.peer.features&FeatureDesktopAux)||!r.good||!snapshot.request||b.size()==r.at||b.size()-r.at>(snapshot.native?MaxNativeSnapshotBytes:MaxSnapshotBytes))return false;
             snapshot.jpeg.assign(b.begin()+r.at,b.end());if(callbacks.snapshot)callbacks.snapshot(c.peer.id,std::move(snapshot));return true;
         }
         case Cursor: {
@@ -1034,11 +1039,12 @@ InputDiagnostics Transport::input_diagnostics(const std::string& peer) const {
 bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{Clipboard}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
 bool Transport::request_snapshot(const std::string& peer,uint64_t request) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!request)return false;
-    Bytes b{SnapshotRequest};u64(b,request);return c->enqueue(std::move(b));
+    Bytes b{uint8_t((c->peer.features&FeatureNativeSnapshot)?NativeSnapshotRequest:SnapshotRequest)};u64(b,request);return c->enqueue(std::move(b));
 }
 bool Transport::send_snapshot(const std::string& peer,const Snapshot& snapshot) {
-    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!snapshot.request||snapshot.jpeg.empty()||snapshot.jpeg.size()>MaxSnapshotBytes)return false;
-    Bytes b{SnapshotReply};u64(b,snapshot.request);b.insert(b.end(),snapshot.jpeg.begin(),snapshot.jpeg.end());return c->enqueue(std::move(b));
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!snapshot.request||snapshot.jpeg.empty()||snapshot.jpeg.size()>(snapshot.native?MaxNativeSnapshotBytes:MaxSnapshotBytes)||
+        (snapshot.native&&!(c->peer.features&FeatureNativeSnapshot)))return false;
+    Bytes b{uint8_t(snapshot.native?NativeSnapshotReply:SnapshotReply)};u64(b,snapshot.request);b.insert(b.end(),snapshot.jpeg.begin(),snapshot.jpeg.end());return c->enqueue(std::move(b));
 }
 bool Transport::send_cursor(const std::string& peer,const CursorState& cursor) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!valid_cursor(cursor))return false;
@@ -1085,6 +1091,25 @@ bool Transport::discovery_self_test(std::string& result){
     result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
 }
 bool Transport::self_test(std::string& result) {
+    {
+        Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);
+        control.channel=0;control.peer.features=FeatureDesktopAux;
+        bool requested=false,received=false;bool native=false;
+        owner.callbacks.snapshot_request=[&](const std::string&,uint64_t id,bool full){requested=id==7;native=full;};
+        owner.callbacks.snapshot=[&](const std::string&,Snapshot image){received=image.request==7;native=image.native;};
+        Bytes request{SnapshotRequest};u64(request,7);
+        if(!owner.dispatch(control,request)||!requested||native){result="Legacy snapshot request changed";return false;}
+        Bytes reply{SnapshotReply};u64(reply,7);reply.push_back(42);
+        if(!owner.dispatch(control,reply)||!received||native){result="Legacy snapshot reply changed";return false;}
+        request[0]=NativeSnapshotRequest;reply[0]=NativeSnapshotReply;
+        if(owner.dispatch(control,request)||owner.dispatch(control,reply)){result="Unnegotiated native snapshot accepted";return false;}
+        control.peer.features|=FeatureNativeSnapshot;
+        if(!owner.dispatch(control,request)||!native||!owner.dispatch(control,reply)||!native){result="Native snapshot negotiation failed";return false;}
+        reply.resize(MaxNativeSnapshotBytes+10,42);
+        if(owner.dispatch(control,reply)){result="Oversized native snapshot accepted";return false;}
+        reply[0]=SnapshotReply;reply.resize(MaxSnapshotBytes+10,42);
+        if(owner.dispatch(control,reply)){result="Legacy snapshot byte bound changed";return false;}
+    }
     {
         Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);
         control.channel=0;control.peer.features=FeatureBuildVersion;
@@ -1631,8 +1656,8 @@ bool Transport::self_test(std::string& result) {
     TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
     acb.host_ended=[&](const std::string& peer,uint64_t session){std::lock_guard lock(mutex);got_host_ended=peer=="test-b"&&session==91;cv.notify_all();};
     acb.diagnostics=[&](const std::string&,const SourceDiagnostics& d){std::lock_guard lock(mutex);const bool base=d.session==91&&d.encoded_millihz==59940&&d.encode_us==1234&&d.capture_wait_us==5678&&d.send_wait_us_per_second==9000&&d.feedback_age_us==11000&&d.network_extra_us==13000;if(d.encode_details)got_encode_diagnostics=base&&d.color_us==500&&d.nvenc_us==734&&d.encode_age_us==10000;else got_diagnostics=base;cv.notify_all();};
-    bcb.snapshot_request=[&](const std::string& peer,uint64_t request){b.send_snapshot(peer,{request,{0xff,0xd8,42,0xff,0xd9}});};
-    acb.snapshot=[&](const std::string&,Snapshot snapshot){std::lock_guard lock(mutex);++snapshot_count;got_snapshot=snapshot.request==901&&snapshot.jpeg==Bytes({0xff,0xd8,42,0xff,0xd9});cv.notify_all();};
+    bcb.snapshot_request=[&](const std::string& peer,uint64_t request,bool native){b.send_snapshot(peer,{request,native?Bytes(1200*1024,42):Bytes({0xff,0xd8,42,0xff,0xd9}),native});};
+    acb.snapshot=[&](const std::string&,Snapshot snapshot){std::lock_guard lock(mutex);++snapshot_count;got_snapshot=snapshot.request==901&&snapshot.native&&snapshot.jpeg==Bytes(1200*1024,42);cv.notify_all();};
     acb.cursor=[&](const std::string&,CursorState cursor){std::lock_guard lock(mutex);++cursor_count;
         got_cursor=cursor.position_revision==77&&cursor.x==12345&&cursor.y==54321&&
             (cursor_count==1?(cursor.visible&&cursor.width==2&&cursor.hotspot_x==1&&cursor.mask==Bytes(8,0xff)):
