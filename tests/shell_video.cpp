@@ -1,5 +1,6 @@
 #include "hivedesk/shell.h"
 #include "hivedesk/media.h"
+#include "hivedesk/experience_trace.h"
 #include <future>
 #include <cstdio>
 #include <stdexcept>
@@ -11,14 +12,34 @@ void pump(DWORD ms){const auto end=GetTickCount64()+ms;do{MSG m{};while(PeekMess
 int probe(){
     USEROBJECTFLAGS flags{};DWORD bytes=0;
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic UI events on interactive station");
+    hive::experience_enabled(true);
     auto encoded=hive::media_generated_test_frame();
     hive::Shell shell;hive::ShellConfig config;config.device_name=L"Generated video test";config.desktop.tray_icon=false;
-    hive::ShellCallbacks callbacks;std::string selected;callbacks.select_peer=[&](const std::string& peer){selected=peer;};
+    std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;
+    hive::ShellCallbacks callbacks;callbacks.visible_peers=[&](const auto& surfaces){visible=surfaces;};std::string selected;callbacks.select_peer=[&](const std::string& peer){selected=peer;};
     std::string error;require(shell.create(GetModuleHandleW(nullptr),config,std::move(callbacks),error),error.c_str());
     shell.update_peers({{"a","Generated A","",47980,true},{"b","Generated B","",47980,true}});
     const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr),panel=FindWindowW(L"HiveDesk.Switcher",nullptr);KillTimer(owner,1);
     const auto px=[&](int n){return MulDiv(n,int(GetDpiForWindow(panel)),96);};
     const int tile=(px(200)-2*px(12))*9/16,stride=tile+px(16);
+    // Prewarm every visible tile before selection; real NVDEC state and HWND
+    // must survive promotion. All UI events remain on this isolated station.
+    shell.update_peers({{"a","Generated A","",47980,true,hive::FeatureWarmStream},{"b","Generated B","",47980,true,hive::FeatureWarmStream}});pump(10);
+    SendMessageW(owner,WM_HOTKEY,81,0);pump(10);
+    require(visible.size()==2,"Opening Hive did not prepare every visible remote");
+    const auto warm_surface=visible.front();require(!IsWindowVisible(warm_surface->window),"Warm viewer became foreground/visible");
+    hive::MediaViewer warm_viewer;
+    auto warm_open=std::async(std::launch::async,[&]{std::string why;require(warm_viewer.open(warm_surface->window,why),why.c_str());});
+    while(warm_open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);warm_open.get();
+    warm_viewer.submit(encoded);for(unsigned i=0;i<80&&!warm_viewer.has_frame();++i)pump(25);
+    require(warm_viewer.has_frame(),"Hidden warm viewer failed to decode its first picture");
+    const int warm_y=px(12)+stride+tile/2;
+    SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),warm_y));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),warm_y));
+    require(shell.viewer_surface()==warm_surface&&warm_viewer.has_frame(),"Selection recreated warmed media surface or lost decoded picture");
+    require(visible.empty(),"Closing Hive did not revoke the visible warm set");
+    shell.show_local();auto warm_close=std::async(std::launch::async,[&]{warm_viewer.close();});
+    while(warm_close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);warm_close.get();
+    shell.update_peers({{"a","Generated A","",47980,true},{"b","Generated B","",47980,true}});pump(10);
     for(int cycle=0;cycle<4;++cycle){
         const int row=1+cycle%2,y=px(12)+row*stride+tile/2;
         SendMessageW(owner,WM_HOTKEY,81,0);SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),y));

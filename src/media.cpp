@@ -1,4 +1,5 @@
 #include "hivedesk/media.h"
+#include "hivedesk/experience_trace.h"
 #include "hivedesk/diagnostic_window.h"
 #include "hivedesk/config.h"
 #include "hivedesk/adaptive.h"
@@ -931,6 +932,11 @@ public:
     IDXGIAdapter* adapter() const { return adapter_.Get(); }
     uint32_t convert_us() const{return convert_us_;}
     uint32_t draw_us() const{return draw_us_;}
+    std::array<uint64_t,6> display_observation() const {
+        DXGI_FRAME_STATISTICS value{};const auto result=swap_->GetFrameStatistics(&value);
+        UINT submitted=0;swap_->GetLastPresentCount(&submitted);
+        return {uint32_t(result),value.PresentCount,value.PresentRefreshCount,value.SyncRefreshCount,uint64_t(value.SyncQPCTime.QuadPart),submitted};
+    }
     bool present_pending() const {return pending_present_;}
     bool cancel_pending() {return std::exchange(pending_present_,false);}
     void set_present_for_test(std::function<HRESULT()> callback){present_for_test_=std::move(callback);}
@@ -1110,7 +1116,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
         try{
             std::atomic<bool> pipeline_stop=false;
             LatestPicture pictures;
-            struct ReadyPicture {Renderer::Picture pixels;std::shared_ptr<ViewerQueue::Pending> pending;};
+            struct ReadyPicture {Renderer::Picture pixels;std::shared_ptr<ViewerQueue::Pending> pending;uint64_t prepared_at=0;};
             std::array<ReadyPicture,3> ready_pictures;
             const auto cancelled=[this,&pipeline_stop]{if(pipeline_stop)return true;std::lock_guard guard(impl_->mutex);return impl_->stopping;};
             const auto eligible=[this,&pipeline_stop](const std::shared_ptr<ViewerQueue::Pending>& pending){
@@ -1128,6 +1134,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
             presenter=std::thread([&]{
                 std::optional<size_t> current;
                 try{
+                    FrameTimer present_retry;
                     while(!cancelled()){
                         if(!current&&!pictures.wait_ready(cancelled))break;
                         // Wait BEFORE acquiring the latest image and before
@@ -1149,6 +1156,11 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                         uint32_t render_us=0,present_us=0;bool presented=false;
                         if(latest)renderer->draw_prepared(picture.pixels,nullptr,&render_us,&present_us,&presented,can_present);
                         else presented=renderer->retry_present(can_present,&present_us);
+                        if(presented&&experience_enabled()){
+                            const auto d=renderer->display_observation();
+                            experience_trace(ExperienceEvent::Present,picture.pending->frame.session,picture.pending->frame.sequence,
+                                {picture.pending->arrival,picture.prepared_at,render_us,present_us,d[0],d[1],d[2],d[3],d[4],d[5]});
+                        }
                         {
                             std::lock_guard guard(impl_->mutex);
                             if(!impl_->stopping){
@@ -1159,7 +1171,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                             }
                         }
                         if(!renderer->present_pending()){pictures.release(*current);current.reset();}
-                        else Sleep(1); // Busy/occluded retry retains the static final image.
+                        else present_retry.wait_until(Clock::now()+std::chrono::milliseconds(1)); // High-resolution retry, never timer-tick-sized Sleep jitter.
                     }
                 }catch(const std::exception& problem){
                     std::lock_guard guard(impl_->mutex);
@@ -1229,6 +1241,9 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                         }
                     }
                     if(!prepared){pictures.release(index);return;}
+                    ready_pictures[index].prepared_at=now_us();
+                    experience_trace(ExperienceEvent::Prepared,context->frame.session,context->frame.sequence,
+                        {context->arrival,ready_pictures[index].prepared_at,map_us,service_us,image.convert_us});
                     const auto published=pictures.publish(index);
                     if(published.replaced){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
                 };
@@ -1245,6 +1260,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
     error = ready.get(); if (!error.empty()) { close(); return false; } return true;
 }
 void MediaViewer::submit(EncodedFrame frame) {
+    experience_trace(ExperienceEvent::Arrival,frame.session,frame.sequence,{frame.capture_time_us,frame.source_ready_us,frame.width,frame.height});
     std::lock_guard guard(impl_->mutex);
     if (impl_->stopping) return;
     if(!impl_->frames.accepts_session(frame.session))return;

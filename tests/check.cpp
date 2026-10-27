@@ -1,5 +1,8 @@
 #include "hivedesk/transport.h"
 #include "hivedesk/media.h"
+#include "hivedesk/host_bridge.h"
+#include <mutex>
+#include <condition_variable>
 #include "media_test_api.h"
 #include "hivedesk/desktop_aux.h"
 #include "hivedesk/adaptive.h"
@@ -8,10 +11,28 @@
 #include <iostream>
 #include <thread>
 int remote_start_check(const char* address,const std::string& part);
+int warm_remote_check(const char* address);
 int main(int argc,char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const std::string mode=argc>1?argv[1]:"--all";
+        if(mode=="--warm-remote"){
+            if(argc!=3){std::cerr<<"Use --warm-remote <IPv4 address>\n";return 2;}
+            return warm_remote_check(argv[2]);
+        }
+        if(mode=="--warm"){
+            // Explicit installed-broker media probe. No hooks or input packets.
+            std::mutex mutex;std::condition_variable changed;unsigned frames=0;uint64_t sequence=0;bool fresh=false;
+            hive::HostBridge host;hive::StreamSettings settings;settings.session=GetTickCount64();settings.receiver_millihz=60000;settings.warm=true;
+            std::string why;
+            if(!host.start(settings,[&](hive::EncodedFrame frame){std::lock_guard lock(mutex);if(frames){fresh=frame.keyframe&&frame.sequence>sequence;}sequence=frame.sequence;++frames;changed.notify_all();},why))throw std::runtime_error(why);
+            {std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return frames>0;}))throw std::runtime_error("No warm broker frame");}
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            {std::lock_guard lock(mutex);if(frames!=1)throw std::runtime_error("Unselected broker kept encoding");}
+            if(!host.activate())throw std::runtime_error("Broker did not acknowledge activation");
+            {std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return frames>1;})||!fresh)throw std::runtime_error("Promotion did not deliver a fresh sequenced IDR");}
+            host.stop();std::cout<<"PASS installed broker warm/pause/activate/fresh IDR; no input injected.\n";return 0;
+        }
         if(mode=="--remote"){
             const std::string part=argc==4?argv[3]:"all";
             if((argc!=3&&argc!=4)||(part!="all"&&part!="--snapshot-only"&&part!="--video-only")){

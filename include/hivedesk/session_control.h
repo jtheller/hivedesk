@@ -11,6 +11,8 @@ struct HostControl {
     const std::string peer;
     const uint64_t session, connection;
     std::atomic<bool> revoked{false};
+    std::atomic<bool> warming{false};
+    std::atomic<uint64_t> warm_until{0};
     std::atomic<bool> input_enabled{false},input_error_reported{false};
     HostControl(std::string id,uint64_t stream,uint64_t token):peer(std::move(id)),session(stream),connection(token){}
     bool revoke(){return !revoked.exchange(true);}

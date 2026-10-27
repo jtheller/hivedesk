@@ -64,6 +64,10 @@ public:
             {const std::lock_guard lock(kick_mutex_);kick_pending_=target;}
             kick_wake_.notify_one();
         };
+        callbacks.visible_peers=[this](const std::vector<std::shared_ptr<const hive::ViewerSurface>>& surfaces){
+            {const std::lock_guard lock(warm_mutex_);warm_visible_=surfaces;}
+            wake_.notify_one();
+        };
         callbacks.panel_opened=[this] {
             for(const auto& peer:transport_.peers())if(peer.features&hive::FeatureDesktopAux) {
                 request_snapshot(peer.id);
@@ -81,17 +85,17 @@ public:
                 });
             }
             const auto peer=active_.load();if(!peer||closing_)return;
-            const auto report=viewer_.feedback();if(report.session&&report.session==active_session_)transport_.send_feedback(*peer,report);
+            const auto report=viewer_.load()->feedback();if(report.session&&report.session==active_session_)transport_.send_feedback(*peer,report);
             if(shell_.debug_enabled()&&GetTickCount64()-last_debug_tick_>=250){
                 last_debug_tick_=GetTickCount64();const auto size=remote_size_.load();
-                const auto stats=viewer_.diagnostics();const auto input=transport_.input_diagnostics(*peer);
+                const auto stats=viewer_.load()->diagnostics();const auto input=transport_.input_diagnostics(*peer);
                 telemetry_.viewer(*peer,stats,uint32_t(size>>32),uint32_t(size));
                 telemetry_.input(*peer,active_session_,input);
             }
         };
         callbacks.debug_tick=[this] {
             const auto peer=active_.load();if(!peer||closing_)return;
-            const auto stats=viewer_.diagnostics();shell_.update_viewer_diagnostics(*peer,stats);
+            const auto stats=viewer_.load()->diagnostics();shell_.update_viewer_diagnostics(*peer,stats);
             const auto input=transport_.input_diagnostics(*peer);shell_.update_input_diagnostics(*peer,input);
         };
         callbacks.captured_input=[this](const std::string& peer,uint64_t session,const hive::InputEvent& input,uint64_t captured_us) {
@@ -111,7 +115,7 @@ public:
             const auto viewing=active_.load();
             const auto hosting=hosting_.load();
             if(viewing) transport_.send_clipboard(*viewing,text);
-            else if(hosting&&!hosting->revoked) transport_.send_clipboard(hosting->peer,text);
+            else if(hosting&&!hosting->revoked&&!hosting->warming) transport_.send_clipboard(hosting->peer,text);
         };
         callbacks.save_preferences=[this](const std::wstring& name,const hive::DesktopPreferences& desktop) {
             const std::lock_guard lock(config_mutex_);
@@ -179,7 +183,7 @@ private:
         for(;;) {
             std::function<void()> job;
             {std::unique_lock lock(queue_mutex_);wake_.wait_for(lock,std::chrono::milliseconds(250),[this]{return closing_||!queue_.empty();});if(closing_)break;if(!queue_.empty()){job=std::move(queue_.front());queue_.pop_front();}}
-            try {if(job)job();retry_tick();update_tick();} catch(const std::exception& error) {status(error.what());}
+            try {if(job)job();retry_tick();warm_tick();update_tick();} catch(const std::exception& error) {status(error.what());}
         }
         // Keep DXGI destruction and socket/thread joins off the HWND-owning thread.
         finish_shutdown();
@@ -205,6 +209,55 @@ private:
             transport_.end_stream(target->peer,target->session);
             status(notified?"Remote controller disconnected by local shortcut.":
                 "Remote controller disconnected. Update both computers for kick support; this legacy connection is blocked.");
+        }
+    }
+    void warm_tick() {
+        if(closing_||updating_)return;
+        const auto now=GetTickCount64();
+        // Leases also expire when the requesting process disappears without Stop.
+        if(const auto host=hosting_.load();host&&host->warming&&now>host->warm_until){
+            const std::lock_guard lock(host_mutex_);
+            if(hosting_.load()==host&&host->warming&&now>host->warm_until){
+                host->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(host->peer,host->session);
+            }
+        }
+        std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;
+        std::vector<std::shared_ptr<WarmView>> expired;
+        {
+            const std::lock_guard lock(warm_mutex_);visible=warm_visible_;
+            for(auto it=warm_views_.begin();it!=warm_views_.end();){
+                const bool wanted=std::any_of(visible.begin(),visible.end(),[&](const auto& surface){return surface==it->second->surface;});
+                if(wanted)it->second->last_visible=now;
+                if(now-it->second->last_visible>2000){expired.push_back(it->second);it=warm_views_.erase(it);}else ++it;
+            }
+        }
+        for(const auto& warm:expired){transport_.cancel_warm(warm->surface->peer,warm->settings.session);warm->viewer->close();}
+        for(const auto& surface:visible){
+            {const std::lock_guard lock(queue_mutex_);if(closing_||!queue_.empty())break;}
+            if(const auto active=active_.load();active&&*active==surface->peer)continue;
+            const auto token=transport_.connection_token(surface->peer);if(!token)continue;
+            std::shared_ptr<WarmView> warm;
+            {const std::lock_guard lock(warm_mutex_);auto found=warm_views_.find(surface->peer);if(found!=warm_views_.end())warm=found->second;}
+            if(warm){
+                if(warm->connection!=token||warm->surface!=surface)warm->failed=true;
+                if(!warm->failed&&now-warm->renewed>=2000){
+                    transport_.request_stream(surface->peer,warm->settings);warm->renewed=now;
+                    const auto feedback=warm->viewer->feedback();if(feedback.session)transport_.send_feedback(surface->peer,feedback);
+                }
+                continue;
+            }
+            warm=std::make_shared<WarmView>();warm->surface=surface;warm->connection=token;
+            warm->last_visible=warm->renewed=now;warm->settings.session=++session_sequence_;
+            warm->settings.receiver_millihz=hive::primary_refresh_millihz();warm->settings.warm=true;
+            std::string error;
+            if(!warm->viewer->open(surface->window,error,[this,peer=surface->peer,session=warm->settings.session](const hive::CursorPresentation& cursor){
+                const auto active=active_.load();if(!closing_&&active&&*active==peer&&active_session_==session)
+                    shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
+            })){
+                warm->failed=true;hive::log("Warm viewer unavailable: "+surface->peer+" "+error);
+            }
+            {const std::lock_guard lock(warm_mutex_);warm_views_[surface->peer]=warm;}
+            if(!warm->failed){warm->failed=!transport_.request_stream(surface->peer,warm->settings);hive::log("Warm viewer requested: "+surface->peer+" session="+std::to_string(warm->settings.session));}
         }
     }
     void update_tick() {
@@ -309,6 +362,8 @@ private:
             const auto target=hosting_.load();if(!closing_&&target&&!target->revoked&&target->peer==peer&&target->session==report.session)host_.feedback(report);
         };
         callbacks.host_ended=[this](const std::string& peer,uint64_t session) {
+            {const std::lock_guard lock(warm_mutex_);const auto found=warm_views_.find(peer);
+                if(found!=warm_views_.end()&&found->second->settings.session==session){found->second->failed=true;return;}}
             uint64_t cancelled=0;
             {
                 const std::lock_guard lock(view_intent_mutex_);
@@ -339,6 +394,22 @@ private:
             if(closing_)return;
             if(updating_){transport_.end_stream(peer,settings.session);return;}
             const auto old=hosting_.load();
+            if(settings.warm){
+                if(old){
+                    if(!old->revoked&&old->peer==peer&&old->session==settings.session&&old->connection==transport_.connection_token(peer)){
+                        // A late renewal must never downgrade/end a promoted session.
+                        if(old->warming)old->warm_until=GetTickCount64()+10000;
+                    }
+                    else transport_.end_stream(peer,settings.session);
+                    return;
+                }
+            }else if(old&&old->warming&&!old->revoked&&old->peer==peer&&old->session==settings.session){
+                old->warming=false;apply_handoff(peer);
+                if(!host_.activate()){old->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,settings.session);return;}
+                std::string name=peer;for(const auto& item:transport_.peers())if(item.id==peer)name=item.name;
+                telemetry_.select(MonitorSide::Host,peer,settings.session,name);shell_.observe_cursor(peer);
+                hive::log("Warm host promoted: "+peer+" session="+std::to_string(settings.session));return;
+            }
             // A pending local kick also rejects an automatic retry that arrives
             // before its termination notice, rather than replacing the lease.
             if(old&&old->revoked){transport_.end_stream(peer,settings.session);return;}
@@ -349,16 +420,17 @@ private:
                 legacy_kicked_.erase(blocked);
             }
             const auto control=std::make_shared<hive::HostControl>(peer,settings.session,connection);
-            if(old)old->revoke();hosting_.store(control);
+            control->warming=settings.warm;control->warm_until=GetTickCount64()+10000;
+            if(old){old->revoke();if(old->warming)transport_.end_stream(old->peer,old->session);}hosting_.store(control);
             host_.stop(); shell_.observe_cursor({});hive::release_injected_input();
             input_ready_=false;clipboard_pending_=false;input_error_reported_=false;
             if(control->revoked)return;
             std::string peer_name=peer;for(const auto& item:transport_.peers())if(item.id==peer)peer_name=item.name;
-            telemetry_.select(MonitorSide::Host,peer,settings.session,peer_name);
+            if(!settings.warm)telemetry_.select(MonitorSide::Host,peer,settings.session,peer_name);
             const auto clipboard=staged_clipboards_.find(peer);
-            if(clipboard!=staged_clipboards_.end()) {
+            if(!settings.warm&&clipboard!=staged_clipboards_.end()) {
                 apply_handoff(peer);
-            } else status("No clipboard handoff for this controller; input paused.");
+            } else if(!settings.warm)status("No clipboard handoff for this controller; input paused.");
             std::string error;
             if(!host_.start(settings,[this,control](hive::EncodedFrame frame) {
                 if(!closing_&&!control->revoked&&hosting_.load()==control){telemetry_.size(MonitorSide::Host,control->peer,frame.session,frame.width,frame.height);if(!transport_.send_frame(control->peer,frame))host_.request_keyframe();}
@@ -372,10 +444,16 @@ private:
                 if(!closing_&&!control->revoked&&hosting_.load()==control&&ack.session==control->session)
                     transport_.send_input_ack(control->peer,ack);
             })) {control->revoke();hosting_.store(nullptr);telemetry_.clear(MonitorSide::Host);status("Capture failed: "+error);}
-            else {
+            else if(!settings.warm) {
                 const auto peers=transport_.peers();
                 for(const auto& p:peers)if(p.id==peer&&(p.features&hive::FeatureDesktopAux))shell_.observe_cursor(peer);
                 status("Streaming primary display to a computer on your network.");
+            }
+        };
+        callbacks.cancel_warm=[this](const std::string& peer,uint64_t session){
+            const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
+            if(target&&target->warming&&target->peer==peer&&target->session==session){
+                target->revoke();hosting_=nullptr;host_.stop();hive::log("Warm host released: "+peer);
             }
         };
         callbacks.stop_stream=[this](const std::string& peer) {
@@ -386,7 +464,15 @@ private:
         };
         callbacks.frame=[this](const std::string& peer,hive::EncodedFrame frame) {
             const auto target=active_.load();
-            if(closing_||!target||*target!=peer)return;
+            if(closing_)return;
+            if(!target||*target!=peer){
+                std::shared_ptr<WarmView> warm;
+                {const std::lock_guard lock(warm_mutex_);auto found=warm_views_.find(peer);if(found!=warm_views_.end())warm=found->second;}
+                if(warm&&!warm->failed&&warm->settings.session==frame.session){
+                    warm->size=(uint64_t(frame.width)<<32)|frame.height;warm->viewer->submit(std::move(frame));
+                }
+                return;
+            }
             const std::lock_guard lock(view_mutex_);
             const auto current=active_.load();
             if(current&&*current==peer) {
@@ -394,7 +480,7 @@ private:
                 ++received_frames_;
                 const uint64_t size=(uint64_t(frame.width)<<32)|frame.height;
                 if(remote_size_.exchange(size)!=size)shell_.set_remote_size(frame.width,frame.height);
-                viewer_.submit(std::move(frame));
+                viewer_.load()->submit(std::move(frame));
             }
         };
         callbacks.input_begin=[this](const std::string& peer,uint64_t session) {
@@ -402,7 +488,7 @@ private:
             // dedicated input reader itself never takes this potentially slow lock.
             const std::lock_guard lock(host_mutex_);
             const auto target=hosting_.load();
-            if(closing_||!target||target->revoked||target->peer!=peer||target->session!=session||!input_ready_)return false;
+            if(closing_||!target||target->revoked||target->warming||target->peer!=peer||target->session!=session||!input_ready_)return false;
             target->input_enabled=true;return true;
         };
         callbacks.input_packet=[this](const std::string& peer,const hive::InputPacket& packet) {
@@ -422,7 +508,7 @@ private:
         callbacks.input=[this](const std::string& peer,const hive::InputEvent& event) {
             const std::lock_guard lock(host_mutex_);
             const auto target=hosting_.load();
-            if(!closing_&&target&&!target->revoked&&!target->input_enabled&&target->peer==peer&&(input_ready_||event.kind==hive::InputKind::ReleaseAll)) {
+            if(!closing_&&target&&!target->revoked&&!target->warming&&!target->input_enabled&&target->peer==peer&&(input_ready_||event.kind==hive::InputKind::ReleaseAll)) {
                 if(!host_.input(event)&&!input_error_reported_){input_error_reported_=true;status("Desktop service input connection failed.");}
             }
         };
@@ -434,7 +520,7 @@ private:
             // Another peer must not overwrite this controller's readiness.
             staged_clipboards_[peer]=text;
             const auto controller=hosting_.load();
-            if(controller&&!controller->revoked&&controller->peer==peer) {
+            if(controller&&!controller->revoked&&!controller->warming&&controller->peer==peer) {
                 apply_handoff(peer);
                 return;
             }
@@ -453,7 +539,7 @@ private:
     void retry_tick() {
         if(updating_||closing_||!reconnect_.current(generation_))return;
         const auto current=active_.load();
-        if(current&&view_ready_&&(active_connection_!=transport_.connection_token(*current)||viewer_.stats().starts_with("Media error:"))) {
+        if(current&&view_ready_&&(active_connection_!=transport_.connection_token(*current)||viewer_.load()->stats().starts_with("Media error:"))) {
             view_ready_=false;
         }
         if(current&&!view_ready_&&!reconnect_.waiting) {
@@ -498,32 +584,47 @@ private:
         const bool automatic=negotiated!=connected_peers.end()&&(negotiated->features&hive::FeatureAutomaticStream);
         std::string error;
         active_connection_=transport_.connection_token(peer);if(!active_connection_)return;
+        std::shared_ptr<WarmView> warm;
+        {const std::lock_guard lock(warm_mutex_);auto cached=warm_views_.find(peer);if(cached!=warm_views_.end()){warm=cached->second;warm_views_.erase(cached);}}
+        if(warm&&(warm->failed||warm->viewer->stats().starts_with("Media error:")||warm->connection!=active_connection_||warm->surface!=shell_.viewer_surface()||warm->settings.receiver_millihz!=refresh)){
+            transport_.cancel_warm(peer,warm->settings.session);warm->viewer->close();warm.reset();
+        }
+        if(!warm){
+            // Cold fallback needs GPU capacity now, rather than waiting for the
+            // grace timer while unused warm decoders retain their surfaces.
+            std::map<std::string,std::shared_ptr<WarmView>> unused;
+            {const std::lock_guard lock(warm_mutex_);unused.swap(warm_views_);}
+            for(const auto& item:unused){transport_.cancel_warm(item.first,item.second->settings.session);item.second->viewer->close();}
+        }
         {const std::lock_guard lock(view_mutex_);
             view_surface_=shell_.viewer_surface();
             if(!view_surface_||view_surface_->peer!=peer){status("Viewer selection changed before startup; waiting for the current selection.");return;}
-            hive::log("Viewer creating graphics: "+peer);
-            if(!viewer_.open(view_surface_->window,error,
+            hive::log(warm?"Viewer reusing warm graphics: "+peer:"Viewer creating graphics: "+peer);
+            if(warm)viewer_.store(warm->viewer);
+            else viewer_.store(std::make_shared<hive::MediaViewer>());
+            if(!warm&&!viewer_.load()->open(view_surface_->window,error,
             [this,peer,epoch](const hive::CursorPresentation& cursor){
                 if(epoch==generation_&&!closing_)
                     shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
             })){status("Viewer failed: "+error);return;}}
         hive::log("Viewer graphics ready: "+peer);
-        if(epoch!=generation_||closing_) {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();return;}
+        if(epoch!=generation_||closing_) {const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();return;}
         // The control stream delivers clipboard before Start/InputEnable. The
         // separate input lane is armed only after that handoff has completed.
-        if(!transport_.send_clipboard(peer,shell_.cached_clipboard())) {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();status("Could not send clipboard handoff.");return;}
+        if(!transport_.send_clipboard(peer,shell_.cached_clipboard())) {const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();status("Could not send clipboard handoff.");return;}
         hive::StreamSettings stream;
-        if(automatic){stream.session=++session_sequence_;stream.receiver_millihz=refresh;}
+        if(automatic){stream.session=warm?warm->settings.session:++session_sequence_;stream.receiver_millihz=refresh;}
         else {stream.fps=std::max(1u,refresh/1000);stream.bitrate_mbps=80;status("Peer uses legacy streaming. Update both computers for automatic quality.");}
         {
             const std::lock_guard lock(view_intent_mutex_);
-            if(epoch!=generation_||closing_){const std::lock_guard view_lock(view_mutex_);viewer_.close();view_surface_.reset();return;}
+            if(epoch!=generation_||closing_){const std::lock_guard view_lock(view_mutex_);viewer_.load()->close();view_surface_.reset();return;}
             auto controlled=std::make_shared<const std::string>(peer);
             last_controlled_.store(controlled);active_.store(std::move(controlled));
             active_session_=stream.session;
             active_dedicated_input_=automatic&&(negotiated->features&hive::FeatureDedicatedInput)!=0;
             view_control_=std::make_shared<const hive::ViewControl>(peer,stream.session,epoch);
         }
+        if(warm){const auto size=warm->size.load();remote_size_=size;if(size)shell_.set_remote_size(uint32_t(size>>32),uint32_t(size));}
         telemetry_.select(MonitorSide::View,peer,stream.session,hive::narrow(label));
         if(!transport_.request_stream(peer,stream)) {go_local(active_.exchange(nullptr),false);status("Could not request desktop stream; retrying.");return;}
         if(active_dedicated_input_&&!transport_.begin_input(peer,stream.session)) {go_local(active_.exchange(nullptr),false);status("Could not initialize dedicated input; retrying.");return;}
@@ -535,23 +636,23 @@ private:
             if(transport_.connection_token(peer)!=active_connection_){failure="Connection changed while starting video; retrying.";break;}
             const auto progress=transport_.received_video_bytes(peer);
             if(progress>received_bytes){received_bytes=progress;deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);}
-            const auto state=viewer_.stats();
+            const auto state=viewer_.load()->stats();
             if(state.find("Media error:")==0) {failure=state;break;}
             // The waiting cover already makes the viewer visible. Keep it
             // opaque until this session has actually submitted its first image,
             // not merely finished decoding while the old HWND image remains.
-            if(viewer_.has_presented_frame()&&(!active_dedicated_input_||transport_.input_ready(peer,stream.session))) {ready=true;break;}
+            if(viewer_.load()->has_presented_frame()&&(!active_dedicated_input_||transport_.input_ready(peer,stream.session))) {ready=true;break;}
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if(epoch!=generation_||closing_) {go_local(active_.exchange(nullptr),false);return;}
         if(!ready) {
-            if(failure.empty()&&viewer_.has_frame()&&!viewer_.has_presented_frame())
+            if(failure.empty()&&viewer_.load()->has_frame()&&!viewer_.load()->has_presented_frame())
                 failure="Desktop decoded, but the first image was not presented. Retrying with the connection snapshot visible.";
-            if(failure.empty()&&active_dedicated_input_&&viewer_.has_presented_frame())
+            if(failure.empty()&&active_dedicated_input_&&viewer_.load()->has_presented_frame())
                 failure="The desktop is ready, but its input channel did not become ready. Install the same HiveDesk version on the controlled computer.";
             if(failure.empty()) failure=received_frames_.load()==0?
                 "Connected to "+hive::narrow(label)+", but no video frames arrived. Check capture/encoding on that computer.":
-                "Received "+std::to_string(received_frames_.load())+" video frames from "+hive::narrow(label)+", but none could be displayed. "+viewer_.stats();
+                "Received "+std::to_string(received_frames_.load())+" video frames from "+hive::narrow(label)+", but none could be displayed. "+viewer_.load()->stats();
             go_local(active_.exchange(nullptr),false);status(failure);reconnect_.next_ms=GetTickCount64()+reconnect_.delay_ms();return;
         }
         {
@@ -561,7 +662,7 @@ private:
                 // A successful first present can precede the queued UI session
                 // switch. Replay after show_remote; sequence guards reject any
                 // replay overtaken by a newer presentation callback.
-                const auto cursor=viewer_.cursor_presentation();
+                const auto cursor=viewer_.load()->cursor_presentation();
                 if(cursor.valid)shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
                 status("Viewing "+hive::narrow(label)+" | HEVC 4:4:4 | Ctrl+Alt+` returns here");
                 return;
@@ -577,7 +678,7 @@ private:
             if(notify_source){if(dedicated&&old_session)transport_.end_input(*previous,old_session);else transport_.send_input(*previous,{hive::InputKind::ReleaseAll,0,0,0});transport_.stop_stream(*previous);}
             auto expected=previous;last_controlled_.compare_exchange_strong(expected,nullptr);
         }
-        {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();}
+        {const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();}
         if(!closing_&&notify_shell)shell_.show_local();
     }
     void finish_shutdown() {
@@ -588,7 +689,10 @@ private:
         const auto previous=last_controlled_.exchange(nullptr);
         if(previous) {const auto session=active_session_.exchange(0);if(active_dedicated_input_.exchange(false)&&session)transport_.end_input(*previous,session);else transport_.send_input(*previous,{hive::InputKind::ReleaseAll,0,0,0});transport_.stop_stream(*previous);}
         {const std::lock_guard lock(host_mutex_);input_ready_=false;clipboard_pending_=false;staged_clipboards_.clear();hosting_.store(nullptr);host_.stop();}
-        {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();}
+        {const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();}
+        std::map<std::string,std::shared_ptr<WarmView>> warm;
+        {const std::lock_guard lock(warm_mutex_);warm.swap(warm_views_);warm_visible_.clear();}
+        for(const auto& item:warm){transport_.cancel_warm(item.first,item.second->settings.session);item.second->viewer->close();}
         transport_.stop();hive::release_injected_input();
         telemetry_.clear(MonitorSide::View);telemetry_.clear(MonitorSide::Host);
     }
@@ -612,12 +716,22 @@ private:
             worker_.join();
         } else finish_shutdown();
     }
+    struct WarmView {
+        std::shared_ptr<const hive::ViewerSurface> surface;
+        std::shared_ptr<hive::MediaViewer> viewer=std::make_shared<hive::MediaViewer>();
+        hive::StreamSettings settings;
+        uint64_t connection=0,last_visible=0,renewed=0;
+        std::atomic<bool> failed{false};std::atomic<uint64_t> size{0};
+    };
+    std::mutex warm_mutex_;
+    std::map<std::string,std::shared_ptr<WarmView>> warm_views_;
+    std::vector<std::shared_ptr<const hive::ViewerSurface>> warm_visible_;
     hive::AppConfig config_;
     hive::Shell shell_;
     hive::Transport transport_;
     hive::HostBridge host_;
     std::shared_ptr<const hive::ViewerSurface> view_surface_;
-    hive::MediaViewer viewer_;
+    std::atomic<std::shared_ptr<hive::MediaViewer>> viewer_{std::make_shared<hive::MediaViewer>()};
     hive::Telemetry telemetry_{hive::data_directory()};
     std::mutex snapshot_mutex_;std::map<std::string,uint64_t> snapshot_pending_;
     std::mutex snapshot_reply_mutex_;

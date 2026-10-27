@@ -21,6 +21,7 @@ public:
     // Call after the supplied ready() predicate becomes true. Wakes the encoder
     // directly rather than waiting for the compatibility timeout.
     void notify_ready();
+    void activate();
     bool running() const;
     std::string failure() const;
     void feedback(const StreamFeedback&);

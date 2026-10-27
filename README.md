@@ -10,8 +10,11 @@ Existing alpha installations can upgrade through the same signed, idle-only OTA.
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
-0.3.2 adds maximize/restore to floating viewers and increases hotkey card
-entrances to 300 ms with up to 120 ms of stagger. See the
+0.4.0 warms the visible Hive computers before selection, retains their media
+resources after a single decoded picture, and promotes the selected session
+without rebuilding its decoder/window. Debug adds bounded per-frame and input
+traces. HEVC 4:4:4 codec settings are unchanged. See the
+[measurement and warm-session behavior](docs/EXPERIENCE.zh-CN.md) and
 [current scope and outstanding work](docs/STATUS.zh-CN.md).
 
 Alpha.36 moves **Relative mouse** into Settings as a saved checkbox, adds

@@ -64,6 +64,33 @@ struct Shell::Impl {
     HANDLE settings_process{};HWND health_badge{},waiting{};
     std::atomic<std::shared_ptr<const ViewerSurface>> viewer_surface;
     std::vector<std::shared_ptr<const ViewerSurface>> retired_viewers;
+    std::map<std::string,std::shared_ptr<const ViewerSurface>> warm_surfaces;
+    std::vector<std::string> warm_visible;
+    void publish_visible() {
+        if(!callbacks.visible_peers)return;
+        std::vector<std::string> ids;
+        if(panel_mode&&!panel_closing){
+            const int first=panel_mode==1?preview_index():scroll;
+            const int last=panel_mode==1?first+1:std::min(int(peers.size())+1,scroll+visible_tiles());
+            for(int i=first;i<last;++i)if(i>0&&i<=int(peers.size())){
+                const auto& p=peers[i-1];
+                if(p.authenticated&&(p.features&FeatureWarmStream)&&p.id!=active_id)ids.push_back(p.id);
+            }
+        }
+        if(ids==warm_visible)return;
+        warm_visible=ids;
+        std::vector<std::shared_ptr<const ViewerSurface>> surfaces;
+        for(const auto& id:ids){
+            auto& surface=warm_surfaces[id];
+            if(!surface){
+                const auto window=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,
+                    0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
+                if(window)surface=std::make_shared<const ViewerSurface>(ViewerSurface{window,id});
+            }
+            if(surface)surfaces.push_back(surface);
+        }
+        callbacks.visible_peers(surfaces);
+    }
     PanelComposition waiting_composition;
     bool waiting_visible=false,waiting_fading=false,waiting_retry=false;
     gpu_policy_restart::SettingsAdmission settings_restart;
@@ -220,13 +247,18 @@ struct Shell::Impl {
     }
     void hide_panel(bool animate=false) {
         cancel_drag();panel_summoned=false;
-        if(animate&&panel_mode&&!panel_closing){panel_closing=true;SetTimer(owner,2,composition.hide(),nullptr);publish_input();return;}
+        if(animate&&panel_mode&&!panel_closing){panel_closing=true;publish_visible();SetTimer(owner,2,composition.hide(),nullptr);publish_input();return;}
         if(animate&&panel_closing)return;
-        panel_closing=false;KillTimer(owner,2);panel_mode=0;outside_since=0;hovered=-1;
+        panel_closing=false;KillTimer(owner,2);panel_mode=0;outside_since=0;hovered=-1;publish_visible();
         if(panel)ShowWindow(panel,SW_HIDE);
         confine_mouse();publish_input();
     }
     void collect_viewers() {
+        std::erase_if(warm_surfaces,[&](const auto& entry){
+            if(std::find(warm_visible.begin(),warm_visible.end(),entry.first)!=warm_visible.end()||
+                (entry.second&&entry.second.use_count()!=1))return false;
+            if(entry.second)DestroyWindow(entry.second->window);return true;
+        });
         std::erase_if(retired_viewers,[](const auto& surface){
             if(surface.use_count()!=1)return false;
             DestroyWindow(surface->window);return true;
@@ -246,19 +278,26 @@ struct Shell::Impl {
             w=bounds.right-bounds.left;h=bounds.bottom-bounds.top;
             bounds.left=std::clamp(drop.x-w/2,work_area.left,std::max(work_area.left,work_area.right-w));bounds.top=std::clamp(drop.y-px(24),work_area.top,std::max(work_area.top,work_area.bottom-h));bounds.right=bounds.left+w;bounds.bottom=bounds.top+h;
         }
-        const HWND next=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",style,
+        std::shared_ptr<const ViewerSurface> surface;
+        if(auto warm=warm_surfaces.find(peer);warm!=warm_surfaces.end()){surface=warm->second;warm_surfaces.erase(warm);}
+        const HWND next=surface?surface->window:CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",style,
             bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,nullptr,nullptr,instance,this);
+        if(surface){
+            SetWindowLongPtrW(next,GWL_STYLE,style);
+            SetWindowPos(next,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
+                SWP_NOACTIVATE|SWP_NOZORDER|SWP_FRAMECHANGED);
+        }
         if(!next)return false;
         const HWND next_waiting=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,
             L"HiveDesk.Waiting",L"HiveDesk connection",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),
             GetSystemMetrics(SM_CYSCREEN),next,nullptr,instance,this);
-        if(!next_waiting){DestroyWindow(next);return false;}
+        if(!next_waiting){if(surface)retired_viewers.push_back(surface);else DestroyWindow(next);return false;}
         PanelComposition next_composition;
         try{
             next_composition.create(next_waiting);
             next_composition.cover(float(GetSystemMetrics(SM_CXSCREEN)),float(GetSystemMetrics(SM_CYSCREEN)),false,true);
-        }catch(const std::exception&){DestroyWindow(next);return false;}
-        auto surface=std::make_shared<const ViewerSurface>(ViewerSurface{next,peer});
+        }catch(const std::exception&){DestroyWindow(next_waiting);if(surface)retired_viewers.push_back(surface);else DestroyWindow(next);return false;}
+        if(!surface)surface=std::make_shared<const ViewerSurface>(ViewerSurface{next,peer});
         if(!IsWindowVisible(viewer)&&!remote&&GetForegroundWindow()!=panel)prior_focus=GetForegroundWindow();
         ShowWindow(viewer,SW_HIDE);
         // The waiting HWND also retains its previous snapshot/fade in DWM.
@@ -503,6 +542,7 @@ struct Shell::Impl {
         publish_input();
         confine_mouse();
         if(entering&&callbacks.panel_opened)callbacks.panel_opened();
+        publish_visible();
     }
     int card_at(POINT p) const {
         if(p.x<px(12)||p.x>=panel_width-px(12)||p.y<px(12))return -1;
@@ -524,7 +564,7 @@ struct Shell::Impl {
         if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
     }
     void timer() {
-        collect_viewers();
+        publish_visible();collect_viewers();
         // Latest-state mailbox: no per-report UI messages or stale report FIFO.
         std::optional<PendingSource> incoming;
         {std::lock_guard lock(source_mutex);incoming=std::move(pending_source);pending_source.reset();}
@@ -952,6 +992,7 @@ struct Shell::Impl {
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
         if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
         for(const auto& surface:retired_viewers)DestroyWindow(surface->window);
+        for(const auto& entry:warm_surfaces)if(entry.second)DestroyWindow(entry.second->window);warm_surfaces.clear();
         retired_viewers.clear();viewer_surface.store(nullptr);
         if(owner){MSG m{};while(PeekMessageW(&m,owner,UiTask,UiTask,PM_REMOVE))delete reinterpret_cast<std::function<void()>*>(m.lParam);DestroyWindow(owner);}
         for(auto& item:thumbnails)DeleteObject(item.second);thumbnails.clear();

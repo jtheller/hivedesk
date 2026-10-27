@@ -1,4 +1,5 @@
-﻿#include "hivedesk/media.h"
+#include "hivedesk/media.h"
+#include "hivedesk/experience_trace.h"
 #include "../src/panel_composition.h"
 #include <future>
 #include <cstdio>
@@ -35,7 +36,7 @@ int main(){
         screen=GetDC(nullptr);const auto gap=GetPixel(screen,x+160,y+90);ReleaseDC(nullptr,screen);
         if(gap!=RGB(22,32,48))throw std::runtime_error("Drag did not animate the adjacent card out of the insertion slot");
         composition.finish_cards();
-        hive::MediaViewer viewer;auto open=std::async(std::launch::async,[&]{std::string error;if(!viewer.open(video,error))throw std::runtime_error(error);});
+        hive::experience_enabled(true);hive::MediaViewer viewer;auto open=std::async(std::launch::async,[&]{std::string error;if(!viewer.open(video,error))throw std::runtime_error(error);});
         while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
         auto frame=hive::media_generated_test_frame();
         for(unsigned i=0;i<100&&!viewer.has_presented_frame();++i){frame.sequence=i;frame.capture_time_us=frame.source_ready_us=0;viewer.submit(frame);pump(25);}

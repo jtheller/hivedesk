@@ -11,8 +11,8 @@ namespace hive::broker {
 using Bytes=std::vector<uint8_t>;
 // Frame layout changed with image-associated cursor composition. Refuse a
 // mixed install rather than treating metadata bytes as compressed image data.
-constexpr uint32_t Magic=0x48425632,MaxBytes=16*1024*1024+128;
-enum Kind:uint32_t {Start=1,Ready=2,Input=3,Feedback=4,Keyframe=5,Frame=6,Health=7,Started=8,Failure=9,Notice=10,Diagnostics=11,InputStart=12,InputStarted=13,InputComplete=14};
+constexpr uint32_t Magic=0x48425633,MaxBytes=16*1024*1024+128;
+enum Kind:uint32_t {Start=1,Ready=2,Input=3,Feedback=4,Keyframe=5,Frame=6,Health=7,Started=8,Failure=9,Notice=10,Diagnostics=11,InputStart=12,InputStarted=13,InputComplete=14,Activate=15,Activated=16};
 inline std::wstring pipe_name(DWORD session){return L"\\\\.\\pipe\\HiveDesk.Host."+std::to_wstring(session);}
 inline std::wstring input_pipe_name(DWORD session){return L"\\\\.\\pipe\\HiveDesk.Input."+std::to_wstring(session);}
 inline std::filesystem::path module_directory(){wchar_t path[32768]{};GetModuleFileNameW(nullptr,path,32768);return std::filesystem::path(path).parent_path();}

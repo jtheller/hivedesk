@@ -8,6 +8,8 @@
 /tests/settings_gpu_policy/bin/
 /tests/settings_gpu_policy/obj/
 /.local/
+__pycache__/
+*.pyc
 *.user
 *.pdb
 *.log

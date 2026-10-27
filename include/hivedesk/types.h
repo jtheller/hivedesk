@@ -34,6 +34,7 @@ constexpr uint32_t FeatureFrameTiming = 256;
 constexpr uint32_t FeatureCursorComposition = 512;
 constexpr uint32_t FeatureBuildVersion = 1024;
 constexpr uint32_t FeatureNativeSnapshot = 2048;
+constexpr uint32_t FeatureWarmStream = 4096;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;
@@ -64,6 +65,7 @@ struct StreamSettings {
     uint32_t receiver_millihz = 0;
     uint64_t session = 0; // Nonzero selects negotiated automatic quality/pacing.
     bool diagnostic_constqp = false; // Developer baseline only; never negotiated.
+    bool warm = false; // One picture, then retain media resources without input authority.
 };
 enum StreamPressure : uint32_t { PressureEncode=1, PressureDecode=2, PressureNetwork=4 };
 struct StreamFeedback {

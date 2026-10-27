@@ -24,6 +24,7 @@ bool trusted_server(HANDLE pipe){
 struct HostBridge::Impl {
     HANDLE pipe=INVALID_HANDLE_VALUE;std::mutex writes;std::thread reader;std::atomic<bool> stopped{true};
     broker::ReadySignal downstream;
+    std::mutex activation_mutex;std::condition_variable activation_changed;bool activated=false;
     std::atomic<HANDLE> input_pipe{INVALID_HANDLE_VALUE};std::mutex input_writes,input_lifecycle;std::thread input_reader;
     std::atomic<bool> input_stopped{true};std::atomic<uint64_t> input_session{0},legacy_sequence{0};
     bool send(broker::Kind kind,const broker::Bytes& bytes={}){std::lock_guard lock(writes);return !stopped&&broker::send(pipe,kind,bytes,&stopped);}
@@ -47,6 +48,7 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
             while(!impl_->stopped&&broker::receive(impl_->pipe,kind,bytes,&impl_->stopped)){
                 broker::Reader r{bytes};
                 if(kind==broker::Started){if(!bytes.empty()||announced)break;announced=true;promise->set_value({});}
+                else if(kind==broker::Activated){if(!bytes.empty())break;{std::lock_guard lock(impl_->activation_mutex);impl_->activated=true;}impl_->activation_changed.notify_all();}
                 else if(kind==broker::Failure){std::string message(bytes.begin(),bytes.end());if(!announced){announced=true;promise->set_value(message);}else log("Desktop service: "+message);break;}
                 else if(kind==broker::Diagnostics){SourceDiagnostics d;d.session=r.u64();d.encoded_millihz=r.u32();d.encode_us=r.u32();d.capture_wait_us=r.u32();d.send_wait_us_per_second=r.u32();d.feedback_age_us=r.u32();d.network_extra_us=r.u32();d.color_us=r.u32();d.nvenc_us=r.u32();d.encode_age_us=r.u32();d.encode_details=true;if(!r.end()&&!rate_wire::read_diagnostics(d,[&]{return r.u32();},[&]{return r.u64();}))break;if(!r.end()||!valid_diagnostics(d))break;if(diagnostics)diagnostics(d);}
                 else if(kind==broker::Notice){if(bytes.size()>1024)break;log("Desktop service: "+std::string(bytes.begin(),bytes.end()));}
@@ -66,7 +68,7 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
         // closes that pipe and the broker releases all held input.
         impl_->input_session=0;impl_->input_stopped=true;
     });
-    broker::Bytes bytes;broker::u32(bytes,settings.fps);broker::u32(bytes,settings.bitrate_mbps);broker::u32(bytes,settings.receiver_millihz);broker::u64(bytes,settings.session);
+    broker::Bytes bytes;broker::u32(bytes,settings.fps);broker::u32(bytes,settings.bitrate_mbps);broker::u32(bytes,settings.receiver_millihz);broker::u64(bytes,settings.session);broker::u32(bytes,settings.warm?1:0);
     if(!impl_->send(broker::Start,bytes)||initialized.wait_for(std::chrono::seconds(8))!=std::future_status::ready){error="Desktop service capture startup timed out.";stop();return false;}
     error=initialized.get();if(!error.empty()){stop();return false;}
     const auto input_name=broker::input_pipe_name(session);
@@ -131,6 +133,12 @@ void HostBridge::stop(){
     if(impl_->pipe!=INVALID_HANDLE_VALUE)CancelIoEx(impl_->pipe,nullptr);
     if(impl_->reader.joinable()){CancelSynchronousIo(impl_->reader.native_handle());impl_->reader.join();}
     std::lock_guard lock(impl_->writes);if(impl_->pipe!=INVALID_HANDLE_VALUE){CloseHandle(impl_->pipe);impl_->pipe=INVALID_HANDLE_VALUE;}
+}
+bool HostBridge::activate(){
+    {std::lock_guard lock(impl_->activation_mutex);impl_->activated=false;}
+    if(!impl_->send(broker::Activate))return false;
+    std::unique_lock lock(impl_->activation_mutex);
+    return impl_->activation_changed.wait_for(lock,std::chrono::seconds(2),[&]{return impl_->activated||impl_->stopped;})&&impl_->activated;
 }
 void HostBridge::notify_ready(){impl_->downstream.notify();}
 void HostBridge::request_keyframe(){impl_->send(broker::Keyframe);}

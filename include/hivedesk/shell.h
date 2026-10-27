@@ -31,6 +31,7 @@ struct ShellCallbacks {
     std::function<void(const std::wstring&, const std::string&, const StreamSettings&)> save_settings;
     std::function<void(const std::string&)> connect_address;
     std::function<void()> panel_opened;
+    std::function<void(const std::vector<std::shared_ptr<const ViewerSurface>>&)> visible_peers;
     std::function<bool(const std::string&, const CursorState&)> cursor_changed;
     std::function<void()> stream_tick;
     std::function<void()> debug_tick;

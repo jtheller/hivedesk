@@ -38,6 +38,7 @@ struct Session {
     HANDLE pipe;MediaHost media;std::mutex write_mutex,media_mutex;
     std::atomic<bool> stopping{false},credit{true};bool active=false;StreamSettings settings{};std::wstring captured_desktop;
     HANDLE input_pipe=INVALID_HANDLE_VALUE;std::thread input_reader;
+    std::atomic<bool> warming{false};
     std::atomic<bool> input_stopping{false};std::atomic<uint64_t> input_session{0};
     broker::StatusMailbox status_mailbox;std::thread status_writer;
     Session(HANDLE connection,DWORD session,SECURITY_ATTRIBUTES* security):pipe(connection){
@@ -64,7 +65,7 @@ struct Session {
                 broker::serve_input(input_pipe,client_pid,input_stopping,
                     [this](uint64_t session){return !input_stopping&&!parent_gone&&input_session.load()==session;},
                     [&](const InputPacket& packet){
-                        const auto fresh=[&]{const auto now=input_now_us();return !input_stopping&&!parent_gone&&input_session.load()==packet.session&&
+                        const auto fresh=[&]{const auto now=input_now_us();return !warming&&!input_stopping&&!parent_gone&&input_session.load()==packet.session&&
                             packet.received_time_us&&now>=packet.received_time_us&&now-packet.received_time_us<=broker::InputMaxQueueUs;};
                         return broker::retry_desktop_input([&]{
                             if(desktop.attach())first_input=true;
@@ -144,7 +145,8 @@ struct Session {
             broker::Reader r{b};bool valid=true;
             if(kind==broker::Start){
                 std::lock_guard lock(media_mutex);if(active)break;
-                settings.fps=r.u32();settings.bitrate_mbps=r.u32();settings.receiver_millihz=r.u32();settings.session=r.u64();
+                settings.fps=r.u32();settings.bitrate_mbps=r.u32();settings.receiver_millihz=r.u32();settings.session=r.u64();const auto warm=r.u32();settings.warm=warm!=0;warming=settings.warm;
+                if(warm>1)break;
                 if(!r.end()||(settings.session?(settings.receiver_millihz<1000||settings.receiver_millihz>2000000):(!settings.bitrate_mbps||settings.bitrate_mbps>4000||settings.fps>2000)))break;
                 // Publish input authority before capture initialization. Later
                 // desktop restarts and feedback cannot obstruct this owner.
@@ -152,6 +154,9 @@ struct Session {
                 std::string error;active=start_media(error);
                 if(!active){send(broker::Failure,broker::Bytes(error.begin(),error.end()));break;}
                 if(!send(broker::Started))break;
+            }else if(kind==broker::Activate){
+                std::lock_guard lock(media_mutex);if(!b.empty()||!active)break;
+                settings.warm=false;warming=false;media.activate();if(!send(broker::Activated))break;
             }else if(kind==broker::Ready){if(!b.empty()||!active)break;credit=true;media.notify_ready();}
             else if(kind==broker::Keyframe){if(!b.empty()||!active)break;media.request_keyframe();}
             else if(kind==broker::Feedback){

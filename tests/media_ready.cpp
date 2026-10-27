@@ -36,5 +36,14 @@ int main(){try{
     wait([&]{return checks>=2;},"Worker did not re-enter blocked state");
     const auto stop=Clock::now();host.stop();
     if(Clock::now()-stop>std::chrono::seconds(1)||host.running())throw std::runtime_error("Stop failed to cancel blocked capture");
-    std::printf("PASS real MediaHost: 12 gated frames, notify-to-ready mean %.1f us / max %.1f us; stop cancels blocked credit. No visible stimulus or input; wake timing excludes capture/codec.\n",total_us/12,max_us);return 0;
+    frames=0;credit=true;
+    hive::StreamSettings warm;warm.session=8182;warm.receiver_millihz=60000;warm.warm=true;
+    std::atomic<uint64_t> warm_sequence=0;std::atomic<bool> promoted_keyframe=false;
+    if(!host.start(warm,[&](hive::EncodedFrame frame){std::lock_guard lock(mutex);warm_sequence=frame.sequence;if(frames>0)promoted_keyframe=frame.keyframe;++frames;changed.notify_all();},error))throw std::runtime_error(error);
+    wait([&]{return frames>0;},"Warm capture did not produce its initial picture");
+    Sleep(150);if(frames!=1)throw std::runtime_error("Warm capture kept encoding while unselected");
+    host.activate();wait([&]{return frames>1;},"Promotion failed to resume the retained encoder");
+    if(!promoted_keyframe||warm_sequence==0)throw std::runtime_error("Promotion lost frame sequence or fresh IDR");
+    host.stop();
+    std::printf("PASS real MediaHost warm first-picture pause / retained-encoder promotion;  12 gated frames, notify-to-ready mean %.1f us / max %.1f us; stop cancels blocked credit. No visible stimulus or input; wake timing excludes capture/codec.\n",total_us/12,max_us);return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL media readiness: %s\n",e.what());return 1;}}

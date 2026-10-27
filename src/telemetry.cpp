@@ -1,4 +1,5 @@
 #include "hivedesk/telemetry.h"
+#include "hivedesk/experience_trace.h"
 #include "hivedesk/config.h"
 #include "hivedesk/auto_rate.h"
 #include <windows.h>
@@ -115,6 +116,7 @@ struct Telemetry::Impl {
             out<<"{\"dedicated\":"<<(d.dedicated?"true":"false")<<",\"ready\":"<<(d.ready?"true":"false")
                <<",\"session\":"<<d.session<<",\"connection\":"<<d.connection<<",\"enqueued\":"<<d.enqueued
                <<",\"coalesced\":"<<d.coalesced<<",\"sent\":"<<d.sent<<",\"acknowledged\":"<<d.acknowledged
+               <<",\"credit_stalls\":"<<d.credit_stalls<<",\"credit_wait_total_ms\":"<<d.credit_wait_total_us/1000.0<<",\"credit_wait_max_ms\":"<<d.credit_wait_max_us/1000.0
                <<",\"failed\":"<<d.failed<<",\"queued\":"<<d.queued<<",\"inflight\":"<<d.inflight
                <<",\"samples\":"<<d.samples<<",\"sample_age_ms\":";
             if(d.sample_age_us==UINT32_MAX)out<<"null";else out<<d.sample_age_us/1000.0;
@@ -163,7 +165,7 @@ struct Telemetry::Impl {
 };
 Telemetry::Telemetry(std::filesystem::path directory):impl_(std::make_unique<Impl>(std::move(directory))){}
 Telemetry::~Telemetry()=default;
-void Telemetry::enabled(bool value){std::lock_guard lock(impl_->mutex);if(impl_->enabled==value)return;impl_->enabled=value;impl_->dirty=true;impl_->changed.notify_one();}
+void Telemetry::enabled(bool value){experience_enabled(value);std::lock_guard lock(impl_->mutex);if(impl_->enabled==value)return;impl_->enabled=value;impl_->dirty=true;impl_->changed.notify_one();}
 void Telemetry::select(Side side,const std::string& peer,uint64_t session,const std::string& name){std::lock_guard lock(impl_->mutex);auto& e=impl_->endpoint(side);e={};e.active=true;e.peer=peer;e.name=name;e.session=session;if(impl_->enabled){impl_->dirty=true;impl_->changed.notify_one();}}
 void Telemetry::clear(Side side){std::lock_guard lock(impl_->mutex);auto& e=impl_->endpoint(side);if(!e.active)return;e={};if(impl_->enabled){impl_->dirty=true;impl_->changed.notify_one();}}
 void Telemetry::disconnected(const std::string& peer){std::lock_guard lock(impl_->mutex);for(auto* e:{&impl_->view,&impl_->host})if(e->active&&e->peer==peer)e->connected=false;if(impl_->enabled){impl_->dirty=true;impl_->changed.notify_one();}}

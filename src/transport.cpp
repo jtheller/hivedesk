@@ -11,6 +11,7 @@
 #include <bcrypt.h>
 #include <iphlpapi.h>
 #include "hivedesk/transport.h"
+#include "hivedesk/experience_trace.h"
 #include "hivedesk/network_key.h"
 #include "rate_wire.h"
 #include "video_send_window.h"
@@ -47,7 +48,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -207,7 +208,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -432,7 +433,7 @@ struct Transport::Impl {
                 // One operation owns the complete encrypted packet (header,
                 // ciphertext and tag); no three-send delayed-ACK interaction.
                 if(input_sequence){std::lock_guard queue_lock(queue_mutex);const auto now=input_now_us();
-                    if(input_send.expired(now))return false;input_send.submitted(input_session,input_sequence,now);}
+                    if(input_send.expired(now))return false;input_send.submitted(input_session,input_sequence,now);experience_trace(ExperienceEvent::InputSent,input_session,input_sequence,{now});}
                 submitted=WSASend(s,buffers.data(),DWORD(buffers.size()),nullptr,0,&operation,nullptr);
                 if(submitted==SOCKET_ERROR)error=WSAGetLastError();
             }
@@ -731,6 +732,7 @@ struct Transport::Impl {
             {std::lock_guard lock(c.queue_mutex);if(ack.session!=c.input_send.session()||c.input_ending)return true;
                 if(!c.input_send.acknowledge(ack,input_now_us()))return false;
                 if(c.input_ending&&c.input_send.empty())c.input_enabled=false;}
+            experience_trace(ExperienceEvent::InputAck,ack.session,ack.sequence,{ack.capture_time_us,ack.host_queue_us,ack.inject_us,ack.injected?1ull:0ull});
             c.queue_cv.notify_all();if(callbacks.input_ack)callbacks.input_ack(c.peer.id,ack);
             if(!ack.injected){status("Desktop input was not accepted; reconnecting remote control.");return false;}return true;
         }
@@ -750,8 +752,15 @@ struct Transport::Impl {
             Peer updated;{std::lock_guard lock(mutex);c.peer.version=std::move(version);updated=c.peer;}
             if(callbacks.peer)callbacks.peer(updated);return true;
         }
+        case WarmCancel: {
+            const auto session=r.qword();
+            if(!(c.peer.features&FeatureWarmStream)||!session||!r.end())return false;
+            if(callbacks.cancel_warm)callbacks.cancel_warm(c.peer.id,session);return true;
+        }
+        case WarmStart:
         case AutoStart: {
-            StreamSettings settings;settings.session=r.qword();settings.receiver_millihz=r.dword();
+            StreamSettings settings;settings.session=r.qword();settings.receiver_millihz=r.dword();settings.warm=type==WarmStart;
+            if(settings.warm&&!(c.peer.features&FeatureWarmStream))return false;
             if(!(c.peer.features&FeatureAutomaticStream)||!settings.session||settings.receiver_millihz<1000||settings.receiver_millihz>2000000||!r.end())return false;
             if(callbacks.start_stream)callbacks.start_stream(c.peer.id,settings);return true;
         }
@@ -938,8 +947,13 @@ uint64_t Transport::connection_token(const std::string& peer) const {
 }
 bool Transport::request_stream(const std::string& peer, const StreamSettings& s) {
     if(s.session){auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||s.receiver_millihz<1000||s.receiver_millihz>2000000)return false;
-        Bytes b{AutoStart};u64(b,s.session);u32(b,s.receiver_millihz);return c->enqueue(std::move(b));}
+        if(s.warm&&!(c->peer.features&FeatureWarmStream))return false;
+        Bytes b{uint8_t(s.warm?WarmStart:AutoStart)};u64(b,s.session);u32(b,s.receiver_millihz);return c->enqueue(std::move(b));}
     auto c = impl_->find(peer); if (!c || !s.bitrate_mbps || s.bitrate_mbps > 10000) return false; Bytes b{Start}; u32(b,s.fps); u32(b,s.bitrate_mbps); return c->enqueue(std::move(b));
+}
+bool Transport::cancel_warm(const std::string& peer,uint64_t session) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureWarmStream)||!session)return false;
+    Bytes b{WarmCancel};u64(b,session);return c->enqueue(std::move(b));
 }
 void Transport::stop_stream(const std::string& peer) { if (auto c = impl_->find(peer)) c->enqueue(Bytes{Stop}); }
 bool Transport::end_stream(const std::string& peer,uint64_t session) {
@@ -1261,6 +1275,23 @@ bool Transport::self_test(std::string& result) {
         for(const uint8_t channel:{uint8_t(1),uint8_t(2)}){control.channel=channel;if(owner.dispatch(control,packet)){result="Build version accepted on media/input channel";return false;}}
     }
     {
+        Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);
+        control.channel=0;control.peer.features=FeatureAutomaticStream;
+        Bytes request{WarmStart};u64(request,71);u32(request,100000);
+        Bytes cancel{WarmCancel};u64(cancel,71);
+        if(owner.dispatch(control,request)||owner.dispatch(control,cancel)){result="Unnegotiated prewarm accepted";return false;}
+        control.peer.features|=FeatureWarmStream;unsigned starts=0,cancels=0;
+        owner.callbacks.start_stream=[&](const std::string&,const StreamSettings& settings){if(settings.warm&&settings.session==71&&settings.receiver_millihz==100000)++starts;};
+        owner.callbacks.cancel_warm=[&](const std::string&,uint64_t session){if(session==71)++cancels;};
+        if(!owner.dispatch(control,request)||!owner.dispatch(control,cancel)||starts!=1||cancels!=1){result="Prewarm request/cancel identity lost";return false;}
+        for(auto bytes:{request,cancel}){
+            auto truncated=bytes;truncated.pop_back();auto trailing=bytes;trailing.push_back(0);
+            if(owner.dispatch(control,truncated)||owner.dispatch(control,trailing)){result="Malformed prewarm accepted";return false;}
+            for(uint8_t channel:{uint8_t(1),uint8_t(2)}){control.channel=channel;if(owner.dispatch(control,bytes)){result="Prewarm accepted off control lane";return false;}}
+            control.channel=0;
+        }
+    }
+    {
         InputSendWindow queue;queue.reset(71);
         uint64_t sequence=0;
         const auto put=[&](InputEvent event,uint64_t at=1000){return queue.enqueue({71,++sequence,at,event},at);};
@@ -1280,6 +1311,9 @@ bool Transport::self_test(std::string& result) {
         const auto& last=sent.back();
         queue.submitted(71,last.sequence,1250);
         if(!queue.acknowledge({71,last.sequence,last.capture_time_us,7,11,true},1400)||!queue.writable()) {result="Completed injection ACK did not return credit";return false;}
+        const auto credit_metrics=queue.snapshot(1450);
+        if(credit_metrics.credit_stalls!=1||credit_metrics.credit_wait_total_us!=100||credit_metrics.credit_wait_max_us!=100){result="Input credit wait includes non-blocked time or was not measured";return false;}
+
         auto stats=queue.snapshot(1500);
         if(stats.coalesced!=2||stats.inflight||stats.queued!=1||stats.acknowledged!=8||stats.capture_to_send_p99_us!=250||stats.ack_roundtrip_p99_us!=150||stats.host_queue_max_us!=7||stats.inject_max_us!=11) {
             result="Input latency metric attribution failed";return false;
@@ -1781,11 +1815,12 @@ bool Transport::self_test(std::string& result) {
     auto bad_aad = aad; bad_aad.back() ^= 1; if (cipher.crypt(false,bad_aad,encrypted,decrypted,tag)) { result = "Tampered packet counter accepted."; return false; }
     std::mutex mutex; std::condition_variable cv; int state = 0; bool received_frame = false, returned_text = false, input_order = false, got_stop = false, got_release = false, got_uncapped = false;
     Transport a,b,wrong;
-    bool got_snapshot=false,got_cursor=false,got_diagnostics=false,got_encode_diagnostics=false,got_host_ended=false;int snapshot_count=0,cursor_count=0;
+    bool got_snapshot=false,got_cursor=false,got_diagnostics=false,got_encode_diagnostics=false,got_host_ended=false;int snapshot_count=0,cursor_count=0;bool got_warm=false,got_warm_cancel=false;
     TransportCallbacks bcb;
     bcb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); if (s == L"Hive \x4e2d\x6587 \xd83d\xde80") state = 1; cv.notify_all(); };
     bcb.input = [&](const std::string&,const InputEvent& e) { std::lock_guard lock(mutex); if (e.kind == InputKind::ReleaseAll) got_release = true; else { input_order = state == 1 && e.kind == InputKind::Key && e.a == 30; state = 2; } cv.notify_all(); };
-    bcb.start_stream = [&](const std::string&,const StreamSettings& s) { std::lock_guard lock(mutex); if (state == 2 && s.fps == 237 && s.bitrate_mbps == 80) state = 3; else if (state == 3 && s.fps == 0 && s.bitrate_mbps == 80) got_uncapped = true; cv.notify_all(); };
+    bcb.start_stream = [&](const std::string&,const StreamSettings& s) { std::lock_guard lock(mutex); if(s.warm){got_warm=s.session==919&&s.receiver_millihz==100000;cv.notify_all();return;} if (state == 2 && s.fps == 237 && s.bitrate_mbps == 80) state = 3; else if (state == 3 && s.fps == 0 && s.bitrate_mbps == 80) got_uncapped = true; cv.notify_all(); };
+    bcb.cancel_warm=[&](const std::string&,uint64_t session){std::lock_guard lock(mutex);got_warm_cancel=session==919;cv.notify_all();};
     bcb.stop_stream = [&](const std::string&) { std::lock_guard lock(mutex); got_stop = true; cv.notify_all(); };
     bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}); cv.notify_all(); };
     TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
@@ -1834,6 +1869,9 @@ bool Transport::self_test(std::string& result) {
             result="Encrypted video loopback did not expose valid local sender timings";return false;
         }
     }
+    StreamSettings warm_settings;warm_settings.session=919;warm_settings.receiver_millihz=100000;warm_settings.warm=true;
+    ok=a.request_stream("test-b",warm_settings)&&a.cancel_warm("test-b",919)&&!a.cancel_warm("test-b",0)&&ok;
+    {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_warm&&got_warm_cancel;})&&ok;}
     std::wstring oversized(kMaxClipboard/2+1,L'x'), malformed(1,wchar_t(0xd800));
     ok=ok&&!a.request_stream("test-b",{0,0,0,1})&&!a.request_stream("test-b",{0,0,2000001,1})&&
         !a.send_health("test-b",{1,60000,60001,0})&&!a.send_health("test-b",{1,60000,60000,8})&&!a.send_feedback("test-b",{})&&!a.send_diagnostics("test-b",{})&&!a.send_diagnostics("test-b",{1,4000001})&&!a.send_diagnostics("test-b",{1,60000,0,0,1000001});
