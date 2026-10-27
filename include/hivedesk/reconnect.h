@@ -4,6 +4,14 @@
 #include <string>
 
 namespace hive {
+// Bytes arriving without a usable picture/input channel are not readiness.
+// Permit a slow first frame to make progress, but never renew Connecting forever.
+struct StreamStartupDeadline {
+    uint64_t idle_until,hard_until,bytes;
+    StreamStartupDeadline(uint64_t now,uint64_t received):idle_until(now+8000),hard_until(now+16000),bytes(received){}
+    void progress(uint64_t now,uint64_t received){if(received>bytes){bytes=received;idle_until=std::min(hard_until,now+8000);}}
+    bool expired(uint64_t now)const{return now>=std::min(idle_until,hard_until);}
+};
 // Owned by the command worker. The UI generation cancels pending attempts
 // immediately, including an attempt waiting for its first decoded frame.
 struct ReconnectIntent {

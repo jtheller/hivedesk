@@ -3,6 +3,11 @@
 #include <cstdio>
 void require(bool ok,const char* error){if(!ok)throw std::runtime_error(error);}
 int main(){try{
+    hive::StreamStartupDeadline startup(100,0);
+    require(!startup.expired(8099)&&startup.expired(8100),"Silent startup did not time out");
+    for(uint64_t now=1000;now<16100;now+=1000)startup.progress(now,now);
+    require(!startup.expired(16099)&&startup.expired(16100),"Continuous bytes renewed Connecting past its hard deadline");
+    startup.progress(20000,20000);require(startup.expired(20000),"Expired startup resurrected by late bytes");
     hive::ReconnectIntent r;r.select("VI",10);
     require(r.due(10,0),"first attempt delayed");r.attempted(0);
     require(!r.due(10,999)&&r.due(10,1000),"retry interval");

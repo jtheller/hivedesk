@@ -599,6 +599,7 @@ private:
         service_cost=uint32_t(std::min<uint64_t>(1000000,now_us()-began));
     }
     void mapping_loop() noexcept{
+        SetThreadDescription(GetCurrentThread(),L"HiveDesk NVDEC mapping / color");
         try{
             cuda_.current();
             for(;;){
@@ -1053,7 +1054,7 @@ struct MediaViewer::Impl {
     mutable std::mutex mutex;
     std::condition_variable changed;
     ViewerQueue frames;
-    bool stopping = true, displayed = false;
+    bool stopping = true, displayed = false, present_enabled = true;
     CursorPresentation cursor;
     std::thread worker;
     std::string status = "Closed";
@@ -1087,7 +1088,7 @@ struct MediaViewer::Impl {
 };
 MediaViewer::MediaViewer() : impl_(std::make_unique<Impl>()) {}
 MediaViewer::~MediaViewer() { close(); }
-bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented) {
+bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented,bool warm) {
     close();
     // DXGI creation may synchronously send window messages. Create it on the
     // caller/UI thread, then hand the device/context to the render worker.
@@ -1106,12 +1107,13 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
         // transitions need UI work; retain the last presented state for startup.
         if(changed&&presented)presented(cursor);
     });
-    { std::lock_guard guard(impl_->mutex); impl_->stopping = false; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
+    { std::lock_guard guard(impl_->mutex); impl_->stopping = false; impl_->present_enabled=!warm; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
         impl_->cursor={};
         impl_->live_window={};impl_->live_totals={};impl_->live_window.sample(now_us(),{});
         impl_->feedback={};impl_->last_arrival=0;impl_->service_samples.clear();impl_->present_samples.clear();impl_->diagnostics={};impl_->sample_since=now_us();impl_->receive_sample_at=0;impl_->received_count=impl_->decoded_count=impl_->presented_count=impl_->received_bytes=0;}
     std::promise<std::string> initialized; auto ready = initialized.get_future();
     impl_->worker = std::thread([this, renderer = std::move(renderer), initialized = std::move(initialized)]() mutable {
+        SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer decode / lifetime");
         bool announced=false;
         try{
             std::atomic<bool> pipeline_stop=false;
@@ -1129,11 +1131,21 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
             std::thread presenter;
             struct Workers {
                 std::atomic<bool>& stop;LatestPicture& pictures;Decoder& decoder;std::thread& presenter;
-                ~Workers(){stop=true;pictures.stop();decoder.request_stop();if(presenter.joinable())presenter.join();decoder.stop_async();}
-            } workers{pipeline_stop,pictures,decoder,presenter};
+                std::mutex& state_mutex;std::condition_variable& changed;
+                ~Workers(){
+                    {std::lock_guard lock(state_mutex);stop=true;}changed.notify_all();
+                    pictures.stop();decoder.request_stop();if(presenter.joinable())presenter.join();decoder.stop_async();
+                }
+            } workers{pipeline_stop,pictures,decoder,presenter,impl_->mutex,impl_->changed};
             presenter=std::thread([&]{
+                SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer presentation");
                 std::optional<size_t> current;
                 try{
+                    {
+                        std::unique_lock guard(impl_->mutex);
+                        impl_->changed.wait(guard,[&]{return pipeline_stop||impl_->stopping||impl_->present_enabled;});
+                        if(pipeline_stop||impl_->stopping)return;
+                    }
                     FrameTimer present_retry;
                     while(!cancelled()){
                         if(!current&&!pictures.wait_ready(cancelled))break;
@@ -1273,6 +1285,10 @@ void MediaViewer::submit(EncodedFrame frame) {
 void MediaViewer::close() {
     { std::lock_guard guard(impl_->mutex); impl_->stopping = true; impl_->frames.reset();impl_->cursor={}; }
     impl_->changed.notify_all(); if (impl_->worker.joinable()) impl_->worker.join();
+}
+void MediaViewer::activate(){
+    {std::lock_guard guard(impl_->mutex);impl_->present_enabled=true;}
+    impl_->changed.notify_all();
 }
 std::string MediaViewer::stats() const { std::lock_guard guard(impl_->mutex); return impl_->status; }
 bool MediaViewer::has_frame() const { std::lock_guard guard(impl_->mutex); return impl_->displayed && !impl_->stopping; }

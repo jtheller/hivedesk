@@ -32,7 +32,10 @@ public:
     MediaViewer(); ~MediaViewer();
     // HWND belongs to UI; decoder/rendering must not depend on UI message pumping.
     bool open(HWND window, std::string& error,
-        std::function<void(const CursorPresentation&)> presented={});
+        std::function<void(const CursorPresentation&)> presented={},bool warm=false);
+    // Prewarm prepares pixels without touching the hidden swapchain. Selection
+    // enables presentation after the UI has assigned its final window/style.
+    void activate();
     void submit(EncodedFrame frame);
     void close();
     std::string stats() const;

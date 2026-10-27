@@ -29,16 +29,28 @@ int probe(){
     require(visible.size()==2,"Opening Hive did not prepare every visible remote");
     const auto warm_surface=visible.front();require(!IsWindowVisible(warm_surface->window),"Warm viewer became foreground/visible");
     hive::MediaViewer warm_viewer;
-    auto warm_open=std::async(std::launch::async,[&]{std::string why;require(warm_viewer.open(warm_surface->window,why),why.c_str());});
+    auto warm_open=std::async(std::launch::async,[&]{std::string why;require(warm_viewer.open(warm_surface->window,why,{},true),why.c_str());});
     while(warm_open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);warm_open.get();
     warm_viewer.submit(encoded);for(unsigned i=0;i<80&&!warm_viewer.has_frame();++i)pump(25);
     require(warm_viewer.has_frame(),"Hidden warm viewer failed to decode its first picture");
+    pump(30);require(!warm_viewer.has_presented_frame(),"Unselected warm viewer touched its swapchain");
     const int warm_y=px(12)+stride+tile/2;
     SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),warm_y));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),warm_y));
     require(shell.viewer_surface()==warm_surface&&warm_viewer.has_frame(),"Selection recreated warmed media surface or lost decoded picture");
     require(visible.empty(),"Closing Hive did not revoke the visible warm set");
+    warm_viewer.activate();
     shell.show_local();auto warm_close=std::async(std::launch::async,[&]{warm_viewer.close();});
     while(warm_close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);warm_close.get();
+    // Cancellation must also wake a presenter which was never activated.
+    {
+        hive::MediaViewer unselected;
+        auto open=std::async(std::launch::async,[&]{std::string why;require(unselected.open(warm_surface->window,why,{},true),why.c_str());});
+        while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
+        unselected.submit(encoded);for(unsigned i=0;i<80&&!unselected.has_frame();++i)pump(25);
+        require(unselected.has_frame()&&!unselected.has_presented_frame(),"Unselected preparation failed");
+        auto close=std::async(std::launch::async,[&]{unselected.close();});
+        while(close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);close.get();
+    }
     shell.update_peers({{"a","Generated A","",47980,true},{"b","Generated B","",47980,true}});pump(10);
     for(int cycle=0;cycle<4;++cycle){
         const int row=1+cycle%2,y=px(12)+row*stride+tile/2;

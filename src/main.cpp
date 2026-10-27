@@ -180,6 +180,7 @@ private:
         wake_.notify_one();return true;
     }
     void work() {
+        SetThreadDescription(GetCurrentThread(),L"HiveDesk commands / viewer lifecycle");
         for(;;) {
             std::function<void()> job;
             {std::unique_lock lock(queue_mutex_);wake_.wait_for(lock,std::chrono::milliseconds(250),[this]{return closing_||!queue_.empty();});if(closing_)break;if(!queue_.empty()){job=std::move(queue_.front());queue_.pop_front();}}
@@ -231,7 +232,11 @@ private:
                 if(now-it->second->last_visible>2000){expired.push_back(it->second);it=warm_views_.erase(it);}else ++it;
             }
         }
-        for(const auto& warm:expired){transport_.cancel_warm(warm->surface->peer,warm->settings.session);warm->viewer->close();}
+        for(const auto& warm:expired){
+            transport_.cancel_warm(warm->surface->peer,warm->settings.session);
+            hive::log("Warm graphics retiring: "+warm->surface->peer+" session="+std::to_string(warm->settings.session));
+            warm->viewer->close();hive::log("Warm graphics retired: "+warm->surface->peer);
+        }
         for(const auto& surface:visible){
             {const std::lock_guard lock(queue_mutex_);if(closing_||!queue_.empty())break;}
             if(const auto active=active_.load();active&&*active==surface->peer)continue;
@@ -253,7 +258,7 @@ private:
             if(!warm->viewer->open(surface->window,error,[this,peer=surface->peer,session=warm->settings.session](const hive::CursorPresentation& cursor){
                 const auto active=active_.load();if(!closing_&&active&&*active==peer&&active_session_==session)
                     shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
-            })){
+            },true)){
                 warm->failed=true;hive::log("Warm viewer unavailable: "+surface->peer+" "+error);
             }
             {const std::lock_guard lock(warm_mutex_);warm_views_[surface->peer]=warm;}
@@ -533,14 +538,24 @@ private:
             }
         };
         std::string error;
-        if(!transport_.start({config_.device_id,hive::narrow(config_.name),config_.group_key,config_.port,true,true},std::move(callbacks),error))throw std::runtime_error("Network startup failed: "+error);
+        // The isolated full-App regression uses generated loopback peers only.
+#ifdef HIVEDESK_APP_SESSION_TEST
+        constexpr bool discovery=false;
+#else
+        constexpr bool discovery=true;
+#endif
+        if(!transport_.start({config_.device_id,hive::narrow(config_.name),config_.group_key,config_.port,discovery,true},std::move(callbacks),error))throw std::runtime_error("Network startup failed: "+error);
         status("Ready. Move to the top-left corner to switch computers.");
     }
     void retry_tick() {
         if(updating_||closing_||!reconnect_.current(generation_))return;
         const auto current=active_.load();
-        if(current&&view_ready_&&(active_connection_!=transport_.connection_token(*current)||viewer_.load()->stats().starts_with("Media error:"))) {
-            view_ready_=false;
+        if(current&&view_ready_) {
+            const auto state=viewer_.load()->stats();
+            if(active_connection_!=transport_.connection_token(*current)||state.starts_with("Media error:")){
+                hive::log("Viewer recovery: "+*current+" session="+std::to_string(active_session_.load())+" "+state);
+                view_ready_=false;
+            }
         }
         if(current&&!view_ready_&&!reconnect_.waiting) {
             status("Connection lost. Reconnecting to "+reconnect_.peer+"...");
@@ -584,9 +599,13 @@ private:
         const bool automatic=negotiated!=connected_peers.end()&&(negotiated->features&hive::FeatureAutomaticStream);
         std::string error;
         active_connection_=transport_.connection_token(peer);if(!active_connection_)return;
+        // Retain one immutable HWND lease throughout validation and startup.
+        // A second read could bind a warmed decoder to a newer same-peer window.
+        const auto selected_surface=shell_.viewer_surface();
+        if(!selected_surface||selected_surface->peer!=peer||epoch!=generation_)return;
         std::shared_ptr<WarmView> warm;
         {const std::lock_guard lock(warm_mutex_);auto cached=warm_views_.find(peer);if(cached!=warm_views_.end()){warm=cached->second;warm_views_.erase(cached);}}
-        if(warm&&(warm->failed||warm->viewer->stats().starts_with("Media error:")||warm->connection!=active_connection_||warm->surface!=shell_.viewer_surface()||warm->settings.receiver_millihz!=refresh)){
+        if(warm&&(warm->failed||warm->viewer->stats().starts_with("Media error:")||warm->connection!=active_connection_||warm->surface!=selected_surface||warm->settings.receiver_millihz!=refresh)){
             transport_.cancel_warm(peer,warm->settings.session);warm->viewer->close();warm.reset();
         }
         if(!warm){
@@ -597,7 +616,7 @@ private:
             for(const auto& item:unused){transport_.cancel_warm(item.first,item.second->settings.session);item.second->viewer->close();}
         }
         {const std::lock_guard lock(view_mutex_);
-            view_surface_=shell_.viewer_surface();
+            view_surface_=selected_surface;
             if(!view_surface_||view_surface_->peer!=peer){status("Viewer selection changed before startup; waiting for the current selection.");return;}
             hive::log(warm?"Viewer reusing warm graphics: "+peer:"Viewer creating graphics: "+peer);
             if(warm)viewer_.store(warm->viewer);
@@ -615,27 +634,33 @@ private:
         hive::StreamSettings stream;
         if(automatic){stream.session=warm?warm->settings.session:++session_sequence_;stream.receiver_millihz=refresh;}
         else {stream.fps=std::max(1u,refresh/1000);stream.bitrate_mbps=80;status("Peer uses legacy streaming. Update both computers for automatic quality.");}
+        bool admitted=false;
         {
             const std::lock_guard lock(view_intent_mutex_);
-            if(epoch!=generation_||closing_){const std::lock_guard view_lock(view_mutex_);viewer_.load()->close();view_surface_.reset();return;}
-            auto controlled=std::make_shared<const std::string>(peer);
-            last_controlled_.store(controlled);active_.store(std::move(controlled));
-            active_session_=stream.session;
-            active_dedicated_input_=automatic&&(negotiated->features&hive::FeatureDedicatedInput)!=0;
-            view_control_=std::make_shared<const hive::ViewControl>(peer,stream.session,epoch);
+            if(epoch==generation_&&!closing_){
+                auto controlled=std::make_shared<const std::string>(peer);
+                last_controlled_.store(controlled);active_.store(std::move(controlled));
+                active_session_=stream.session;
+                active_dedicated_input_=automatic&&(negotiated->features&hive::FeatureDedicatedInput)!=0;
+                view_control_=std::make_shared<const hive::ViewControl>(peer,stream.session,epoch);
+                admitted=true;
+            }
         }
+        // GPU/DXGI teardown can send UI messages; never join with the intent
+        // lock held while UI selection or the input thread needs that lock.
+        if(!admitted){const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();return;}
+        if(warm)viewer_.load()->activate();
         if(warm){const auto size=warm->size.load();remote_size_=size;if(size)shell_.set_remote_size(uint32_t(size>>32),uint32_t(size));}
         telemetry_.select(MonitorSide::View,peer,stream.session,hive::narrow(label));
         if(!transport_.request_stream(peer,stream)) {go_local(active_.exchange(nullptr),false);status("Could not request desktop stream; retrying.");return;}
         if(active_dedicated_input_&&!transport_.begin_input(peer,stream.session)) {go_local(active_.exchange(nullptr),false);status("Could not initialize dedicated input; retrying.");return;}
         hive::log("Viewer stream requested: "+peer+" session="+std::to_string(stream.session));
-        auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);
-        auto received_bytes=transport_.received_video_bytes(peer);
+        hive::StreamStartupDeadline deadline(GetTickCount64(),transport_.received_video_bytes(peer));
         bool ready=false;std::string failure;
-        while(epoch==generation_&&!closing_&&std::chrono::steady_clock::now()<deadline) {
+        while(epoch==generation_&&!closing_&&!deadline.expired(GetTickCount64())) {
             if(transport_.connection_token(peer)!=active_connection_){failure="Connection changed while starting video; retrying.";break;}
             const auto progress=transport_.received_video_bytes(peer);
-            if(progress>received_bytes){received_bytes=progress;deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);}
+            deadline.progress(GetTickCount64(),progress);
             const auto state=viewer_.load()->stats();
             if(state.find("Media error:")==0) {failure=state;break;}
             // The waiting cover already makes the viewer visible. Keep it
@@ -678,7 +703,11 @@ private:
             if(notify_source){if(dedicated&&old_session)transport_.end_input(*previous,old_session);else transport_.send_input(*previous,{hive::InputKind::ReleaseAll,0,0,0});transport_.stop_stream(*previous);}
             auto expected=previous;last_controlled_.compare_exchange_strong(expected,nullptr);
         }
-        {const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();}
+        {const std::lock_guard lock(view_mutex_);
+            if(view_surface_)hive::log("Viewer graphics retiring: "+view_surface_->peer+" session="+std::to_string(old_session));
+            viewer_.load()->close();
+            if(view_surface_)hive::log("Viewer graphics retired: "+view_surface_->peer);
+            view_surface_.reset();}
         if(!closing_&&notify_shell)shell_.show_local();
     }
     void finish_shutdown() {
@@ -765,6 +794,7 @@ private:
     std::thread worker_,kick_worker_;
 };
 }
+#ifndef HIVEDESK_APP_SESSION_TEST
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false,warm_check=false;
@@ -817,3 +847,4 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     catch(const std::exception& error) {hive::log(std::string("Fatal: ")+error.what());MessageBoxW(nullptr,hive::widen(error.what()).c_str(),L"HiveDesk",MB_OK|MB_ICONERROR);}
     CloseHandle(singleton);return result;
 }
+#endif
