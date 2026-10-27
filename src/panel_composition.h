@@ -30,6 +30,8 @@ class PanelComposition {
     bool detached_=false;
     std::vector<Ptr<IDCompositionVisual>> card_layers_;
     ULONGLONG cards_started_=0;
+    struct CardMotion { Ptr<IDCompositionVisual> visual;float from=0,to=0;ULONGLONG started=0; };
+    std::vector<CardMotion> drag_cards_;
     float fade_from_=0,fade_to_=0,fade_seconds_=0;
     ULONGLONG fade_start_=0;
     static void check(HRESULT result) { if(FAILED(result))throw std::runtime_error("Switcher GPU composition failed."); }
@@ -52,28 +54,32 @@ class PanelComposition {
 public:
     void finish_cards(bool commit=true) {
         if(card_layers_.empty())return;
-        for(auto& layer:card_layers_)check(visual_->RemoveVisual(layer.Get()));card_layers_.clear();cards_started_=0;
+        for(auto& layer:card_layers_)check(visual_->RemoveVisual(layer.Get()));card_layers_.clear();drag_cards_.clear();cards_started_=0;
         check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));
         check(clip_->SetTop(0.0f));check(clip_->SetBottom(float(height_)));check(list_clip_->SetTop(float(height_)));
         if(commit)check(device_->Commit());
     }
     // All layers share the same bitmap. Only DWM transforms/opacity animate;
     // snapshot arrivals can update it without restarting the 240 ms timeline.
-    void reveal_cards(const std::vector<RECT>& cards,COLORREF background) {
-        if(!animations()||cards.empty())return;
+    void reveal_cards(const std::vector<RECT>& cards,COLORREF background,int dragged=-1) {
+        if((dragged<0&&!animations())||cards.empty())return;
         finish_cards(false);check(preview_->SetContent(nullptr));check(list_->SetContent(nullptr));
         const auto layer=[&](const RECT& bounds,int index){
             if(bounds.right<=bounds.left||bounds.bottom<=bounds.top)return;
             Ptr<IDCompositionVisual> v;check(device_->CreateVisual(&v));check(v->SetContent(surface_.Get()));
             const D2D_RECT_F clip{float(bounds.left),float(bounds.top),float(bounds.right),float(bounds.bottom)};check(v->SetClip(clip));
-            if(index>=0){
+            if(index>=0&&dragged<0){
                 const float delay=cards.size()>1?.06f*index/float(cards.size()-1):0;
                 const float duration=.24f-delay;
-                auto movement=tween(-float(bounds.right-bounds.left)*.28f,0,duration,delay);check(v->SetOffsetX(movement.Get()));
+                auto movement=tween(-float(width_),0,duration,delay);check(v->SetOffsetX(movement.Get()));
                 Ptr<IDCompositionEffectGroup> effect;check(device_->CreateEffectGroup(&effect));
                 auto opacity=tween(0,1,duration,delay);check(effect->SetOpacity(opacity.Get()));check(v->SetEffect(effect.Get()));
             }
-            check(visual_->AddVisual(v.Get(),TRUE,nullptr));card_layers_.push_back(std::move(v));
+            if(dragged>=0){
+                drag_cards_.push_back({v});
+                if(index==dragged){Ptr<IDCompositionEffectGroup> effect;check(device_->CreateEffectGroup(&effect));check(effect->SetOpacity(0.0f));check(v->SetEffect(effect.Get()));}
+            }
+            check(visual_->AddVisual(v.Get(),FALSE,nullptr));card_layers_.push_back(std::move(v));
         };
         // An opaque, solid backing remains behind moving/fading cards. Cutting
         // holes out of the original bitmap would fade through to the desktop.
@@ -90,11 +96,26 @@ public:
         Ptr<IDCompositionVisual> back;Ptr<IDCompositionScaleTransform> scale;
         check(device_->CreateVisual(&back));check(back->SetContent(backing.Get()));check(device_->CreateScaleTransform(&scale));
         check(scale->SetScaleX(float(width_)));check(scale->SetScaleY(float(height_)));check(back->SetTransform(scale.Get()));
-        check(visual_->AddVisual(back.Get(),TRUE,nullptr));card_layers_.push_back(std::move(back));
+        check(visual_->AddVisual(back.Get(),FALSE,nullptr));card_layers_.push_back(std::move(back));
         for(size_t i=0;i<cards.size();++i)layer(cards[i],int(i));
-        cards_started_=GetTickCount64();check(device_->Commit());
+        cards_started_=dragged<0?GetTickCount64():0;check(device_->Commit());
         SetPropW(window_,L"HiveDesk.CardAnimationMs",reinterpret_cast<HANDLE>(240));
         SetPropW(window_,L"HiveDesk.AnimatedCards",reinterpret_cast<HANDLE>(cards.size()));
+    }
+    void drag_slot(int from,int slot,int first,int stride) {
+        if(drag_cards_.empty())return;
+        const auto now=GetTickCount64();bool changed=false;
+        for(size_t n=0;n<drag_cards_.size();++n){
+            auto& card=drag_cards_[n];const int i=first+int(n);
+            const float target=slot>=0&&i>0&&i!=from?
+                (slot<=i&&i<from?float(stride):from<i&&i<slot?-float(stride):0):0;
+            if(target==card.to)continue;
+            const float t=std::clamp(float(now-card.started)/140.f,0.f,1.f),remaining=1-t;
+            card.from=card.to+(card.from-card.to)*remaining*remaining*remaining;card.to=target;card.started=now;
+            if(animations()){auto motion=tween(card.from,target,.14f);check(card.visual->SetOffsetY(motion.Get()));}
+            else check(card.visual->SetOffsetY(target));changed=true;
+        }
+        if(changed)check(device_->Commit());
     }
     // A full-screen waiting surface must never fade through to the previous
     // machine. Keep an opaque neutral backing while only the snapshot fades in.
@@ -145,7 +166,7 @@ public:
         SetPropW(window,L"HiveDesk.Composited",reinterpret_cast<HANDLE>(1));
     }
     void present(const void* bgra,UINT width,UINT height,bool commit=true) {
-        if(!card_layers_.empty()&&(width!=width_||height!=height_||GetTickCount64()-cards_started_>=240))finish_cards(false);
+        if(!card_layers_.empty()&&(width!=width_||height!=height_||(cards_started_&&GetTickCount64()-cards_started_>=240)))finish_cards(false);
         if(width!=width_||height!=height_) {
             surface_.Reset();check(device_->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED,&surface_));
             check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));width_=width;height_=height;

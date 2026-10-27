@@ -31,7 +31,7 @@
 
 namespace hive {
 namespace {
-constexpr UINT UiTask=WM_APP+41, TrayMessage=WM_APP+42, ClipboardApply=WM_APP+43, KickControllerMessage=WM_APP+47, CaptureActionMessage=WM_APP+48;
+constexpr UINT UiTask=WM_APP+41, TrayMessage=WM_APP+42, ClipboardApply=WM_APP+43, KickControllerMessage=WM_APP+47, CaptureActionMessage=WM_APP+48, ViewerLayoutMessage=WM_APP+50;
 constexpr ULONG_PTR InputMarker=0x48495645;
 constexpr COLORREF Background=RGB(19,22,29), Card=RGB(34,39,49), Selected=RGB(37,66,80);
 constexpr COLORREF Accent=RGB(94,217,213), Text=RGB(240,243,247), Muted=RGB(162,172,188);
@@ -77,19 +77,54 @@ struct Shell::Impl {
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
     ShellConfig config; ShellCallbacks callbacks; std::vector<Peer> peers;
     std::string active_id,previous_id,pending_id;
-    bool windowed=false,sizing_viewer=false,dragging=false;HWND drag_focus{};
+    bool windowed=false,sizing_viewer=false,dragging=false,viewer_layout_pending=false;HWND drag_focus{};
     int pressed_card=-1,drop_slot=-1;POINT drag_origin{};std::string dragged_peer;ULONGLONG last_drag_scroll=0;
+    HWND drag_ghost{};POINT drag_anchor{};std::vector<uint32_t> panel_pixels;int pixels_width=0,pixels_height=0;
     double window_ratio=16.0/9;
     RECT viewer_client() const {RECT r{};GetClientRect(viewer,&r);MapWindowPoints(viewer,nullptr,reinterpret_cast<POINT*>(&r),2);return r;}
     void sort_peers(){
         const auto rank=[&](const std::string& id){return std::find(config.device_order.begin(),config.device_order.end(),id)-config.device_order.begin();};
         std::stable_sort(peers.begin(),peers.end(),[&](const Peer& a,const Peer& b){const auto ar=rank(a.id),br=rank(b.id);return ar==br?a.id<b.id:ar<br;});
     }
-    void cancel_drag(){
+    void cancel_drag(bool restore_focus=true,bool commit_visual=true){
+        if(drag_ghost){DestroyWindow(drag_ghost);drag_ghost=nullptr;}
+        if(dragging)composition.finish_cards(commit_visual);
         const auto restore=drag_focus;drag_focus=nullptr;pressed_card=-1;dragging=false;drop_slot=-1;dragged_peer.clear();
         if(GetCapture()==panel)ReleaseCapture();
-        if(restore&&IsWindow(restore)&&GetForegroundWindow()==panel)SetForegroundWindow(restore);
+        if(restore_focus&&restore&&IsWindow(restore)&&GetForegroundWindow()==panel)SetForegroundWindow(restore);
         publish_input();InvalidateRect(panel,nullptr,FALSE);
+    }
+    std::vector<RECT> visible_cards() const {
+        std::vector<RECT> cards;
+        for(int i=scroll;i<=int(peers.size())&&i<scroll+visible_tiles();++i){const int y=px(12)+(i-scroll)*tile_stride();cards.push_back({px(12),y,panel_width-px(12),y+tile_height()});}
+        return cards;
+    }
+    void drag_layers(){
+        const auto shade=RGB(GetRValue(accent)*16/100,GetGValue(accent)*16/100,GetBValue(accent)*16/100);
+        // The source may scroll out of view; keep drag mode without hiding an
+        // unrelated visible card or starting the hotkey reveal timeline.
+        composition.reveal_cards(visible_cards(),shade,pressed_card>=scroll?pressed_card-scroll:INT_MAX);
+    }
+    void begin_drag_visual(){
+        paint_panel();const auto cards=visible_cards();const int index=pressed_card-scroll;
+        if(index<0||index>=int(cards.size()))return;
+        const RECT box=cards[index];const int w=box.right-box.left,h=box.bottom-box.top;
+        if(panel_pixels.empty()||box.bottom>pixels_height)return;
+        drag_ghost=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,
+            L"HiveDesk.Drag",L"HiveDesk dragged computer",WS_POPUP,0,0,w,h,panel,nullptr,instance,this);
+        if(!drag_ghost)return;
+        BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=w;info.bmiHeader.biHeight=-h;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
+        void* pixels=nullptr;HDC dc=CreateCompatibleDC(nullptr);HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
+        if(!dc||!bitmap){if(bitmap)DeleteObject(bitmap);if(dc)DeleteDC(dc);DestroyWindow(drag_ghost);drag_ghost=nullptr;return;}
+        for(int y=0;y<h;++y)std::memcpy(static_cast<uint32_t*>(pixels)+y*w,panel_pixels.data()+size_t(y+box.top)*pixels_width+box.left,size_t(w)*4);
+        const auto old=SelectObject(dc,bitmap);POINT source{},position=drag_origin;ClientToScreen(panel,&position);position.x-=drag_anchor.x;position.y-=drag_anchor.y;
+        SIZE size{w,h};BLENDFUNCTION blend{AC_SRC_OVER,0,235,AC_SRC_ALPHA};
+        UpdateLayeredWindow(drag_ghost,nullptr,&position,&size,dc,&source,0,&blend,ULW_ALPHA);
+        SelectObject(dc,old);DeleteObject(bitmap);DeleteDC(dc);ShowWindow(drag_ghost,SW_SHOWNOACTIVATE);drag_layers();
+    }
+    void move_drag_visual(POINT point){
+        if(drag_ghost){POINT screen=point;ClientToScreen(panel,&screen);SetWindowPos(drag_ghost,HWND_TOPMOST,screen.x-drag_anchor.x,screen.y-drag_anchor.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);}
+        composition.drag_slot(pressed_card,drop_slot<0?-1:drop_slot+1,scroll,tile_stride());
     }
     void reorder_peer(const std::string& id,int slot){
         auto next=peers;const auto it=std::find_if(next.begin(),next.end(),[&](const Peer& p){return p.id==id;});if(it==next.end())return;
@@ -111,9 +146,20 @@ struct Shell::Impl {
         const LONG w=r.right-r.left,h=r.bottom-r.top;r.left=std::clamp(r.left,work_area.left,std::max(work_area.left,work_area.right-w));r.top=std::clamp(r.top,work_area.top,std::max(work_area.top,work_area.bottom-h));
         SetWindowPos(viewer,nullptr,r.left,r.top,w,h,SWP_NOZORDER|SWP_NOACTIVATE);
     }
+    void request_viewer_layout(){
+        if(!viewer_layout_pending&&owner)viewer_layout_pending=PostMessageW(owner,ViewerLayoutMessage,0,0)!=FALSE;
+    }
     void sync_viewer_ui(){
+        viewer_layout_pending=false;
         if(!viewer)return;
-        if(waiting_visible&&!IsIconic(viewer)){const auto r=viewer_client();SetWindowPos(waiting,HWND_TOP,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_SHOWWINDOW);try{paint_waiting(false);}catch(const std::exception&){local(true);}}
+        if(waiting_visible&&!IsIconic(viewer)){
+            const auto r=viewer_client();SetWindowPos(waiting,HWND_TOP,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+            const auto width=ULONG_PTR(r.right-r.left),height=ULONG_PTR(r.bottom-r.top);
+            // Moving the HWND needs no GPU upload. Also preserve an in-progress
+            // first-frame fade instead of restarting its opaque cover on move.
+            if(!waiting_fading&&(ULONG_PTR(GetPropW(waiting,L"HiveDesk.SurfaceWidth"))!=width||ULONG_PTR(GetPropW(waiting,L"HiveDesk.SurfaceHeight"))!=height))
+                try{paint_waiting(false);}catch(const std::exception&){local(true);}
+        }
         else if(waiting_visible)ShowWindow(waiting,SW_HIDE);
         publish_input();
     }
@@ -189,8 +235,8 @@ struct Shell::Impl {
         RECT bounds{0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};
         if(windowed){
             RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
-            int w=std::min(px(1100),int((work_area.right-work_area.left)*.72)),h=int(w/window_ratio);
-            if(h>(work_area.bottom-work_area.top)*.75){h=int((work_area.bottom-work_area.top)*.75);w=int(h*window_ratio);}
+            int w=int((work_area.right-work_area.left)*.84),h=int(w/window_ratio);
+            if(h>(work_area.bottom-work_area.top)*.84){h=int((work_area.bottom-work_area.top)*.84);w=int(h*window_ratio);}
             bounds={0,0,w,h};AdjustWindowRectExForDpi(&bounds,style,FALSE,WS_EX_APPWINDOW,UINT(dpi));
             w=bounds.right-bounds.left;h=bounds.bottom-bounds.top;
             bounds.left=std::clamp(drop.x-w/2,work_area.left,std::max(work_area.left,work_area.right-w));bounds.top=std::clamp(drop.y-px(24),work_area.top,std::max(work_area.top,work_area.bottom-h));bounds.right=bounds.left+w;bounds.bottom=bounds.top+h;
@@ -208,7 +254,7 @@ struct Shell::Impl {
             next_composition.cover(float(GetSystemMetrics(SM_CXSCREEN)),float(GetSystemMetrics(SM_CYSCREEN)),false,true);
         }catch(const std::exception&){DestroyWindow(next);return false;}
         auto surface=std::make_shared<const ViewerSurface>(ViewerSurface{next,peer});
-        if(!IsWindowVisible(viewer)&&!remote)prior_focus=GetForegroundWindow();
+        if(!IsWindowVisible(viewer)&&!remote&&GetForegroundWindow()!=panel)prior_focus=GetForegroundWindow();
         ShowWindow(viewer,SW_HIDE);
         // The waiting HWND also retains its previous snapshot/fade in DWM.
         // Give it a fresh target, rather than racing a reset commit against Show.
@@ -445,7 +491,7 @@ struct Shell::Impl {
         // connection. Commit this image and its new clips/opacity together.
         if(!paint_panel(false)){hide_panel();return;}
         try{composition.show(float(panel_width),float(panel_height),float(previous_height),entering,reversing);
-            if(hotkey&&entering){std::vector<RECT> cards;for(int i=scroll;i<=int(peers.size())&&i<scroll+visible_tiles();++i){const int y=px(12)+(i-scroll)*tile_stride();cards.push_back({px(12),y,panel_width-px(12),y+tile_height()});}composition.reveal_cards(cards,RGB(GetRValue(accent)*16/100,GetGValue(accent)*16/100,GetBValue(accent)*16/100));}
+            if(hotkey&&entering)composition.reveal_cards(visible_cards(),RGB(GetRValue(accent)*16/100,GetGValue(accent)*16/100,GetBValue(accent)*16/100));
         }
         catch(const std::exception&){hide_panel();return;}
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
@@ -512,7 +558,7 @@ struct Shell::Impl {
             if(dragging&&p.x>=0&&p.x<panel_width&&now-last_drag_scroll>=120){
                 const int direction=p.y<px(36)?-1:p.y>panel_height-px(36)?1:0;
                 const int next=std::clamp(scroll+direction,0,std::max(0,int(peers.size())+1-visible_tiles()));
-                if(next!=scroll){scroll=next;drop_slot=std::clamp(int((p.y-px(12)+tile_stride()/2)/tile_stride())+scroll-1,0,int(peers.size()));InvalidateRect(panel,nullptr,FALSE);}last_drag_scroll=now;
+                if(next!=scroll){scroll=next;drop_slot=std::clamp(int((p.y-px(12)+tile_stride()/2)/tile_stride())+scroll-1,0,int(peers.size()));composition.finish_cards(false);paint_panel(false);drag_layers();move_drag_visual(p);}last_drag_scroll=now;
             }return;
         }
         if(!panel_summoned&&(p.x<0||p.x>panel_width+px(40)||p.y<0||p.y>panel_height+px(30))) {if(!outside_since)outside_since=now;if(now-outside_since>250)hide_panel(true);}else outside_since=0;
@@ -566,8 +612,8 @@ struct Shell::Impl {
         };
         if(panel_mode==1)card(preview_index(),px(12));
         else for(int i=scroll;i<=static_cast<int>(peers.size())&&i<scroll+visible_tiles();++i)card(i,px(12)+(i-scroll)*tile_stride());
-        if(dragging&&drop_slot>=0){const int y=px(12)+(drop_slot+1-scroll)*tile_stride()-px(8);fill(dc,{px(12),y,panel_width-px(12),y+px(3)},accent);}
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
+        panel_pixels.assign(rgba,rgba+size_t(width)*height);pixels_width=width;pixels_height=height;
         bool rendered=false;
         try{composition.present(pixels,width,height,commit);rendered=true;}
         catch(const std::exception&){
@@ -699,6 +745,7 @@ struct Shell::Impl {
         Impl* s=reinterpret_cast<Impl*>(GetWindowLongPtrW(window,GWLP_USERDATA));
         if(message==WM_NCCREATE){s=static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(s));}
         if(!s)return DefWindowProcW(window,message,w,l);
+        if(window==s->drag_ghost){if(message==WM_NCHITTEST)return HTTRANSPARENT;if(message==WM_MOUSEACTIVATE)return MA_NOACTIVATE;}
         if(message==WM_CLOSE&&window!=s->viewer&&std::any_of(s->retired_viewers.begin(),s->retired_viewers.end(),
             [window](const auto& surface){return surface->window==window;}))return 0;
         if(window==s->health_badge) {
@@ -727,6 +774,7 @@ struct Shell::Impl {
             }
             case KickControllerMessage:if(!s->shutting_down&&s->callbacks.kick_controller)s->callbacks.kick_controller();return 0;
             case WM_COPYDATA:return s->settings_command(w,reinterpret_cast<const COPYDATASTRUCT*>(l));
+            case ViewerLayoutMessage:s->sync_viewer_ui();return 0;
             case WM_APP+44:return s->relative_mode?1:0;
             case WM_APP+45:s->settings_ui();return 0;
             case WM_APP+46:return s->hotkey_registered?1:0;
@@ -755,6 +803,8 @@ struct Shell::Impl {
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};s->cancel_drag();s->pressed_card=s->card_at(p);s->drag_origin=p;
                 if(s->pressed_card>0)s->dragged_peer=s->peers[s->pressed_card-1].id;
                 if(s->pressed_card>=0){
+                    const int top=s->px(12)+(s->panel_mode==1?0:s->pressed_card-s->scroll)*s->tile_stride();
+                    s->drag_anchor={p.x-s->px(12),p.y-top};
                     // Background/no-activate windows cannot retain capture
                     // outside their bounds. Activate only for the gesture.
                     s->drag_focus=GetForegroundWindow();SetForegroundWindow(window);SetCapture(window);s->composition.finish_cards();s->publish_input();
@@ -763,27 +813,31 @@ struct Shell::Impl {
             case WM_CAPTURECHANGED:case WM_CANCELMODE:s->cancel_drag();return 0;
             case WM_MOUSEMOVE:{
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
-                if(s->pressed_card>0&&!s->dragging&&(abs(p.x-s->drag_origin.x)>=GetSystemMetrics(SM_CXDRAG)||abs(p.y-s->drag_origin.y)>=GetSystemMetrics(SM_CYDRAG))){s->dragging=true;if(s->panel_mode==1)s->show_panel(2);}
+                if(s->pressed_card>0&&!s->dragging&&(abs(p.x-s->drag_origin.x)>=GetSystemMetrics(SM_CXDRAG)||abs(p.y-s->drag_origin.y)>=GetSystemMetrics(SM_CYDRAG))){s->dragging=true;if(s->panel_mode==1)s->show_panel(2);s->begin_drag_visual();}
                 if(s->dragging){
                     const bool outside=p.x>=s->panel_width;
                     s->drop_slot=outside?-1:std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
-                    SetCursor(LoadCursorW(nullptr,outside?IDC_SIZEALL:IDC_SIZENS));InvalidateRect(window,nullptr,FALSE);return 0;
+                    SetCursor(LoadCursorW(nullptr,outside?IDC_SIZEALL:IDC_SIZENS));s->move_drag_visual(p);return 0;
                 }
                 int h=s->card_at(p);if(h!=s->hovered){s->hovered=h;InvalidateRect(window,nullptr,FALSE);}return 0;
             }
             case WM_LBUTTONUP:{
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};const bool dragged=s->dragging;const auto id=s->dragged_peer;const int slot=std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
-                const int pressed=s->pressed_card,index=s->card_at(p);s->cancel_drag();
+                const int pressed=s->pressed_card,index=s->card_at(p);
+                const bool opening=(dragged&&p.x>=s->panel_width)||(!dragged&&pressed>0&&pressed==index&&index<=int(s->peers.size())&&s->peers[index-1].id==id);
+                if(opening&&s->drag_focus&&s->drag_focus!=s->viewer)s->prior_focus=s->drag_focus;
+                s->cancel_drag(!opening,false);
                 if(dragged){
                     if(p.x>=s->panel_width){ClientToScreen(window,&p);s->select(id,true,p);}
-                    else if(slot>=0&&p.x>=0&&p.y>=0&&p.y<s->panel_height)s->reorder_peer(id,slot);
+                    else {if(slot>=0&&p.x>=0&&p.y>=0&&p.y<s->panel_height)s->reorder_peer(id,slot);s->paint_panel();}
                 }else if(pressed>=0&&pressed==index){
                     if(index==0)s->select({});else if(index>0&&index<=int(s->peers.size())&&s->peers[index-1].id==id)s->select(id);
                 }
                 return 0;
             }
             case WM_RBUTTONUP:s->tray_menu();return 0;
-            case WM_MOUSEWHEEL:{s->composition.finish_cards();int visible=s->visible_tiles();s->scroll=std::clamp(s->scroll-GET_WHEEL_DELTA_WPARAM(w)/WHEEL_DELTA,0,std::max(0,static_cast<int>(s->peers.size())+1-visible));InvalidateRect(window,nullptr,FALSE);return 0;}
+            case WM_MOUSEWHEEL:{s->composition.finish_cards();int visible=s->visible_tiles();s->scroll=std::clamp(s->scroll-GET_WHEEL_DELTA_WPARAM(w)/WHEEL_DELTA,0,std::max(0,static_cast<int>(s->peers.size())+1-visible));
+                if(s->dragging){s->paint_panel(false);s->drag_layers();POINT p{};GetCursorPos(&p);ScreenToClient(window,&p);s->move_drag_visual(p);}else InvalidateRect(window,nullptr,FALSE);return 0;}
             }
         }
         if(window==s->settings) {
@@ -831,7 +885,10 @@ struct Shell::Impl {
                 }
             }break;
             case WM_SYSCOMMAND:if(s->windowed&&(w&0xfff0)==SC_MAXIMIZE)return 0;break;
-            case WM_MOVE:case WM_SIZE:s->sync_viewer_ui();break;
+            // DXGI sends these synchronously while holding graphics locks.
+            // Never enter DComp/BeginDraw from that nested message: the DXGI
+            // worker cannot release its lock until this handler returns.
+            case WM_MOVE:case WM_SIZE:s->request_viewer_layout();break;
             case WM_CLOSE:s->local(true);return 0;case WM_ERASEBKGND:return 1;case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(window,&ps);EndPaint(window,&ps);return 0;}}
         }
         return DefWindowProcW(window,message,w,l);
@@ -846,7 +903,7 @@ struct Shell::Impl {
         debug_font=CreateFontW(-px(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Consolas");
         small_font=CreateFontW(-px(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
         title_font=CreateFontW(-px(24),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-        for(const wchar_t* name:{L"HiveDesk.Owner",L"HiveDesk.Viewer",L"HiveDesk.Switcher",L"HiveDesk.Settings",L"HiveDesk.Health",L"HiveDesk.Waiting"}) {
+        for(const wchar_t* name:{L"HiveDesk.Owner",L"HiveDesk.Viewer",L"HiveDesk.Switcher",L"HiveDesk.Settings",L"HiveDesk.Health",L"HiveDesk.Waiting",L"HiveDesk.Drag"}) {
             WNDCLASSEXW c{};c.cbSize=sizeof(c);c.lpfnWndProc=window_proc;c.hInstance=instance;c.hCursor=LoadCursorW(nullptr,IDC_ARROW);c.hbrBackground=background_brush;c.lpszClassName=name;c.hIcon=app_icon;c.hIconSm=app_small_icon;
             if(!RegisterClassExW(&c)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS){error="Could not register native UI classes.";return false;}
         }

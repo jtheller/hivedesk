@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
-project(HiveDesk VERSION 0.3.0 LANGUAGES CXX)
-set(HIVEDESK_VERSION "0.3.0")
+project(HiveDesk VERSION 0.3.1 LANGUAGES CXX)
+set(HIVEDESK_VERSION "0.3.1")
 add_compile_definitions(HIVEDESK_VERSION="${HIVEDESK_VERSION}")
 enable_language(RC)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -174,3 +174,11 @@ target_link_libraries(HiveDeskShellSmoke PRIVATE hive_core user32 gdi32 shell32 
 add_executable(HiveDeskDebugSmoke tests/debug_overlay.cpp src/shell.cpp)
 target_include_directories(HiveDeskDebugSmoke PRIVATE include)
 target_link_libraries(HiveDeskDebugSmoke PRIVATE hive_core user32 gdi32 shell32 dwmapi dcomp d2d1 d3d11 msimg32)
+
+add_executable(HiveDeskShellVideoCheck tests/shell_video.cpp src/shell.cpp)
+target_link_libraries(HiveDeskShellVideoCheck PRIVATE hive_core shell32 dcomp d2d1 msimg32)
+add_test(NAME shell_video COMMAND HiveDeskShellVideoCheck)
+set_tests_properties(shell_video PROPERTIES TIMEOUT 35)
+# Explicit no-input/no-activation generated-content probe, requires visible DWM.
+add_executable(HiveDeskPresentationCheck tests/presentation.cpp)
+target_link_libraries(HiveDeskPresentationCheck PRIVATE hive_core dcomp d2d1)

@@ -46,6 +46,9 @@ int probe(){
         waiting=find(L"HiveDesk.Waiting");
     };
     shell.update_thumbnail("a",image(80));select(1);
+    const auto initial_revision=GetPropW(waiting,L"HiveDesk.SurfaceRevision");
+    SendMessageW(shell.viewer_window(),WM_SIZE,SIZE_RESTORED,0);
+    require(GetPropW(waiting,L"HiveDesk.SurfaceRevision")==initial_revision,"Synchronous DXGI size notification reentered GPU composition");
     require(selected==1&&shown(waiting)&&title(waiting).find(L"Computer A")!=std::wstring::npos&&title(waiting).find(L"Snapshot")!=std::wstring::npos,"A cached snapshot was not shown immediately");
     select(2);
     require(selected==2&&shown(waiting)&&title(waiting).find(L"Computer B")!=std::wstring::npos&&title(waiting).find(L"Snapshot")==std::wstring::npos,"B reused A's snapshot");
@@ -111,7 +114,11 @@ int probe(){
     const auto drag=[&](int row,int x,int y){
         SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(row)));
         SendMessageW(panel,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(x,y));
+        const auto ghost=find(L"HiveDesk.Drag");RECT ghost_rect{};GetWindowRect(ghost,&ghost_rect);
+        require(ghost&&shown(ghost)&&ghost_rect.right-ghost_rect.left==px(200)-2*px(12),"Dragging has no visible snapshot ghost");
+        require((GetWindowLongW(ghost,GWL_EXSTYLE)&(WS_EX_NOACTIVATE|WS_EX_TRANSPARENT))==(WS_EX_NOACTIVATE|WS_EX_TRANSPARENT),"Drag ghost intercepts focus/input");
         SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(x,y));
+        require(!IsWindow(ghost),"Drop leaked the drag visual");
     };
     SendMessageW(owner,WM_HOTKEY,81,0);
     BOOL animations=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
@@ -140,6 +147,8 @@ int probe(){
     require((style&WS_THICKFRAME)&&(style&WS_CAPTION)&&!(style&WS_MAXIMIZEBOX),"Floating viewer is not a resizable framed window");
     RECT client{},outer{};GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
     require(std::abs(double(client.right)/client.bottom-1.6)<.01,"Window did not use the native snapshot aspect");
+    RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
+    require(client.right>=(work_area.right-work_area.left)*.6&&client.bottom>=(work_area.bottom-work_area.top)*.6,"Floating viewer opened as a tiny window");
     shell.set_remote_size(1080,1920);GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
     require(std::abs(double(client.right)/client.bottom-.5625)<.01,"First frame did not correct the provisional window aspect");
     const LONG fx=outer.right-outer.left-client.right,fy=outer.bottom-outer.top-client.bottom;
@@ -153,6 +162,10 @@ int probe(){
     }
     SetWindowPos(floating->window,nullptr,px(300),px(140),px(480),px(400),SWP_NOZORDER|SWP_NOACTIVATE);
     GetClientRect(floating->window,&client);require(std::abs(double(client.right)/client.bottom-.5625)<.01,"Programmatic/snap resize bypassed aspect constraint");
+    const auto revision=GetPropW(waiting,L"HiveDesk.SurfaceRevision");
+    SendMessageW(floating->window,WM_SIZE,SIZE_RESTORED,0);
+    require(GetPropW(waiting,L"HiveDesk.SurfaceRevision")==revision,"Synchronous DXGI size notification reentered GPU composition");
+    pump(20); // Layout is deliberately deferred out of synchronous DXGI messages.
     POINT origin{};ClientToScreen(floating->window,&origin);RECT cover{};GetWindowRect(waiting,&cover);GetClientRect(floating->window,&client);
     require(cover.left==origin.x&&cover.top==origin.y&&cover.right-cover.left==client.right&&cover.bottom-cover.top==client.bottom,"Waiting snapshot did not follow the floating client area");
     shell.show_remote("b",L"Computer B",30,floating->window);pump(260);

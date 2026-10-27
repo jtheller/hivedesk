@@ -42,6 +42,7 @@ public:
             const std::lock_guard lock(view_intent_mutex_);
             if(updating_)return;
             const auto epoch=++generation_;
+            hive::log("Viewer selection queued: "+peer+" generation="+std::to_string(epoch));
             request_snapshot(peer);
             enqueue([this,peer,epoch]{
                 if(epoch!=generation_)return;
@@ -475,6 +476,7 @@ private:
     }
     void select(std::string peer,uint64_t epoch) {
         if(epoch!=generation_||closing_)return;
+        hive::log("Viewer startup: "+peer+" generation="+std::to_string(epoch));
         request_snapshot(peer);
         go_local(active_.exchange(nullptr),false);
         remote_size_=0;received_frames_=0;
@@ -498,12 +500,14 @@ private:
         active_connection_=transport_.connection_token(peer);if(!active_connection_)return;
         {const std::lock_guard lock(view_mutex_);
             view_surface_=shell_.viewer_surface();
-            if(!view_surface_||view_surface_->peer!=peer)return;
+            if(!view_surface_||view_surface_->peer!=peer){status("Viewer selection changed before startup; waiting for the current selection.");return;}
+            hive::log("Viewer creating graphics: "+peer);
             if(!viewer_.open(view_surface_->window,error,
             [this,peer,epoch](const hive::CursorPresentation& cursor){
                 if(epoch==generation_&&!closing_)
                     shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
             })){status("Viewer failed: "+error);return;}}
+        hive::log("Viewer graphics ready: "+peer);
         if(epoch!=generation_||closing_) {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();return;}
         // The control stream delivers clipboard before Start/InputEnable. The
         // separate input lane is armed only after that handoff has completed.
@@ -523,6 +527,7 @@ private:
         telemetry_.select(MonitorSide::View,peer,stream.session,hive::narrow(label));
         if(!transport_.request_stream(peer,stream)) {go_local(active_.exchange(nullptr),false);status("Could not request desktop stream; retrying.");return;}
         if(active_dedicated_input_&&!transport_.begin_input(peer,stream.session)) {go_local(active_.exchange(nullptr),false);status("Could not initialize dedicated input; retrying.");return;}
+        hive::log("Viewer stream requested: "+peer+" session="+std::to_string(stream.session));
         auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);
         auto received_bytes=transport_.received_video_bytes(peer);
         bool ready=false;std::string failure;
