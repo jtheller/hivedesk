@@ -946,6 +946,7 @@ uint64_t Transport::connection_token(const std::string& peer) const {
     return pair.control->token;
 }
 bool Transport::request_stream(const std::string& peer, const StreamSettings& s) {
+    if(s.warm&&!s.session)return false; // Never downgrade prewarming to legacy control Start.
     if(s.session){auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||s.receiver_millihz<1000||s.receiver_millihz>2000000)return false;
         if(s.warm&&!(c->peer.features&FeatureWarmStream))return false;
         Bytes b{uint8_t(s.warm?WarmStart:AutoStart)};u64(b,s.session);u32(b,s.receiver_millihz);return c->enqueue(std::move(b));}
@@ -1870,7 +1871,8 @@ bool Transport::self_test(std::string& result) {
         }
     }
     StreamSettings warm_settings;warm_settings.session=919;warm_settings.receiver_millihz=100000;warm_settings.warm=true;
-    ok=a.request_stream("test-b",warm_settings)&&a.cancel_warm("test-b",919)&&!a.cancel_warm("test-b",0)&&ok;
+    auto invalid_warm=warm_settings;invalid_warm.session=0;
+    ok=!a.request_stream("test-b",invalid_warm)&&a.request_stream("test-b",warm_settings)&&a.cancel_warm("test-b",919)&&!a.cancel_warm("test-b",0)&&ok;
     {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_warm&&got_warm_cancel;})&&ok;}
     std::wstring oversized(kMaxClipboard/2+1,L'x'), malformed(1,wchar_t(0xd800));
     ok=ok&&!a.request_stream("test-b",{0,0,0,1})&&!a.request_stream("test-b",{0,0,2000001,1})&&
