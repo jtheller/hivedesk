@@ -29,6 +29,7 @@ constexpr uint32_t FeatureHostKick = 16;
 constexpr uint32_t FeatureAutoRate = 64;
 constexpr uint32_t FeatureDedicatedInput = 128;
 constexpr uint32_t FeatureFrameTiming = 256;
+constexpr uint32_t FeatureCursorComposition = 512;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 struct Snapshot { uint64_t request = 0; std::vector<uint8_t> jpeg; };
@@ -102,6 +103,10 @@ struct ViewerDiagnostics {
     uint32_t service_sample_age_us=UINT32_MAX,receive_sample_age_us=UINT32_MAX,transit_extra_us=0;
     uint64_t sequence_gaps=0,age_expired=0,queue_overflows=0;
 };
+enum class CursorComposition : uint8_t { Unknown=0, Separate=1, NoSeparate=2 };
+inline bool valid_cursor_composition(CursorComposition value) {
+    return value==CursorComposition::Unknown||value==CursorComposition::Separate||value==CursorComposition::NoSeparate;
+}
 struct EncodedFrame {
     std::vector<uint8_t> data;
     uint32_t width = 0;
@@ -114,6 +119,9 @@ struct EncodedFrame {
     // Zero means the legacy capture-to-arrival freshness policy. This must not
     // be restamped by the broker or transport after waiting in their queues.
     uint64_t source_ready_us = 0;
+    // Describes this image, never the newest asynchronously sampled cursor.
+    // Unknown preserves the separate-cursor behavior of legacy peers.
+    CursorComposition cursor_composition = CursorComposition::Unknown;
 };
 // Allow bounded, intrinsic GPU work without confusing it with queued playback.
 // A one-second source job remains an absolute upper bound, never permission to

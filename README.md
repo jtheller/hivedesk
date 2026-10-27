@@ -5,6 +5,11 @@ Windows-native personal LAN desktop switching. This is an early hardware-tested 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+Alpha.34 fixes duplicate cursor rendering when Windows includes the pointer in
+the captured desktop. Cursor composition follows each encoded image and is
+applied after successful presentation, including dropped frames and display
+backpressure. Update both computers; older peers retain their prior behavior.
+
 Alpha.32 adds **Check for updates** beside the Settings version. It verifies the
 latest signed release immediately and requests an earlier automatic update check
 when a newer version is available. Installation still waits for idle connections.

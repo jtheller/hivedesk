@@ -5,6 +5,11 @@
 #include <memory>
 #include <string>
 namespace hive {
+struct CursorPresentation {
+    uint64_t session=0,sequence=0;
+    CursorComposition composition=CursorComposition::Unknown;
+    bool valid=false;
+};
 class MediaHost {
 public:
     MediaHost(); ~MediaHost();
@@ -24,11 +29,13 @@ class MediaViewer {
 public:
     MediaViewer(); ~MediaViewer();
     // HWND belongs to UI; decoder/rendering must not depend on UI message pumping.
-    bool open(HWND window, std::string& error);
+    bool open(HWND window, std::string& error,
+        std::function<void(const CursorPresentation&)> presented={});
     void submit(EncodedFrame frame);
     void close();
     std::string stats() const;
     bool has_frame() const;
+    CursorPresentation cursor_presentation() const;
     StreamFeedback feedback() const;
     ViewerDiagnostics diagnostics() const;
 private: struct Impl; std::unique_ptr<Impl> impl_;

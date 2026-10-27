@@ -470,7 +470,11 @@ private:
         const bool automatic=negotiated!=connected_peers.end()&&(negotiated->features&hive::FeatureAutomaticStream);
         std::string error;
         active_connection_=transport_.connection_token(peer);if(!active_connection_)return;
-        {const std::lock_guard lock(view_mutex_);if(!viewer_.open(shell_.viewer_window(),error)){status("Viewer failed: "+error);return;}}
+        {const std::lock_guard lock(view_mutex_);if(!viewer_.open(shell_.viewer_window(),error,
+            [this,peer,epoch](const hive::CursorPresentation& cursor){
+                if(epoch==generation_&&!closing_)
+                    shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
+            })){status("Viewer failed: "+error);return;}}
         if(epoch!=generation_||closing_) {const std::lock_guard lock(view_mutex_);viewer_.close();return;}
         // The control stream delivers clipboard before Start/InputEnable. The
         // separate input lane is armed only after that handoff has completed.
@@ -512,6 +516,11 @@ private:
             const std::lock_guard lock(view_intent_mutex_);
             if(epoch==generation_&&!closing_&&view_control_&&view_control_->session==stream.session){
                 view_ready_=true;reconnect_.connected();shell_.show_remote(peer,label,stream.session);
+                // A successful first present can precede the queued UI session
+                // switch. Replay after show_remote; sequence guards reject any
+                // replay overtaken by a newer presentation callback.
+                const auto cursor=viewer_.cursor_presentation();
+                if(cursor.valid)shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
                 status("Viewing "+hive::narrow(label)+" | HEVC 4:4:4 | Ctrl+Alt+` returns here");
                 return;
             }

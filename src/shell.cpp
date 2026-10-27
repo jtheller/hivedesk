@@ -4,6 +4,7 @@
 #include <optional>
 #include "hivedesk/network_key.h"
 #include "hivedesk/desktop_aux.h"
+#include "hivedesk/cursor_composition.h"
 #include "hivedesk/adaptive.h"
 #include "hivedesk/auto_rate.h"
 #include "hivedesk/gpu_policy_restart.h"
@@ -79,6 +80,7 @@ struct Shell::Impl {
     bool cursor_sent=false,sent_cursor_visible=false,remote_cursor_visible=true,remote_cursor_received=false;
     uint64_t pointer_revision=1,sent_pointer_revision=0,remote_pointer_revision=0;
     CursorState remote_pointer;
+    PresentedCursorComposition remote_cursor_composition;
     POINT physical_pointer{};
     ULONGLONG last_local_motion=0;
     InputCapture input_capture;uint64_t input_session=0,last_capture_pointer_revision=0;
@@ -144,11 +146,16 @@ struct Shell::Impl {
         stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;debug_pulses={};slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
         SetCursor(LoadCursorW(nullptr,IDC_ARROW));if(remote_cursor)DestroyCursor(remote_cursor);
         remote_cursor=nullptr;remote_cursor_visible=true;remote_cursor_received=false;remote_pointer_revision=0;remote_pointer={};
+        remote_cursor_composition.reset();
+    }
+    HCURSOR selected_remote_cursor() const {
+        return remote_cursor_composition.visible(remote_cursor_visible,relative_mode)?
+            (remote_cursor?remote_cursor:LoadCursorW(nullptr,IDC_ARROW)):nullptr;
     }
     void apply_remote_cursor() {
         POINT point{};GetCursorPos(&point);
         if(remote&&WindowFromPoint(point)==viewer)
-            SetCursor(relative_mode||!remote_cursor_visible?nullptr:remote_cursor?remote_cursor:LoadCursorW(nullptr,IDC_ARROW));
+            SetCursor(selected_remote_cursor());
     }
     void apply_remote_position() {
         sample_physical_pointer();
@@ -210,6 +217,7 @@ struct Shell::Impl {
         reconnecting=false;InvalidateRect(health_badge,nullptr,FALSE);
         if(active_id!=id)previous_id=active_id;
         if(!remote&&!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
+        if(!remote||active_id!=id||input_session!=session)remote_cursor_composition.reset(session);
         active_id=id;input_session=session;remote=true;SetWindowTextW(viewer,(L"HiveDesk - "+label).c_str());
         SetWindowPos(viewer,HWND_TOP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),SWP_SHOWWINDOW);
         SetForegroundWindow(viewer);SetFocus(viewer);confine_mouse();hide_panel();apply_remote_position();apply_remote_cursor();
@@ -224,6 +232,7 @@ struct Shell::Impl {
     }
     void set_relative(bool enabled) {
         relative_mode=enabled&&raw_mouse_available;confine_mouse();
+        apply_remote_cursor();
         publish_input();
         status=relative_mode?L"Relative mouse on. Ctrl+Alt+` returns locally.":L"Absolute desktop mouse";
         InvalidateRect(panel,nullptr,FALSE);
@@ -701,13 +710,23 @@ void Shell::update_input_diagnostics(const std::string& peer,const InputDiagnost
 void Shell::update_cursor(const std::string& peer,CursorState cursor) {
     impl_->dispatch([s=impl_,peer,cursor=std::move(cursor)] {
         if(peer!=s->pending_id&&peer!=s->active_id)return;
+        HCURSOR next=nullptr;
         if(cursor.width) {
-            HCURSOR next=make_cursor(cursor);if(!next)return;
-            HCURSOR old=s->remote_cursor;s->remote_cursor=next;
-            if(old){if(GetCursor()==old)SetCursor(next);DestroyCursor(old);}
+            next=make_cursor(cursor);if(!next)return;
         }
         s->remote_cursor_visible=cursor.visible;s->remote_cursor_received=true;s->remote_pointer=cursor;
+        if(next) {
+            HCURSOR old=s->remote_cursor;s->remote_cursor=next;
+            if(old){if(GetCursor()==old)SetCursor(s->selected_remote_cursor());DestroyCursor(old);}
+        }
         s->apply_remote_position();s->apply_remote_cursor();
+    });
+}
+void Shell::update_cursor_composition(const std::string& peer,uint64_t session,uint64_t sequence,CursorComposition mode) {
+    const auto generation=impl_->generation.load();
+    impl_->dispatch([s=impl_,peer,session,sequence,mode,generation] {
+        if(generation!=s->generation.load()||!s->remote||s->reconnecting||peer!=s->active_id||session!=s->input_session)return;
+        if(s->remote_cursor_composition.present(session,sequence,mode))s->apply_remote_cursor();
     });
 }
 }

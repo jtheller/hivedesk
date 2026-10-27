@@ -6,9 +6,12 @@
 #include <filesystem>
 #include <cstring>
 #include <atomic>
+#include <utility>
 namespace hive::broker {
 using Bytes=std::vector<uint8_t>;
-constexpr uint32_t Magic=0x48425631,MaxBytes=16*1024*1024+128;
+// Frame layout changed with image-associated cursor composition. Refuse a
+// mixed install rather than treating metadata bytes as compressed image data.
+constexpr uint32_t Magic=0x48425632,MaxBytes=16*1024*1024+128;
 enum Kind:uint32_t {Start=1,Ready=2,Input=3,Feedback=4,Keyframe=5,Frame=6,Health=7,Started=8,Failure=9,Notice=10,Diagnostics=11,InputStart=12,InputStarted=13,InputComplete=14};
 inline std::wstring pipe_name(DWORD session){return L"\\\\.\\pipe\\HiveDesk.Host."+std::to_wstring(session);}
 inline std::wstring input_pipe_name(DWORD session){return L"\\\\.\\pipe\\HiveDesk.Input."+std::to_wstring(session);}
@@ -20,6 +23,24 @@ struct Reader {const Bytes& data;size_t at=0;bool good=true;
     uint64_t u64(){const auto low=u32();return low|(uint64_t(u32())<<32);}
     bool end()const{return good&&at==data.size();}
 };
+inline Bytes write_frame(const EncodedFrame& frame){
+    Bytes bytes;bytes.reserve(frame.data.size()+48);
+    u32(bytes,frame.width);u32(bytes,frame.height);u64(bytes,frame.sequence);u64(bytes,frame.capture_time_us);
+    u64(bytes,frame.session);u32(bytes,frame.keyframe?1:0);u64(bytes,frame.source_ready_us);
+    u32(bytes,uint32_t(frame.cursor_composition));bytes.insert(bytes.end(),frame.data.begin(),frame.data.end());return bytes;
+}
+inline bool read_frame(const Bytes& bytes,EncodedFrame& result){
+    Reader reader{bytes};EncodedFrame frame;
+    frame.width=reader.u32();frame.height=reader.u32();frame.sequence=reader.u64();frame.capture_time_us=reader.u64();
+    frame.session=reader.u64();const auto key=reader.u32();frame.keyframe=key!=0;frame.source_ready_us=reader.u64();
+    const auto composition=reader.u32();
+    // Check the full wire integer before narrowing to the enum's byte.
+    if(!reader.good||!frame.width||!frame.height||frame.width>8192||frame.height>8192||key>1||
+        composition>uint32_t(CursorComposition::NoSeparate)||reader.at==bytes.size()||
+        bytes.size()-reader.at>16*1024*1024||!valid_frame_timing(frame))return false;
+    frame.cursor_composition=CursorComposition(composition);
+    frame.data.assign(bytes.begin()+reader.at,bytes.end());result=std::move(frame);return true;
+}
 // Overlapped I/O with an explicit cancellation flag avoids a stop/ReadFile race
 // and unbounded joins when a peer stops consuming a large encoded frame.
 inline bool transfer(HANDLE pipe,void* data,size_t bytes,bool write,const std::atomic<bool>* cancel){

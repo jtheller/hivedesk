@@ -108,7 +108,7 @@ struct Session {
     bool start_media(std::string& error){
         captured_desktop=input_desktop_name();credit=true;
         return media.start(settings,[this](EncodedFrame frame){
-            broker::Bytes b;broker::u32(b,frame.width);broker::u32(b,frame.height);broker::u64(b,frame.sequence);broker::u64(b,frame.capture_time_us);broker::u64(b,frame.session);broker::u32(b,frame.keyframe?1:0);broker::u64(b,frame.source_ready_us);b.insert(b.end(),frame.data.begin(),frame.data.end());
+            const auto b=broker::write_frame(frame);
             credit=false;if(!send(broker::Frame,b))throw std::runtime_error("Local viewer pipe closed");
         },error,[this]{return !stopping&&credit.load();},[this](const StreamHealth& h){broker::Bytes b;broker::u64(b,h.session);broker::u32(b,h.target_millihz);broker::u32(b,h.rate_millihz);broker::u32(b,h.pressure);status_mailbox.publish(broker::Health,std::move(b));},[this](const SourceDiagnostics& d){broker::Bytes b;broker::u64(b,d.session);broker::u32(b,d.encoded_millihz);broker::u32(b,d.encode_us);broker::u32(b,d.capture_wait_us);broker::u32(b,d.send_wait_us_per_second);broker::u32(b,d.feedback_age_us);broker::u32(b,d.network_extra_us);broker::u32(b,d.color_us);broker::u32(b,d.nvenc_us);broker::u32(b,d.encode_age_us);if(d.rate_details)rate_wire::write_diagnostics(d,[&](uint32_t n){broker::u32(b,n);},[&](uint64_t n){broker::u64(b,n);});status_mailbox.publish(broker::Diagnostics,std::move(b));});
     }

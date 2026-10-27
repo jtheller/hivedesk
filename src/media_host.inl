@@ -227,7 +227,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                     }
                     bool submitted=false,completion_queued=false;
                     const auto sequence=impl_->sequence.next();
-                    try{submitted=encoder.submit_texture(capture.texture(),sequence,forced||sequence==0,now_us(),&completion_queued);}
+                    try{submitted=encoder.submit_texture(capture.texture(),sequence,forced||sequence==0,now_us(),&completion_queued,capture.cursor_composition());}
                     catch(...){if(completion_queued)impl_->sequence.submitted();else{std::lock_guard lock(impl_->wait_mutex);completed.cancel_completion();}throw;}
                     if(submitted){
                         impl_->sequence.submitted();if(forced)last_keyframe=Clock::now();deadline=advance_frame_deadline(deadline,capture_started,interval);

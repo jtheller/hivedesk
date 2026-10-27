@@ -53,6 +53,7 @@ public:
     void update_thumbnail(const std::string& peer, Thumbnail);
     void observe_cursor(const std::string& controller);
     void update_cursor(const std::string& peer, CursorState);
+    void update_cursor_composition(const std::string& peer,uint64_t session,uint64_t sequence,CursorComposition);
     void update_health(const std::string& peer,const StreamHealth&);
     void update_source_diagnostics(const std::string& peer,const SourceDiagnostics&);
     void update_viewer_diagnostics(const std::string& peer,const ViewerDiagnostics&);

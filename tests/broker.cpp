@@ -9,6 +9,29 @@
 using namespace hive;
 namespace {
 void require(bool ok,const char* text){if(!ok)throw std::runtime_error(text);}
+void frame_composition_check(){
+    EncodedFrame frame;frame.width=2560;frame.height=1440;frame.sequence=91;frame.capture_time_us=1000000;
+    frame.source_ready_us=1010000;frame.session=13;frame.keyframe=true;frame.data={0,0,0,1,99};
+    for(const auto composition:{CursorComposition::Unknown,CursorComposition::Separate,CursorComposition::NoSeparate}){
+        frame.cursor_composition=composition;const auto bytes=broker::write_frame(frame);EncodedFrame decoded;
+        require(broker::read_frame(bytes,decoded)&&decoded.width==frame.width&&decoded.height==frame.height&&
+            decoded.sequence==frame.sequence&&decoded.capture_time_us==frame.capture_time_us&&decoded.source_ready_us==frame.source_ready_us&&
+            decoded.session==frame.session&&decoded.keyframe&&decoded.cursor_composition==composition&&decoded.data==frame.data,
+            "Broker lost image-associated cursor ownership or frame provenance");
+        for(size_t size=0;size<=48;++size){
+            const broker::Bytes truncated(bytes.begin(),bytes.begin()+size);
+            require(!broker::read_frame(truncated,decoded),"Broker accepted truncated frame metadata or empty image");
+        }
+    }
+    auto bytes=broker::write_frame(frame);EncodedFrame decoded;
+    for(const auto invalid:{3u,255u,256u,0x10001u,UINT32_MAX}){
+        for(unsigned i=0;i<4;++i)bytes[44+i]=uint8_t(invalid>>(i*8));
+        require(!broker::read_frame(bytes,decoded),"Broker accepted invalid or narrowing-wrapped cursor ownership");
+    }
+    frame.cursor_composition=CursorComposition::Separate;frame.source_ready_us=0;
+    require(broker::read_frame(broker::write_frame(frame),decoded)&&!decoded.source_ready_us&&decoded.cursor_composition==CursorComposition::Separate,
+        "Broker cursor ownership incorrectly requires source timing");
+}
 void rate_extension_check(){
     StreamFeedback feedback{7,900,10,1200,5,true};feedback.rate_details=true;feedback.feedback_sequence=80;
     feedback.received_bytes=0x123456789ull;feedback.received_frames=310;feedback.received_kbps=100000;feedback.received_millihz=144000;
@@ -107,11 +130,11 @@ int main(){try{
     require(r.u32()==0xfedcba98&&r.u64()==0xfedcba9876543210ull&&r.end(),"Integer wire roundtrip");r.u32();require(!r.good&&!r.end(),"Truncated fields accepted");
     require(!broker::valid_input({InputKind::Key,0,0,0})&&!broker::valid_input({InputKind::Key,256,0,0})&&!broker::valid_input({InputKind::Button,6,0,0})&&!broker::valid_input({InputKind::Absolute,-1,1,0})&&!broker::valid_input({InputKind::Wheel,120,2,0})&&!broker::valid_input({InputKind(99),0,0,0}),"Invalid input accepted");
     {Pipe p;require(broker::send(p.client,broker::Input,data),"Write message");broker::Bytes received;broker::Kind kind;require(broker::receive(p.server,kind,received)&&kind==broker::Input&&received==data,"Message roundtrip");}
-    for(const auto header: {std::array<uint32_t,3>{0,broker::Input,0},std::array<uint32_t,3>{broker::Magic,99,0},std::array<uint32_t,3>{broker::Magic,broker::Frame,broker::MaxBytes+1}}){
+    for(const auto header: {std::array<uint32_t,3>{0,broker::Input,0},std::array<uint32_t,3>{0x48425631,broker::Frame,0},std::array<uint32_t,3>{broker::Magic,99,0},std::array<uint32_t,3>{broker::Magic,broker::Frame,broker::MaxBytes+1}}){
         Pipe p;auto h=header;require(broker::transfer(p.client,h.data(),sizeof(h),true,nullptr),"Write malformed header");broker::Bytes received;broker::Kind kind;require(!broker::receive(p.server,kind,received),"Malformed header accepted");
     }
     {Pipe p;std::atomic<bool> cancel=false;auto read=std::async(std::launch::async,[&]{broker::Bytes received;broker::Kind kind;return broker::receive(p.server,kind,received,&cancel);});Sleep(20);cancel=true;require(read.wait_for(std::chrono::seconds(2))==std::future_status::ready&&!read.get(),"Idle read cancellation");}
     {Pipe p;std::atomic<bool> cancel=false;broker::Bytes large(1024*1024,42);auto write=std::async(std::launch::async,[&]{return broker::send(p.server,broker::Frame,large,&cancel);});Sleep(20);cancel=true;require(write.wait_for(std::chrono::seconds(2))==std::future_status::ready&&!write.get(),"Blocked frame cancellation");}
-    readiness_check();rate_extension_check();
-    std::puts("PASS broker: framing, invalid input/headers, I/O cancellation, bounded frame credit, readiness wake races, and blocked-credit cancellation.");return 0;
+    readiness_check();rate_extension_check();frame_composition_check();
+    std::puts("PASS broker: framing, cursor ownership/provenance, mixed-version rejection, invalid input/headers, I/O cancellation, bounded frame credit, readiness wake races, and blocked-credit cancellation.");return 0;
 }catch(const std::exception& e){std::printf("FAIL broker: %s\n",e.what());return 1;}}

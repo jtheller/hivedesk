@@ -47,7 +47,7 @@ constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 constexpr auto kVideoWriteBudget = std::chrono::milliseconds(150);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -204,7 +204,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -590,7 +590,7 @@ struct Transport::Impl {
     }
     bool dispatch(Conn& c, const Bytes& b) {
         Reader r{b}; uint8_t type = r.byte();
-        if ((c.channel == 1) != (type == Frame||type==AutoFrame||type==AutoFrameTimed)) return false;
+        if ((c.channel == 1) != (type == Frame||type==AutoFrame||type==AutoFrameTimed||type==FrameCursor)) return false;
         const bool input_message=type==InputReady||type==InputData||type==InputComplete||type==InputRevoke;
         if((c.channel==2)!=input_message)return false;
         switch (type) {
@@ -689,13 +689,21 @@ struct Transport::Impl {
             // Callback must finish the local clipboard write before returning. Input follows on this same thread.
             if (callbacks.clipboard) callbacks.clipboard(c.peer.id,value); return true;
         }
-        case Frame: case AutoFrame: case AutoFrameTimed: {
-            EncodedFrame frame;if(type!=Frame){frame.session=r.qword();if(!(c.peer.features&FeatureAutomaticStream)||!frame.session)return false;}
+        case Frame: case AutoFrame: case AutoFrameTimed: case FrameCursor: {
+            EncodedFrame frame;
+            if(type==FrameCursor){
+                if(!(c.peer.features&FeatureCursorComposition))return false;
+                frame.session=r.qword();if(frame.session&&!(c.peer.features&FeatureAutomaticStream))return false;
+            }else if(type!=Frame){frame.session=r.qword();if(!(c.peer.features&FeatureAutomaticStream)||!frame.session)return false;}
             frame.width = r.dword(); frame.height = r.dword(); frame.sequence = r.qword(); frame.capture_time_us = r.qword(); uint8_t key = r.byte(); frame.keyframe = key != 0;
-            if(type==AutoFrameTimed){
-                if(!(c.peer.features&FeatureFrameTiming))return false;
+            if(type==AutoFrameTimed||type==FrameCursor){
                 frame.source_ready_us=r.qword();
-                if(!frame.source_ready_us||!valid_frame_timing(frame))return false;
+                if((type==AutoFrameTimed&&!frame.source_ready_us)||
+                    (frame.source_ready_us&&(!frame.session||!(c.peer.features&FeatureFrameTiming)))||!valid_frame_timing(frame))return false;
+            }
+            if(type==FrameCursor){
+                frame.cursor_composition=CursorComposition(r.byte());
+                if(!valid_cursor_composition(frame.cursor_composition))return false;
             }
             if (!r.good || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384 || key > 1 || b.size()-r.at > kMaxFrame || b.size() == r.at) return false;
             frame.data.assign(b.begin()+r.at,b.end()); if (callbacks.frame) callbacks.frame(c.peer.id,std::move(frame)); return true;
@@ -832,17 +840,19 @@ bool Transport::end_stream(const std::string& peer,uint64_t session) {
     // TCP packet, which would require disconnecting the reciprocal session too.
     if(video){std::lock_guard lock(video->queue_mutex);
         if(video->video){Reader r{video->video->payload};
-            const auto kind=r.byte();if((kind==AutoFrame||kind==AutoFrameTimed)&&r.qword()==session&&r.good){video->video.reset();video->wait_keyframe=true;}}}
+            const auto kind=r.byte();if((kind==AutoFrame||kind==AutoFrameTimed||kind==FrameCursor)&&r.qword()==session&&r.good){video->video.reset();video->wait_keyframe=true;}}}
     if(!control||!(control->peer.features&FeatureHostKick))return input_notified;
     Bytes b{HostEnded};u64(b,session);const bool control_notified=control->enqueue(std::move(b));return input_notified||control_notified;
 }
 bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
     auto c = impl_->find(peer,true); if (!c || frame.data.empty() || frame.data.size() > kMaxFrame || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384) return false;
-    if((frame.session&&!(c->peer.features&FeatureAutomaticStream))||!valid_frame_timing(frame))return false;
+    if((frame.session&&!(c->peer.features&FeatureAutomaticStream))||!valid_frame_timing(frame)||!valid_cursor_composition(frame.cursor_composition))return false;
     const bool timed=frame.session&&frame.source_ready_us&&(c->peer.features&FeatureFrameTiming);
-    Bytes b{timed?AutoFrameTimed:frame.session?AutoFrame:Frame}; b.reserve(frame.data.size()+42);if(frame.session)u64(b,frame.session);
+    const bool cursor=(c->peer.features&FeatureCursorComposition)!=0;
+    Bytes b{cursor?FrameCursor:timed?AutoFrameTimed:frame.session?AutoFrame:Frame}; b.reserve(frame.data.size()+43);if(frame.session||cursor)u64(b,frame.session);
     u32(b,frame.width); u32(b,frame.height); u64(b,frame.sequence); u64(b,frame.capture_time_us); b.push_back(frame.keyframe ? 1 : 0);
-    if(timed)u64(b,frame.source_ready_us);
+    if(cursor||timed)u64(b,timed?frame.source_ready_us:0);
+    if(cursor)b.push_back(uint8_t(frame.cursor_composition));
     b.insert(b.end(),frame.data.begin(),frame.data.end()); return c->enqueue(std::move(b),frame.keyframe);
 }
 bool Transport::frame_ready(const std::string& peer) const {
@@ -1275,6 +1285,85 @@ bool Transport::self_test(std::string& result) {
         }
     }
     {
+        // Cursor composition belongs to the encoded image, including images
+        // waiting in the video slot. A separate cursor message cannot replace it.
+        Transport sender;auto& owner=*sender.impl_;
+        auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        auto video=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        control->ready=video->ready=true;video->channel=1;
+        control->peer.id=video->peer.id="composition-peer";
+        control->peer.features=video->peer.features=FeatureAutomaticStream|FeatureFrameTiming|FeatureCursorComposition|FeatureHostKick;
+        owner.connected["composition-peer"]={control,video};
+        EncodedFrame observed;unsigned delivered=0;
+        owner.callbacks.frame=[&](const std::string&,EncodedFrame frame){observed=std::move(frame);++delivered;};
+        EncodedFrame frame;frame.width=1920;frame.height=1080;frame.sequence=8;frame.capture_time_us=1000000;
+        frame.source_ready_us=1080000;frame.session=72;frame.keyframe=true;frame.data={0,0,0,1,99};
+        for(const auto composition:{CursorComposition::Unknown,CursorComposition::Separate,CursorComposition::NoSeparate}){
+            frame.cursor_composition=composition;
+            if(!sender.send_frame("composition-peer",frame)||!video->video||video->video->payload[0]!=FrameCursor||
+                !owner.dispatch(*video,video->video->payload)||observed.cursor_composition!=composition||
+                observed.capture_time_us!=frame.capture_time_us||observed.source_ready_us!=frame.source_ready_us||
+                observed.sequence!=frame.sequence||observed.session!=frame.session||observed.data!=frame.data){
+                result="Image-associated cursor composition roundtrip failed";return false;
+            }
+        }
+        const auto composed=video->video->payload;const auto before=delivered;
+        auto invalid=composed;invalid[42]=3;
+        if(owner.dispatch(*video,invalid)||owner.dispatch(*control,composed)||delivered!=before){
+            result="Invalid composition or wrong-channel video was accepted";return false;
+        }
+        for(size_t size=0;size<=43;++size){
+            const Bytes truncated(composed.begin(),composed.begin()+size);
+            if(owner.dispatch(*video,truncated)||delivered!=before){result="Truncated composition metadata or empty image accepted";return false;}
+        }
+        // Capability absence preserves the exact previous timed frame layout.
+        Bytes legacy{AutoFrameTimed};u64(legacy,frame.session);u32(legacy,frame.width);u32(legacy,frame.height);
+        u64(legacy,frame.sequence);u64(legacy,frame.capture_time_us);legacy.push_back(1);u64(legacy,frame.source_ready_us);
+        legacy.insert(legacy.end(),frame.data.begin(),frame.data.end());
+        video->peer.features&=~FeatureCursorComposition;
+        if(owner.dispatch(*video,composed)||!sender.send_frame("composition-peer",frame)||video->video->payload!=legacy||
+            !owner.dispatch(*video,legacy)||observed.cursor_composition!=CursorComposition::Unknown||observed.source_ready_us!=frame.source_ready_us){
+            result="Cursor composition failed legacy timed-layout fallback";return false;
+        }
+        video->peer.features|=FeatureCursorComposition;
+        if(!owner.dispatch(*video,legacy)||observed.cursor_composition!=CursorComposition::Unknown){
+            result="New composition receiver rejected a legacy sender";return false;
+        }
+        video->peer.features&=~FeatureFrameTiming;
+        if(owner.dispatch(*video,composed)||!sender.send_frame("composition-peer",frame)||
+            !owner.dispatch(*video,video->video->payload)||observed.source_ready_us||observed.cursor_composition!=frame.cursor_composition){
+            result="Composition and timing capabilities were not independently gated";return false;
+        }
+        auto untimed_legacy=legacy;untimed_legacy[0]=AutoFrame;untimed_legacy.erase(untimed_legacy.begin()+34,untimed_legacy.begin()+42);
+        video->peer.features&=~FeatureCursorComposition;
+        if(!sender.send_frame("composition-peer",frame)||video->video->payload!=untimed_legacy||
+            !owner.dispatch(*video,untimed_legacy)||observed.cursor_composition!=CursorComposition::Unknown||observed.source_ready_us){
+            result="Composition changed the untimed legacy automatic-frame layout";return false;
+        }
+        // Manual streams also preserve ownership, without pretending to have
+        // negotiated automatic sessions or source-completion clock provenance.
+        video->peer.features=FeatureCursorComposition;frame.session=0;
+        if(owner.dispatch(*video,composed)||!sender.send_frame("composition-peer",frame)||
+            !owner.dispatch(*video,video->video->payload)||observed.session||observed.source_ready_us||observed.cursor_composition!=frame.cursor_composition){
+            result="Manual composition frame required automatic stream negotiation";return false;
+        }
+        auto manual_timed=video->video->payload;
+        for(unsigned i=0;i<8;++i)manual_timed[34+i]=uint8_t(frame.source_ready_us>>(56-i*8));
+        video->peer.features|=FeatureFrameTiming;
+        if(owner.dispatch(*video,manual_timed)){result="Manual composition frame accepted automatic timing provenance";return false;}
+        Bytes manual{Frame};manual.insert(manual.end(),untimed_legacy.begin()+9,untimed_legacy.end());
+        video->peer.features=0;
+        if(!sender.send_frame("composition-peer",frame)||video->video->payload!=manual||!owner.dispatch(*video,manual)||
+            observed.cursor_composition!=CursorComposition::Unknown||observed.session){result="Composition changed the legacy manual-frame layout";return false;}
+        frame.cursor_composition=CursorComposition(255);
+        if(sender.send_frame("composition-peer",frame)){result="Sender accepted invalid cursor composition";return false;}
+        frame.cursor_composition=CursorComposition::Separate;frame.session=72;
+        video->peer.features=FeatureAutomaticStream|FeatureFrameTiming|FeatureCursorComposition|FeatureHostKick;
+        if(!sender.send_frame("composition-peer",frame)||!sender.end_stream("composition-peer",72)||video->video||!video->wait_keyframe){
+            result="Session termination retained an obsolete composition frame";return false;
+        }
+    }
+    {
         // Session termination must preserve the connection and the reciprocal
         // stream, reject malformed input, and never send unknown legacy commands.
         Transport sender;auto& owner=*sender.impl_;
@@ -1379,7 +1468,7 @@ bool Transport::self_test(std::string& result) {
     {
         auto hello=make_hello({"feature-test","Features","Test1234",47980,false},0);
         Peer peer;uint8_t channel=9;
-        if(!parse_hello(hello,peer,channel)||!(peer.features&FeatureDesktopAux)||!(peer.features&FeatureAutomaticStream)||!(peer.features&FeatureHostKick)||!(peer.features&FeatureAutoRate)||!(peer.features&FeatureDedicatedInput)||!(peer.features&FeatureFrameTiming)){result="Feature negotiation failed";return false;}
+        if(!parse_hello(hello,peer,channel)||!(peer.features&FeatureDesktopAux)||!(peer.features&FeatureAutomaticStream)||!(peer.features&FeatureHostKick)||!(peer.features&FeatureAutoRate)||!(peer.features&FeatureDedicatedInput)||!(peer.features&FeatureFrameTiming)||!(peer.features&FeatureCursorComposition)){result="Feature negotiation failed";return false;}
         std::fill(hello.end()-32,hello.end(),uint8_t(42));peer={};
         if(!parse_hello(hello,peer,channel)||peer.features){result="Legacy challenge compatibility failed";return false;}
         auto input_hello=make_hello({"feature-test","Features","Test1234",47980,false},2);peer={};
@@ -1415,7 +1504,7 @@ bool Transport::self_test(std::string& result) {
     bcb.input = [&](const std::string&,const InputEvent& e) { std::lock_guard lock(mutex); if (e.kind == InputKind::ReleaseAll) got_release = true; else { input_order = state == 1 && e.kind == InputKind::Key && e.a == 30; state = 2; } cv.notify_all(); };
     bcb.start_stream = [&](const std::string&,const StreamSettings& s) { std::lock_guard lock(mutex); if (state == 2 && s.fps == 237 && s.bitrate_mbps == 80) state = 3; else if (state == 3 && s.fps == 0 && s.bitrate_mbps == 80) got_uncapped = true; cv.notify_all(); };
     bcb.stop_stream = [&](const std::string&) { std::lock_guard lock(mutex); got_stop = true; cv.notify_all(); };
-    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.data == Bytes({0,0,0,1,42,99}); cv.notify_all(); };
+    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}); cv.notify_all(); };
     TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
     acb.host_ended=[&](const std::string& peer,uint64_t session){std::lock_guard lock(mutex);got_host_ended=peer=="test-b"&&session==91;cv.notify_all();};
     acb.diagnostics=[&](const std::string&,const SourceDiagnostics& d){std::lock_guard lock(mutex);const bool base=d.session==91&&d.encoded_millihz==59940&&d.encode_us==1234&&d.capture_wait_us==5678&&d.send_wait_us_per_second==9000&&d.feedback_age_us==11000&&d.network_extra_us==13000;if(d.encode_details)got_encode_diagnostics=base&&d.color_us==500&&d.nvenc_us==734&&d.encode_age_us==10000;else got_diagnostics=base;cv.notify_all();};
@@ -1446,7 +1535,7 @@ bool Transport::self_test(std::string& result) {
     cursor.width=cursor.height=cursor.hotspot_x=0;cursor.mask.clear();cursor.visible=false;
     ok=b.send_cursor("test-a",cursor)&&ok;
     ok = a.send_clipboard("test-b",L"Hive \x4e2d\x6587 \xd83d\xde80") && a.send_input("test-b",{InputKind::Key,30,0,0}) && a.request_stream("test-b",{237,80}) && a.request_stream("test-b",{0,80}) && ok;
-    EncodedFrame frame; frame.width = 1920; frame.height = 1080; frame.sequence = 42; frame.capture_time_us = 123456; frame.source_ready_us = 124500; frame.session = 77; frame.keyframe = true; frame.data = {0,0,0,1,42,99};
+    EncodedFrame frame; frame.width = 1920; frame.height = 1080; frame.sequence = 42; frame.capture_time_us = 123456; frame.source_ready_us = 124500; frame.session = 77; frame.keyframe = true; frame.cursor_composition=CursorComposition::NoSeparate; frame.data = {0,0,0,1,42,99};
     const auto token_before_kick=a.connection_token("test-b");
     ok = ok && a.send_frame("test-b",frame) && b.send_clipboard("test-a",L"return") && b.end_stream("test-a",91); a.stop_stream("test-b");
     {

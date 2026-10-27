@@ -1,5 +1,30 @@
 # Alpha validation
 
+## Alpha 34 cursor composition
+
+- DXGI pointer ownership is read only when LastMouseUpdateTime is nonzero.
+  Ownership changes force a fresh desktop copy, even without a desktop-update
+  timestamp; cached recovery IDRs retain the ownership of their copied image.
+- Each NVENC job, local broker frame and negotiated video packet carries cursor
+  composition. Older peers retain their exact previous wire layouts. Local
+  broker framing rejects mixed binary versions instead of misreading metadata.
+- Only a successful Present publishes ownership to the native cursor layer.
+  Prepared-frame replacement, cancellation, busy/occluded retries and early
+  startup cannot apply a discarded picture's state. Session/generation/sequence
+  guards reject stale UI notifications. Cursor shape/motion keep their separate
+  path; native shape replacement respects embedded and relative-mode hiding.
+- Release compilation and 28/28 CTest checks passed, including malformed wire
+  data, feature negotiation, encrypted transport, broker round trips and the
+  new capture/presentation state regressions. Real hidden-window NVENC/NVDEC
+  tests passed with cursor metadata rotating through native asynchronous and
+  forced-synchronous encoder slots. Real GPU rendering plus injected Present
+  results verified success-only ownership and color/resize correctness.
+- Managed update/GPU bridge checks and private-desktop WinUI light/dark tests
+  passed. No live desktop input or visible capture probe was used. Successful
+  Present is not physical scanout proof: a compositor/UI tick can still separate
+  native cursor and video transitions. The reported VI/DEVG drag ghost has not
+  been reproduced in this validation; two-computer acceptance remains pending.
+
 ## Alpha 33 GPU power-policy comparison
 
 - Added an immediate WinUI checkbox for local HiveDesk host/viewer NVIDIA

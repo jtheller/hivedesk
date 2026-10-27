@@ -4,6 +4,7 @@
 #include "hivedesk/adaptive.h"
 #include "hivedesk/auto_rate.h"
 #include "hivedesk/desktop_session.h"
+#include "hivedesk/cursor_composition.h"
 #include "media_cuda.h"
 #include "frame_timer.h"
 #include "source_queue.h"
@@ -125,6 +126,7 @@ private:
         bool event_registered = false, in_use = false, submitted = false, event_consumed = false, locked = false;
         bool output_ready = false;
         uint64_t sequence = 0, capture_time_us = 0, started_us = 0, converted_us = 0, submitted_us = 0;
+        CursorComposition cursor_composition=CursorComposition::Unknown;
     };
     Cuda cuda_;
     std::unique_ptr<HiveGpu, decltype(&hive_gpu_destroy)> gpu_{hive_gpu_create(), hive_gpu_destroy};
@@ -355,7 +357,8 @@ public:
     }
     // One producer owns conversion/submission; one consumer owns receive(). The
     // queue lock never spans a CUDA/encoder call or a completion wait.
-    bool submit_texture(ID3D11Texture2D* texture, uint64_t sequence, bool force, uint64_t captured_us, bool* completion_queued = nullptr) {
+    bool submit_texture(ID3D11Texture2D* texture, uint64_t sequence, bool force, uint64_t captured_us, bool* completion_queued = nullptr,
+        CursorComposition cursor_composition=CursorComposition::Unknown) {
         if (completion_queued) *completion_queued = false;
         const auto index = reserve();
         if (index == buffer_count) return false;
@@ -365,7 +368,7 @@ public:
             if (!hive_gpu_encode_texture(gpu_.get(), texture, width_, height_, slot.pixels, slot.pitch))
                 throw std::runtime_error(hive_gpu_error(gpu_.get()));
             slot.converted_us = now_us();
-            submit_loaded(index, sequence, force, captured_us, completion_queued);
+            submit_loaded(index, sequence, force, captured_us, completion_queued, cursor_composition);
             return true;
         } catch (...) { abandon(index); throw; }
     }
@@ -397,6 +400,7 @@ public:
                 completion.frame.data.assign(bytes, bytes + locked.bitstreamSizeInBytes);
                 completion.frame.width = width_; completion.frame.height = height_;
                 completion.frame.sequence = slot.sequence; completion.frame.capture_time_us = slot.capture_time_us;
+                completion.frame.cursor_composition=slot.cursor_composition;
                 completion.frame.keyframe = locked.pictureType == NV_ENC_PIC_TYPE_IDR;
                 completion.average_qp = locked.frameAvgQP <= 51 ? locked.frameAvgQP : UINT32_MAX;
             } catch (...) {
@@ -495,12 +499,14 @@ private:
         { std::lock_guard lock(queue_mutex_); slot.in_use = false; --in_flight_; }
         queue_cv_.notify_all();
     }
-    void submit_loaded(uint32_t index, uint64_t sequence, bool force, uint64_t captured_us, bool* completion_queued = nullptr) {
+    void submit_loaded(uint32_t index, uint64_t sequence, bool force, uint64_t captured_us, bool* completion_queued = nullptr,
+        CursorComposition cursor_composition=CursorComposition::Unknown) {
         auto& slot = slots_[index];
         NV_ENC_MAP_INPUT_RESOURCE mapped{}; mapped.version = NV_ENC_MAP_INPUT_RESOURCE_VER; mapped.registeredResource = slot.registered;
         nv(api_.nvEncMapInputResource(session_, &mapped), "NVENC map input");
         slot.mapped = mapped.mappedResource;
         slot.sequence = sequence; slot.capture_time_us = captured_us;
+        slot.cursor_composition=cursor_composition;
         NV_ENC_PIC_PARAMS picture{}; picture.version = NV_ENC_PIC_PARAMS_VER;
         picture.inputBuffer = slot.mapped; picture.bufferFmt = NV_ENC_BUFFER_FORMAT_YUV444;
         picture.inputWidth = width_; picture.inputHeight = height_; picture.inputPitch = static_cast<uint32_t>(slot.pitch);
@@ -769,6 +775,7 @@ class Capture {
     DXGI_OUTPUT_DESC description_{};
     bool acquired_=false;
     CaptureUpdateFilter updates_;
+    CaptureCursorComposition cursor_;
 public:
     uint32_t width = 0, height = 0;
     Capture() {
@@ -811,6 +818,7 @@ public:
     IDXGIAdapter* adapter() const { return adapter_.Get(); }
     RECT bounds() const { return description_.DesktopCoordinates; }
     ID3D11Texture2D* texture() const { return capture_.Get(); }
+    CursorComposition cursor_composition() const {return cursor_.picture();}
     Image readback_for_test() { return read_texture(device_.Get(), context_.Get(), capture_.Get()); }
     bool next() {
         // Retain ownership through encode/pacing, releasing immediately before
@@ -821,16 +829,15 @@ public:
         if (result == DXGI_ERROR_WAIT_TIMEOUT) return false;
         hr(result, "Acquire desktop frame");
         acquired_=true;
-        // AcquireNextFrame also wakes for a hardware pointer update. Its
-        // separate cursor channel already carries that change; avoid a full
-        // desktop copy/conversion/encode and leave the cached image available
-        // for a forced recovery IDR. Software cursor pixels are desktop updates
-        // and retain a nonzero LastPresentTime, so they are still captured.
-        if(!updates_.needs_copy(info.LastPresentTime.QuadPart))return false;
+        // Pointer-only movement needs no video work, but switching between a
+        // separate pointer and a cursor embedded in the desktop needs a new
+        // image. Bind ownership to the copied image, including recovery IDRs.
+        cursor_.observe(info.LastMouseUpdateTime.QuadPart,info.PointerPosition.Visible!=FALSE);
+        if(!updates_.needs_copy(info.LastPresentTime.QuadPart)&&!cursor_.needs_copy())return false;
         try {
             ComPtr<ID3D11Texture2D> texture; hr(resource.As(&texture), "Get desktop texture");
             context_->CopyResource(capture_.Get(), texture.Get()); context_->Flush();
-            updates_.copied();
+            updates_.copied();cursor_.copied();
         } catch (...) { duplication_->ReleaseFrame();acquired_=false;throw; }
         return true;
     }
@@ -842,6 +849,7 @@ public:
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<ID3D11ShaderResourceView> resource;
         uint32_t width=0,height=0,convert_us=0;
+        CursorPresentation cursor;
     };
 private:
     HWND window_;
@@ -860,6 +868,8 @@ private:
     bool pending_present_ = false;
     uint32_t convert_us_=0,draw_us_=0;
     std::function<HRESULT()> present_for_test_;
+    CursorPresentation pending_cursor_;
+    std::function<void(const CursorPresentation&)> cursor_presented_;
     void target() {
         ComPtr<ID3D11Texture2D> backbuffer; hr(swap_->GetBuffer(0, IID_PPV_ARGS(&backbuffer)), "Get swapchain backbuffer");
         hr(device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &target_), "Create render target");
@@ -924,6 +934,7 @@ public:
     bool present_pending() const {return pending_present_;}
     bool cancel_pending() {return std::exchange(pending_present_,false);}
     void set_present_for_test(std::function<HRESULT()> callback){present_for_test_=std::move(callback);}
+    void set_cursor_presented(std::function<void(const CursorPresentation&)> callback){cursor_presented_=std::move(callback);}
     bool retry_present(const std::function<bool()>& eligible={},uint32_t* present_cost=nullptr) {
         if(present_cost)*present_cost=0;
         if(!pending_present_)return false;
@@ -935,6 +946,7 @@ public:
         // mapped and a retry never repeats conversion or queues another frame.
         pending_present_=result==DXGI_ERROR_WAS_STILL_DRAWING||result==DXGI_STATUS_OCCLUDED;
         if(!pending_present_)hr(result,"Present decoded desktop");
+        if(result==S_OK&&pending_cursor_.valid&&cursor_presented_)cursor_presented_(pending_cursor_);
         return result==S_OK;
     }
     bool present_when_ready(const std::function<bool()>& eligible,uint32_t* present_cost=nullptr){
@@ -1014,13 +1026,15 @@ public:
         if(proof){ComPtr<ID3D11Texture2D> backbuffer;hr(swap_->GetBuffer(0,IID_PPV_ARGS(&backbuffer)),"Get diagnostic backbuffer");*proof=read_texture(device_.Get(),context_.Get(),backbuffer.Get());}
         draw_us_=uint32_t(std::min<uint64_t>(10000000,now_us()-render_begin));
         if(render_cost)*render_cost=uint32_t(std::min<uint64_t>(10000000,uint64_t(draw_us_)+convert_us_));
-        pending_present_=true;
+        pending_cursor_=picture.cursor;pending_present_=true;
         if(defer_present)return;
         const bool result=retry_present(eligible,present_cost);if(presented)*presented=result;
     }
     void draw(uint64_t yuv,size_t pitch,uint32_t image_width,uint32_t image_height,HiveGpu* gpu,Image* proof=nullptr,
-        uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,std::function<bool()> eligible={},bool defer_present=false){
+        uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,std::function<bool()> eligible={},bool defer_present=false,
+        CursorPresentation cursor={}){
         convert(synchronous_picture_,yuv,pitch,image_width,image_height,gpu);
+        synchronous_picture_.cursor=cursor;
         draw_prepared(synchronous_picture_,proof,render_cost,present_cost,presented,std::move(eligible),defer_present);
     }
 
@@ -1034,6 +1048,7 @@ struct MediaViewer::Impl {
     std::condition_variable changed;
     ViewerQueue frames;
     bool stopping = true, displayed = false;
+    CursorPresentation cursor;
     std::thread worker;
     std::string status = "Closed";
     StreamFeedback feedback{};uint64_t last_arrival=0;
@@ -1066,14 +1081,27 @@ struct MediaViewer::Impl {
 };
 MediaViewer::MediaViewer() : impl_(std::make_unique<Impl>()) {}
 MediaViewer::~MediaViewer() { close(); }
-bool MediaViewer::open(HWND window, std::string& error) {
+bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented) {
     close();
     // DXGI creation may synchronously send window messages. Create it on the
     // caller/UI thread, then hand the device/context to the render worker.
     std::unique_ptr<Renderer> renderer;
     try { renderer = std::make_unique<Renderer>(window,true); }
     catch (const std::exception& problem) { error = problem.what(); return false; }
+    renderer->set_cursor_presented([this,presented=std::move(presented)](const CursorPresentation& cursor){
+        bool changed=false;
+        {
+            std::lock_guard guard(impl_->mutex);if(impl_->stopping)return;
+            const auto& previous=impl_->cursor;
+            changed=!previous.valid||previous.session!=cursor.session||previous.composition!=cursor.composition;
+            impl_->cursor=cursor;
+        }
+        // Cursor motion keeps its independent low-latency lane. Only ownership
+        // transitions need UI work; retain the last presented state for startup.
+        if(changed&&presented)presented(cursor);
+    });
     { std::lock_guard guard(impl_->mutex); impl_->stopping = false; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
+        impl_->cursor={};
         impl_->live_window={};impl_->live_totals={};impl_->live_window.sample(now_us(),{});
         impl_->feedback={};impl_->last_arrival=0;impl_->service_samples.clear();impl_->present_samples.clear();impl_->diagnostics={};impl_->sample_since=now_us();impl_->receive_sample_at=0;impl_->received_count=impl_->decoded_count=impl_->presented_count=impl_->received_bytes=0;}
     std::promise<std::string> initialized; auto ready = initialized.get_future();
@@ -1167,7 +1195,9 @@ bool MediaViewer::open(HWND window, std::string& error) {
                         auto& picture=ready_pictures[*reserved];picture.pending=context;
                         // Offscreen conversion only: the mapping worker never
                         // touches the D3D immediate context or waits for vsync.
-                        renderer->convert(picture.pixels,yuv,pitch,width,height,gpu);*slot=reserved;
+                        renderer->convert(picture.pixels,yuv,pitch,width,height,gpu);
+                        picture.pixels.cursor={context->frame.session,context->frame.sequence,context->frame.cursor_composition,true};
+                        *slot=reserved;
                     }catch(...){pictures.release(*reserved);throw;}
                 };
                 output.complete=[&,context,slot](uint32_t map_us,uint32_t service_us){
@@ -1225,11 +1255,12 @@ void MediaViewer::submit(EncodedFrame frame) {
     if(queued||impl_->frames.recovery_pending())impl_->changed.notify_one();
 }
 void MediaViewer::close() {
-    { std::lock_guard guard(impl_->mutex); impl_->stopping = true; impl_->frames.reset(); }
+    { std::lock_guard guard(impl_->mutex); impl_->stopping = true; impl_->frames.reset();impl_->cursor={}; }
     impl_->changed.notify_all(); if (impl_->worker.joinable()) impl_->worker.join();
 }
 std::string MediaViewer::stats() const { std::lock_guard guard(impl_->mutex); return impl_->status; }
 bool MediaViewer::has_frame() const { std::lock_guard guard(impl_->mutex); return impl_->displayed && !impl_->stopping; }
+CursorPresentation MediaViewer::cursor_presentation() const {std::lock_guard guard(impl_->mutex);return impl_->cursor;}
 StreamFeedback MediaViewer::feedback() const {
     std::lock_guard guard(impl_->mutex);if(impl_->stopping)return {};
     impl_->sync_queue();if(impl_->stopping)return {};
@@ -1594,8 +1625,11 @@ bool media_render_self_test(std::string& report) {
         }
         Encoder encoder(width, height, StreamSettings{60, 100});
         Image proof;
+        CursorPresentation cursor;
+        std::vector<CursorPresentation> presented_cursors;
+        renderer.set_cursor_presented([&](const CursorPresentation& value){presented_cursors.push_back(value);});
         Decoder decoder([&](uint64_t yuv, size_t pitch, uint32_t w, uint32_t h, HiveGpu* gpu) {
-            renderer.draw(yuv, pitch, w, h, gpu, &proof);
+            renderer.draw(yuv, pitch, w, h, gpu, &proof,nullptr,nullptr,nullptr,{},false,cursor);
         }, renderer.adapter());
         const auto verify = [&](uint32_t x, uint32_t y, const uint8_t* expected) {
             if (proof.bgra.empty() || x >= proof.width || y >= proof.height) throw std::runtime_error("No rendered proof image.");
@@ -1618,31 +1652,38 @@ bool media_render_self_test(std::string& report) {
         // expired or superseded picture must never be replayed afterward.
         unsigned present_calls=0;bool busy=true;
         renderer.set_present_for_test([&]{++present_calls;return busy?DXGI_ERROR_WAS_STILL_DRAWING:S_OK;});
+        cursor={41,2,CursorComposition::Separate,true};
         decoder.feed(encoder.encode(source,2,false));
         if(!renderer.present_pending()||present_calls!=1)throw std::runtime_error("Busy Present did not retain the prepared final frame.");
         if(renderer.retry_present()||!renderer.present_pending()||present_calls!=2)throw std::runtime_error("Busy Present retry lost the prepared frame.");
+        if(!presented_cursors.empty())throw std::runtime_error("Cursor ownership changed before successful presentation.");
         busy=false;
         if(!renderer.retry_present()||renderer.present_pending()||present_calls!=3)throw std::runtime_error("Static final frame did not present on retry without another decode.");
         if(renderer.retry_present()||present_calls!=3)throw std::runtime_error("Completed presentation replayed the same frame.");
+        if(presented_cursors.size()!=1||presented_cursors.back().session!=41||presented_cursors.back().sequence!=2||presented_cursors.back().composition!=CursorComposition::Separate)
+            throw std::runtime_error("Successful retry did not retain the prepared cursor metadata.");
+        cursor={41,3,CursorComposition::NoSeparate,true};
         busy=true;decoder.feed(encoder.encode(source,3,false));
         const auto before_cancel=present_calls;
         if(renderer.retry_present([]{return false;})||renderer.present_pending()||present_calls!=before_cancel)
             throw std::runtime_error("Expired prepared frame was submitted on retry.");
-        decoder.feed(encoder.encode(source,4,false));
+        cursor={41,4,CursorComposition::Separate,true};decoder.feed(encoder.encode(source,4,false));
         Image latest=source;
         for(size_t pixel=0;pixel<latest.bgra.size();pixel+=4)for(size_t c=0;c<3;++c)latest.bgra[pixel+c]=colors[2][c];
-        decoder.feed(encoder.encode(latest,5,false));
+        cursor={41,5,CursorComposition::NoSeparate,true};decoder.feed(encoder.encode(latest,5,false));
         verify(200,90,colors[2]);verify(440,270,colors[2]);
         busy=false;const auto before_latest=present_calls;
         if(!renderer.retry_present()||renderer.present_pending()||present_calls!=before_latest+1||renderer.retry_present())
             throw std::runtime_error("Newer prepared frame did not supersede the old pending presentation.");
+        if(presented_cursors.size()!=2||presented_cursors.back().sequence!=5||presented_cursors.back().composition!=CursorComposition::NoSeparate)
+            throw std::runtime_error("Cancelled or replaced image leaked its cursor ownership.");
         // Exercise the queue/renderer boundary: a compressed arrival has not
         // produced replacement pixels, so it must not starve a prepared frame.
         ViewerQueue pending_frames;
         EncodedFrame metadata;metadata.session=1;metadata.sequence=0;metadata.capture_time_us=1000000;metadata.keyframe=true;metadata.data={1};
         if(!pending_frames.push(metadata,2000000))throw std::runtime_error("Prepared-frame test could not establish an epoch.");
         auto prepared=pending_frames.pop(2000000);
-        busy=true;decoder.feed(encoder.encode(source,6,false));
+        cursor={41,6,CursorComposition::Separate,true};busy=true;decoder.feed(encoder.encode(source,6,false));
         metadata.sequence=1;metadata.capture_time_us+=5000;metadata.keyframe=false;
         if(!prepared||!pending_frames.push(metadata,2005000)||pending_frames.presentable(*prepared,2005000))
             throw std::runtime_error("Prepared-frame test did not queue the newer compressed picture.");
@@ -1650,14 +1691,22 @@ bool media_render_self_test(std::string& report) {
         if(!renderer.retry_present([&]{return pending_frames.fresh(*prepared,2005000);})||renderer.present_pending()||
             present_calls!=before_arrival_retry+1||renderer.retry_present())
             throw std::runtime_error("Fresh prepared presentation starved behind a compressed arrival.");
-        busy=true;decoder.feed(encoder.encode(source,7,false));
+        cursor={41,7,CursorComposition::NoSeparate,true};busy=true;decoder.feed(encoder.encode(source,7,false));
         metadata.sequence=2;metadata.capture_time_us+=5000;metadata.keyframe=true;
         if(!pending_frames.push(metadata,2010000))throw std::runtime_error("Prepared-frame test replacement IDR was rejected.");
         const auto before_epoch_retry=present_calls;
         if(renderer.retry_present([&]{return pending_frames.fresh(*prepared,2010000);})||renderer.present_pending()||present_calls!=before_epoch_retry)
             throw std::runtime_error("Prepared presentation crossed a replacement IDR epoch.");
+        if(presented_cursors.size()!=3||presented_cursors.back().sequence!=6||presented_cursors.back().composition!=CursorComposition::Separate)
+            throw std::runtime_error("Replacement IDR epoch changed displayed cursor ownership.");
+        renderer.set_present_for_test([]{return DXGI_STATUS_OCCLUDED;});
+        cursor={42,0,CursorComposition::NoSeparate,true};decoder.feed(encoder.encode(source,8,false));
+        if(presented_cursors.size()!=3||!renderer.present_pending())throw std::runtime_error("Occluded frame changed cursor ownership.");
+        renderer.set_present_for_test([]{return S_OK;});
+        if(!renderer.retry_present()||presented_cursors.size()!=4||presented_cursors.back().session!=42||presented_cursors.back().sequence!=0)
+            throw std::runtime_error("First visible frame lost its session cursor ownership.");
         renderer.set_present_for_test({});
-        report = "PASS: actual NVENC444 -> NVDEC -> CUDA/D3D11 interop -> HWND swapchain; GPU backbuffer readback verifies four color quadrants, orientation, letterbox at 512x512 and pillarbox after resize to 640x360. Injected busy Present verifies final-static-frame retry without another decode, freshness cancellation, newest prepared frame replacement without replay, compressed-arrival progress, and replacement-IDR epoch rejection. Hidden window; no desktop interaction or physical-scanout claim.";
+        report = "PASS: actual NVENC444 -> NVDEC -> CUDA/D3D11 interop -> HWND swapchain; GPU backbuffer readback verifies four color quadrants, orientation, letterbox at 512x512 and pillarbox after resize to 640x360. Injected busy Present verifies final-static-frame retry without another decode, freshness cancellation, newest prepared frame replacement without replay, compressed-arrival progress, and replacement-IDR epoch rejection. Cursor metadata follows only successful presentation, including replacement, cancellation, occlusion and a new session. Hidden window; no desktop interaction or physical-scanout claim.";
         return true;
     } catch (const std::exception& error) { report = std::string("FAIL: ") + error.what(); return false; }
 }
@@ -1762,6 +1811,8 @@ bool media_pipeline_self_test(std::string& report) {
                         if (!encoder.receive(completion)) throw std::runtime_error("Pipeline ended before all submitted frames drained.");
                         if (completion.frame.sequence != expected || completion.frame.capture_time_us != timestamps[expected] || completion.frame.data.empty())
                             throw std::runtime_error("Pipeline changed sequence, capture timestamp or bitstream ownership.");
+                        if(completion.frame.cursor_composition!=static_cast<CursorComposition>(expected%3))
+                            throw std::runtime_error("Pipeline reused cursor metadata from a different encoding slot.");
                         if (completion.submitted_us < timestamps[expected] || completion.completed_us < completion.submitted_us || completion.total_us < completion.color_us ||
                             completion.frame.source_ready_us!=completion.completed_us||completion.frame.source_ready_us<completion.frame.capture_time_us)
                             throw std::runtime_error("Pipeline completion timing is not monotonic.");
@@ -1803,7 +1854,7 @@ bool media_pipeline_self_test(std::string& report) {
                         context->UpdateSubresource(texture.Get(),0,nullptr,source.bgra.data(),width*4,0); context->Flush();
                         timestamps[sequence] = now_us();
                         bool completion_queued = false;
-                        if (!encoder.submit_texture(texture.Get(),sequence,sequence==0 || sequence==12,timestamps[sequence],&completion_queued) || !completion_queued)
+                        if (!encoder.submit_texture(texture.Get(),sequence,sequence==0 || sequence==12,timestamps[sequence],&completion_queued,static_cast<CursorComposition>(sequence%3)) || !completion_queued)
                             throw std::runtime_error("Pipeline rejected a free slot.");
                     }
                     bool rejected_completion = true;
