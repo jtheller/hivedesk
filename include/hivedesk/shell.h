@@ -31,6 +31,7 @@ struct ShellCallbacks {
     std::function<void()> debug_tick;
     std::function<bool(const std::wstring&,const DesktopPreferences&)> save_preferences;
     std::function<bool()> restart_video;
+    std::function<bool()> restart;
 };
 class Shell {
 public:

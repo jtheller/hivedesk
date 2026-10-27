@@ -1,5 +1,28 @@
 # Alpha validation
 
+## Alpha 36 preferences, manual restart and endpoint versions
+
+- Relative mouse is a persistent local checkbox in WinUI and native fallback
+  Settings. Save/load and startup use the same preference; old configuration
+  files default to absolute input. The tray menu now offers Restart HiveDesk.
+  Manual restart uses normal shutdown/input release and starts a quiet successor
+  that waits for the predecessor to exit; duplicate queued restarts are ignored.
+- Version announcements use an optional capability on the encrypted control
+  channel. Existing hello/challenge and media formats are unchanged. Debug shows
+  separate local-viewer and remote-host versions, amber on mismatch and Unknown
+  for peers without version information. Disconnect metadata is copied under
+  the same lock used for live peer metadata updates.
+- Release build and 30/30 native checks passed. Coverage includes isolated INI
+  persistence/legacy defaults, quiet and Settings-opening successor processes,
+  predecessor exit ordering/handle isolation, encrypted bidirectional version
+  exchange and malformed/unnegotiated/wrong-channel version rejection.
+- Hidden debug rendering passed at 100/150/200 percent DPI, including version
+  labels, unknown/mismatch tones and bounds. Its generated image was visually
+  inspected. Private-desktop light/dark WinUI checks verify checkbox placement,
+  save/reload/disable and a visible Save button in the fixed-size window. Managed
+  update/GPU bridge checks also passed. No live desktop input or tray restart
+  was injected; physical two-machine interaction remains user acceptance.
+
 ## Alpha 35 GPU policy save permissions
 
 - NVIDIA access denied (-175) is mapped explicitly even when driver error text

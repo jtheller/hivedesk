@@ -30,7 +30,7 @@ int main(){SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
     hive::ViewerDiagnostics view;view.session=1;view.received_millihz=59940;view.decoded_millihz=59940;view.presented_millihz=58500;view.receive_kbps=123400;view.decode_us=2500;view.render_us=1500;view.present_us=300;view.service_p90_us=8900;view.skipped=12;shell.update_viewer_diagnostics("debug-test",view);pump(500);
     HWND badge=FindWindowW(L"HiveDesk.Health",nullptr);require(badge!=nullptr,"Missing debug overlay");
     require(GetWindowLongPtrW(badge,GWL_EXSTYLE)&WS_EX_NOACTIVATE,"Debug overlay can activate");require(SendMessageW(badge,WM_NCHITTEST,0,0)==HTTRANSPARENT,"Debug overlay intercepts input");
-    require(IsWindowVisible(badge),"Windows denied foreground or debug overlay did not show");RECT r{};GetClientRect(badge,&r);const int dpi=int(GetDpiForWindow(badge));require(r.right==MulDiv(460,dpi,96)&&r.bottom==MulDiv(438,dpi,96),"Incorrect debug dimensions");capture(badge);
+    require(IsWindowVisible(badge),"Windows denied foreground or debug overlay did not show");RECT r{};GetClientRect(badge,&r);const int dpi=int(GetDpiForWindow(badge));require(r.right==MulDiv(460,dpi,96)&&r.bottom==MulDiv(474,dpi,96),"Incorrect debug dimensions");capture(badge);
     shell.show_local();pump(50);require(!IsWindowVisible(badge),"Debug overlay remained on local desktop");
     std::puts("PASS synthetic debug overlay: visible, fixed bounds, nonactivating, pointer-transparent, hidden on local return; rendered BMP saved.");return 0;
 }catch(const std::exception& e){std::printf("FAIL debug overlay: %s\n",e.what());return 1;}}

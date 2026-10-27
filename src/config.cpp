@@ -55,6 +55,7 @@ AppConfig load_config() {
     config.desktop.startup=GetPrivateProfileIntW(L"HiveDesk",L"Startup",1,path.c_str())!=0;
     config.desktop.tray_icon=GetPrivateProfileIntW(L"HiveDesk",L"TrayIcon",1,path.c_str())!=0;
     config.desktop.debug_overlay=GetPrivateProfileIntW(L"HiveDesk",L"DebugOverlay",0,path.c_str())!=0;
+    config.desktop.relative_mouse=GetPrivateProfileIntW(L"HiveDesk",L"RelativeMouse",0,path.c_str())!=0;
     config.desktop.hotkey_modifiers=GetPrivateProfileIntW(L"HiveDesk",L"HotkeyModifiers",3,path.c_str());
     config.desktop.hotkey_key=GetPrivateProfileIntW(L"HiveDesk",L"HotkeyKey",'H',path.c_str());
     if(!valid_hive_hotkey(config.desktop.hotkey_modifiers,config.desktop.hotkey_key)){config.desktop.hotkey_modifiers=3;config.desktop.hotkey_key='H';}
@@ -70,6 +71,7 @@ void save_config(const AppConfig& config) {
     write(L"DeviceId",widen(config.device_id)); write(L"Name",config.name);
     write(L"Startup",config.desktop.startup?L"1":L"0");write(L"TrayIcon",config.desktop.tray_icon?L"1":L"0");
     write(L"DebugOverlay",config.desktop.debug_overlay?L"1":L"0");
+    write(L"RelativeMouse",config.desktop.relative_mouse?L"1":L"0");
     write(L"HotkeyModifiers",std::to_wstring(config.desktop.hotkey_modifiers));write(L"HotkeyKey",std::to_wstring(config.desktop.hotkey_key));
     write(L"FPS",std::to_wstring(config.stream.fps)); write(L"BitrateMbps",std::to_wstring(config.stream.bitrate_mbps));
 }

@@ -5,6 +5,11 @@ Windows-native personal LAN desktop switching. This is an early hardware-tested 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+Alpha.36 moves **Relative mouse** into Settings as a saved checkbox, adds
+**Restart HiveDesk** to the tray menu, and shows viewer/host versions at the top
+of the debug overlay. Different versions are amber; older peers that do not
+announce a version show **Unknown**.
+
 Alpha.35 handles NVIDIA access-denied errors when saving the GPU performance
 preference. Windows requests permission for the small settings helper only when
 needed. Failed saves no longer automatically suggest restarting HiveDesk.

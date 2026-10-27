@@ -129,6 +129,14 @@ public:
             }
             wake_.notify_one();return true;
         };
+        callbacks.restart=[this] {
+            return enqueue([this]{
+                if(updating_||closing_)return;
+                hive::gpu_policy_restart::Relaunch relaunch(false);
+                if(!relaunch.commit())throw std::runtime_error("Could not restart HiveDesk; the current process is still running.");
+                updating_=true;status("Restarting HiveDesk.");shell_.quit();
+            });
+        };
         std::string error;
         if(!shell_.create(instance,{config_.name,config_.group_key,config_.stream,config_.desktop},std::move(callbacks),error))throw std::runtime_error(error);
         const bool initially_show_settings=(config_.first_run||open_settings)&&!video_restart_pending_;

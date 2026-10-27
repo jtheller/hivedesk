@@ -34,7 +34,7 @@ constexpr UINT UiTask=WM_APP+41, TrayMessage=WM_APP+42, ClipboardApply=WM_APP+43
 constexpr ULONG_PTR InputMarker=0x48495645;
 constexpr COLORREF Background=RGB(19,22,29), Card=RGB(34,39,49), Selected=RGB(37,66,80);
 constexpr COLORREF Accent=RGB(94,217,213), Text=RGB(240,243,247), Muted=RGB(162,172,188);
-constexpr int Name=101, Save=111, Close=113, Startup=117, TrayIcon=118, Hotkey=119, DebugOverlay=120;
+constexpr int Name=101, Save=111, Close=113, Startup=117, TrayIcon=118, Hotkey=119, DebugOverlay=120, RelativeMouse=121;
 std::wstring wide(const std::string& s) {
     if(s.empty()) return {};
     int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),nullptr,0);
@@ -252,10 +252,11 @@ struct Shell::Impl {
     }
     void tray_menu() {
         HMENU m=CreatePopupMenu();AppendMenuW(m,MF_STRING,1,L"Computers");AppendMenuW(m,MF_STRING,2,L"Settings");
-        AppendMenuW(m,MF_STRING|(relative_mode?MF_CHECKED:0)|(raw_mouse_available?0:MF_GRAYED),5,L"Relative mouse (games)");AppendMenuW(m,MF_STRING,3,L"Return to this computer");AppendMenuW(m,MF_SEPARATOR,0,nullptr);AppendMenuW(m,MF_STRING,4,L"Quit HiveDesk");
+        AppendMenuW(m,MF_STRING,3,L"Return to this computer");AppendMenuW(m,MF_SEPARATOR,0,nullptr);AppendMenuW(m,MF_STRING,5,L"Restart HiveDesk");AppendMenuW(m,MF_STRING,4,L"Quit HiveDesk");
         POINT p{};GetCursorPos(&p);SetForegroundWindow(owner);
         int chosen=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,owner,nullptr);DestroyMenu(m);PostMessageW(owner,WM_NULL,0,0);
-        if(chosen==1)show_panel(2);else if(chosen==2)settings_ui();else if(chosen==3)local(true);else if(chosen==4)SendMessageW(owner,WM_CLOSE,0,0);else if(chosen==5)set_relative(!relative_mode);
+        if(chosen==1)show_panel(2);else if(chosen==2)settings_ui();else if(chosen==3)local(true);else if(chosen==4)SendMessageW(owner,WM_CLOSE,0,0);
+        else if(chosen==5){local(true);if(!callbacks.restart||!callbacks.restart())MessageBoxW(owner,L"Could not request restart. HiveDesk is still running.",L"HiveDesk",MB_OK|MB_ICONERROR);}
     }
     std::pair<std::wstring,std::wstring> card_label(int index) const {
         if(index==0)return {config.device_name.empty()?L"This computer":config.device_name,L"This computer"};
@@ -296,7 +297,9 @@ struct Shell::Impl {
         const int index=row+scroll;return index<=static_cast<int>(peers.size())?index:-1;
     }
     DebugRows debug_rows() {
-        return build_debug_rows({remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time},debug_pulses);
+        const auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==active_id&&p.authenticated;});
+        return build_debug_rows({remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time,
+            wide(HIVEDESK_VERSION),peer==peers.end()?std::wstring{}:wide(peer->version)},debug_pulses);
     }
     void paint_health() {
         RECT rect{};GetClientRect(health_badge,&rect);DebugRows rows;
@@ -316,7 +319,7 @@ struct Shell::Impl {
         if(health_badge) {
             if(remote&&(reconnecting||warning||config.desktop.debug_overlay)&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
-                const int width=px(reconnecting?280:config.desktop.debug_overlay?460:136),height=px(!reconnecting&&config.desktop.debug_overlay?438:30);RECT bounds{};GetWindowRect(health_badge,&bounds);
+                const int width=px(reconnecting?280:config.desktop.debug_overlay?460:136),height=px(!reconnecting&&config.desktop.debug_overlay?474:30);RECT bounds{};GetWindowRect(health_badge,&bounds);
                 const int inset=px(16);
                 if(!IsWindowVisible(health_badge)||bounds.left!=inset||bounds.top!=inset||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOPMOST,inset,inset,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);InvalidateRect(health_badge,nullptr,FALSE);}
                 if(config.desktop.debug_overlay||reconnecting)InvalidateRect(health_badge,nullptr,FALSE);
@@ -455,11 +458,12 @@ struct Shell::Impl {
         std::vector<std::wstring> fields;size_t start=0;for(size_t i=0;i<count;++i)if(!chars[i]){fields.emplace_back(chars+start,i-start);start=i+1;}
         if(fields.empty())return 0;
         if(fields[0]==L"restart-video"&&fields.size()==1)return callbacks.restart_video&&callbacks.restart_video()?1:0;
-        if(fields[0]==L"preferences"&&(fields.size()==6||fields.size()==7)){
-            DesktopPreferences desktop=config.desktop;uint32_t startup=0,tray_icon=0,debug=0;
+        if(fields[0]==L"preferences"&&(fields.size()==6||fields.size()==7||fields.size()==8)){
+            DesktopPreferences desktop=config.desktop;uint32_t startup=0,tray_icon=0,debug=0,relative=0;
             if(!number(fields[2],startup)||startup>1||!number(fields[3],tray_icon)||tray_icon>1||!number(fields[4],desktop.hotkey_modifiers)||!number(fields[5],desktop.hotkey_key))return 0;
             desktop.startup=startup!=0;desktop.tray_icon=tray_icon!=0;
-            if(fields.size()==7){if(!number(fields[6],debug)||debug>1)return 0;desktop.debug_overlay=debug!=0;}
+            if(fields.size()>=7){if(!number(fields[6],debug)||debug>1)return 0;desktop.debug_overlay=debug!=0;}
+            if(fields.size()==8){if(!number(fields[7],relative)||relative>1)return 0;desktop.relative_mouse=relative!=0;}
             return apply_preferences(fields[1],desktop);
         }
         if(fields[0]==L"record"&&fields.size()==2){
@@ -475,7 +479,7 @@ struct Shell::Impl {
         if(hotkey_changed&&!RegisterHotKey(owner,next_id,desktop.hotkey_modifiers|MOD_NOREPEAT,desktop.hotkey_key))return false;
         if(callbacks.save_preferences&&!callbacks.save_preferences(name,desktop)){if(hotkey_changed)UnregisterHotKey(owner,next_id);return false;}
         if(hotkey_changed){UnregisterHotKey(owner,hotkey_id);hotkey_id=next_id;hotkey_registered=true;}
-        config.device_name=name;config.desktop=desktop;publish_input();tray();if(health_badge){ShowWindow(health_badge,SW_HIDE);InvalidateRect(health_badge,nullptr,FALSE);}InvalidateRect(panel,nullptr,FALSE);return true;
+        config.device_name=name;config.desktop=desktop;set_relative(desktop.relative_mouse);publish_input();tray();if(health_badge){ShowWindow(health_badge,SW_HIDE);InvalidateRect(health_badge,nullptr,FALSE);}InvalidateRect(panel,nullptr,FALSE);return true;
     }
     void settings_ui() {
         if(!settings_restart.open())return;
@@ -494,6 +498,7 @@ struct Shell::Impl {
         for(const auto* label:{L"Keep current shortcut",L"Ctrl + Alt + H",L"Ctrl + Shift + H",L"Win + Alt + H"})SendMessageW(hotkey,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(label));
         SendMessageW(hotkey,CB_SETCURSEL,0,0);
         HWND debug=child(L"BUTTON",L"Debug overlay",BS_AUTOCHECKBOX|WS_TABSTOP,DebugOverlay,24,302,200,26);SendMessageW(debug,BM_SETCHECK,config.desktop.debug_overlay?BST_CHECKED:BST_UNCHECKED,0);
+        HWND relative=child(L"BUTTON",L"Relative mouse",BS_AUTOCHECKBOX|WS_TABSTOP,RelativeMouse,244,302,230,26);SendMessageW(relative,BM_SETCHECK,config.desktop.relative_mouse?BST_CHECKED:BST_UNCHECKED,0);EnableWindow(relative,raw_mouse_available);
         child(L"BUTTON",L"Save",BS_PUSHBUTTON|WS_TABSTOP,Save,24,350,120,32);
         child(L"STATIC",wide(HIVEDESK_VERSION).c_str(),0,0,164,355,185,24);
         child(L"BUTTON",L"Close",BS_PUSHBUTTON|WS_TABSTOP,Close,354,350,120,32);
@@ -502,6 +507,7 @@ struct Shell::Impl {
     void save_settings() {
         auto desktop=config.desktop;desktop.startup=SendDlgItemMessageW(settings,Startup,BM_GETCHECK,0,0)==BST_CHECKED;desktop.tray_icon=SendDlgItemMessageW(settings,TrayIcon,BM_GETCHECK,0,0)==BST_CHECKED;
         desktop.debug_overlay=SendDlgItemMessageW(settings,DebugOverlay,BM_GETCHECK,0,0)==BST_CHECKED;
+        desktop.relative_mouse=SendDlgItemMessageW(settings,RelativeMouse,BM_GETCHECK,0,0)==BST_CHECKED;
         const auto selected=SendDlgItemMessageW(settings,Hotkey,CB_GETCURSEL,0,0);
         if(selected>=1&&selected<=3){desktop.hotkey_key='H';desktop.hotkey_modifiers=selected==1?3:selected==2?6:9;}
         if(!apply_preferences(control_text(GetDlgItem(settings,Name)),desktop))MessageBoxW(settings,L"Could not save. Check the name and choose an available shortcut.",L"HiveDesk",MB_OK|MB_ICONINFORMATION);
@@ -539,6 +545,7 @@ struct Shell::Impl {
             case WM_APP+44:return s->relative_mode?1:0;
             case WM_APP+45:s->settings_ui();return 0;
             case WM_APP+46:return s->hotkey_registered?1:0;
+            case WM_APP+49:return s->raw_mouse_available?1:0;
             case UiTask:{std::unique_ptr<std::function<void()>> task(reinterpret_cast<std::function<void()>*>(l));if(task&&!s->shutting_down)(*task)();return 0;}
             case ClipboardApply:{
                 std::shared_ptr<ClipboardJob> job;{std::lock_guard lock(s->jobs_mutex);auto it=s->jobs.find(static_cast<uint64_t>(w));if(it!=s->jobs.end())job=it->second;}
@@ -621,6 +628,7 @@ struct Shell::Impl {
             else if(callbacks.input)callbacks.input(event);
         },error))return false;
         raw_mouse_available=input_capture.raw_mouse_available();
+        relative_mode=config.desktop.relative_mouse&&raw_mouse_available;publish_input();
         if(!AddClipboardFormatListener(owner)){error="Could not listen for clipboard text changes.";return false;}
         hotkey_registered=RegisterHotKey(owner,hotkey_id,config.desktop.hotkey_modifiers|MOD_NOREPEAT,config.desktop.hotkey_key)!=FALSE;
         if(!hotkey_registered)log_hotkey_conflict();

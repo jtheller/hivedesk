@@ -8,6 +8,7 @@ struct DesktopPreferences {
     bool startup=true,tray_icon=true;
     uint32_t hotkey_modifiers=3,hotkey_key='H'; // MOD_CONTROL | MOD_ALT
     bool debug_overlay=false;
+    bool relative_mouse=false;
 };
 inline bool valid_hive_hotkey(uint32_t modifiers,uint32_t key){
     return modifiers>0&&modifiers<=15&&(modifiers&11)&&
@@ -20,6 +21,7 @@ struct Peer {
     uint16_t port = 47980;
     bool authenticated = false;
     uint32_t features = 0;
+    std::string version;
 };
 constexpr uint32_t FeatureDesktopAux = 1;
 constexpr uint32_t FeatureAutomaticStream = 2;
@@ -30,6 +32,7 @@ constexpr uint32_t FeatureAutoRate = 64;
 constexpr uint32_t FeatureDedicatedInput = 128;
 constexpr uint32_t FeatureFrameTiming = 256;
 constexpr uint32_t FeatureCursorComposition = 512;
+constexpr uint32_t FeatureBuildVersion = 1024;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 struct Snapshot { uint64_t request = 0; std::vector<uint8_t> jpeg; };

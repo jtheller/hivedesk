@@ -84,7 +84,7 @@ class Relaunch {
     PROCESS_INFORMATION child_{};
     bool committed_=false;
 public:
-    Relaunch() {
+    explicit Relaunch(bool show_settings=true) {
         HANDLE previous=nullptr;
         if(!DuplicateHandle(GetCurrentProcess(),GetCurrentProcess(),GetCurrentProcess(),&previous,SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,TRUE,0))throw std::runtime_error("Prepare video restart process handle");
         SIZE_T size=0;InitializeProcThreadAttributeList(nullptr,1,0,&size);
@@ -95,6 +95,7 @@ public:
         wchar_t module[32768]{};const bool path_ok=GetModuleFileNameW(nullptr,module,32768)!=0;
         const std::filesystem::path executable=module;
         std::wstring command=L"\""+executable.wstring()+L"\" --restart-after "+std::to_wstring(reinterpret_cast<uintptr_t>(previous));
+        if(!show_settings)command+=L" --quiet";
         STARTUPINFOEXW startup{};startup.StartupInfo.cb=sizeof(startup);startup.StartupInfo.dwFlags=STARTF_USESHOWWINDOW;startup.StartupInfo.wShowWindow=SW_HIDE;startup.lpAttributeList=attributes;
         const bool created=listed&&path_ok&&CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,TRUE,
             CREATE_SUSPENDED|CREATE_NO_WINDOW|EXTENDED_STARTUPINFO_PRESENT,nullptr,executable.parent_path().c_str(),&startup.StartupInfo,&child_)!=FALSE;

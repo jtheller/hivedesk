@@ -10,6 +10,7 @@ struct DebugOverlayState {
     uint32_t width=0,height=0;
     StreamHealth health;SourceDiagnostics source;ViewerDiagnostics viewer;InputDiagnostics input;
     uint64_t now=0,source_time=0,health_time=0;
+    std::wstring viewer_version,host_version;
 };
 inline DebugRows build_debug_rows(const DebugOverlayState& state,std::array<DiagnosticPulse,6>& debug_pulses) {
         using T=DiagnosticTone;const auto now=state.now;const auto& v=state.viewer;const auto& d=state.source;const auto& input=state.input;
@@ -29,6 +30,8 @@ inline DebugRows build_debug_rows(const DebugOverlayState& state,std::array<Diag
         auto input_ms=[&](const wchar_t* label,uint32_t n,uint32_t warning,uint32_t critical){return DebugSpan{std::wstring(label)+(input_fresh?num(n/1000.0):L"--"),diagnostic_threshold(n,warning,critical,input_fresh)};};
         DebugRows rows{
             {{L"HiveDesk debug  "+std::to_wstring(remote_width)+L" x "+std::to_wstring(remote_height)+L"  HEVC 4:4:4"}},
+            {{L"Viewer (this PC): "+(state.viewer_version.empty()?std::wstring(L"Unknown"):state.viewer_version),state.viewer_version.empty()?T::Muted:T::Normal}},
+            {{L"Host (remote): "+(state.host_version.empty()?std::wstring(L"Unknown"):state.host_version),state.host_version.empty()?T::Muted:state.host_version!=state.viewer_version?T::Warning:T::Normal}},
             {metric(L"Target ",stream_health.target_millihz/1000.0),metric(L"   Cap ",stream_health.rate_millihz/1000.0,health_time&&now-health_time<2000?(stream_health.pressure?T::Warning:T::Normal):T::Muted),{L" fps"}},
             {{L"Limit: "},{stream_health.pressure&PressureEncode?L"encode ":L"",T::Warning},{stream_health.pressure&PressureDecode?L"decode/render ":L"",T::Warning},{stream_health.pressure&PressureNetwork?L"network ":L"",T::Warning},{stream_health.pressure?L"":L"none"}},
             {metric(L"FPS  RX ",v.received_millihz/1000.0,v.receive_sample_age_us<500000?T::Normal:T::Muted),metric(L"   Decode ",v.decoded_millihz/1000.0,view_fresh?T::Normal:T::Muted),metric(L"   Present ",v.presented_millihz/1000.0,view_fresh?T::Normal:T::Muted)},

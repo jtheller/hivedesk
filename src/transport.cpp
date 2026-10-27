@@ -47,7 +47,7 @@ constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 constexpr auto kVideoWriteBudget = std::chrono::milliseconds(150);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -204,7 +204,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -434,16 +434,16 @@ struct Transport::Impl {
     void status(const std::string& s) { if (callbacks.status) { try { callbacks.status(s); } catch (...) {} } }
     void ended(Conn& c) {
         if (!running) return;
-        bool notify = false; {
+        bool notify = false;Peer ended_peer; {
             std::lock_guard lock(mutex); auto it = connected.find(c.peer.id);
             if(it!=connected.end()&&(it->second.control.get()==&c||it->second.video.get()==&c||it->second.input.get()==&c)) {
                 if(it->second.control)it->second.control->close();
                 if(it->second.video)it->second.video->close();
                 if(it->second.input)it->second.input->close();
-                connected.erase(it);notify=true;
+                ended_peer=c.peer;connected.erase(it);notify=true;
             }
         }
-        if (notify) { Peer p = c.peer; p.authenticated = false; if (callbacks.peer) { try { callbacks.peer(p); } catch (...) {} } status("Connection closed: " + c.peer.name); }
+        if (notify) { ended_peer.authenticated = false; if (callbacks.peer) { try { callbacks.peer(ended_peer); } catch (...) {} } status("Connection closed: " + ended_peer.name); }
     }
     bool handshake(Conn& c, bool client, uint8_t requested) {
         if(cfg.automatic_lan&&!on_link(c.peer.address))return false;
@@ -501,6 +501,11 @@ struct Transport::Impl {
             slot = c; c->ready = true;
         }
         if (!c->channel && callbacks.peer) { try { callbacks.peer(c->peer); } catch (...) {} }
+        // Keep the authenticated hello layout and its random challenge intact.
+        // Older peers never receive the optional encrypted version announcement.
+        if(!c->channel&&(c->peer.features&FeatureBuildVersion)){
+            Bytes version{BuildVersion};str(version,HIVEDESK_VERSION);if(!c->enqueue(std::move(version)))return false;
+        }
         return true;
     }
     std::shared_ptr<Conn> add(SOCKET socket, const std::string& address) {
@@ -633,6 +638,13 @@ struct Transport::Impl {
         case Rename:{
             auto name=r.string(256);if(!cfg.automatic_lan||!text_ok(name,256)||!r.end())return false;
             Peer updated;{std::lock_guard lock(mutex);c.peer.name=std::move(name);updated=c.peer;}
+            if(callbacks.peer)callbacks.peer(updated);return true;
+        }
+        case BuildVersion:{
+            auto version=r.string(32);
+            if(!(c.peer.features&FeatureBuildVersion)||!r.end()||version.empty()||
+                !std::all_of(version.begin(),version.end(),[](unsigned char ch){return (ch>='0'&&ch<='9')||(ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||ch=='.'||ch=='-'||ch=='+';}))return false;
+            Peer updated;{std::lock_guard lock(mutex);c.peer.version=std::move(version);updated=c.peer;}
             if(callbacks.peer)callbacks.peer(updated);return true;
         }
         case AutoStart: {
@@ -984,6 +996,21 @@ bool Transport::discovery_self_test(std::string& result){
     result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
 }
 bool Transport::self_test(std::string& result) {
+    {
+        Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);
+        control.channel=0;control.peer.features=FeatureBuildVersion;
+        Bytes packet{BuildVersion};str(packet,"0.1.0-alpha.36");
+        if(!owner.dispatch(control,packet)||control.peer.version!="0.1.0-alpha.36"){result="Build version announcement lost";return false;}
+        for(const auto& invalid:{std::string{},std::string(33,'1'),std::string("1.0\nFAKE"),std::string("1.0 xyz")}){
+            Bytes bad{BuildVersion};str(bad,invalid);
+            if(owner.dispatch(control,bad)){result="Invalid build version accepted";return false;}
+        }
+        auto truncated=packet;truncated.pop_back();auto trailing=packet;trailing.push_back(0);
+        if(owner.dispatch(control,truncated)||owner.dispatch(control,trailing)){result="Malformed build version accepted";return false;}
+        control.peer.features=0;if(owner.dispatch(control,packet)){result="Unnegotiated build version accepted";return false;}
+        control.peer.features=FeatureBuildVersion;
+        for(const uint8_t channel:{uint8_t(1),uint8_t(2)}){control.channel=channel;if(owner.dispatch(control,packet)){result="Build version accepted on media/input channel";return false;}}
+    }
     {
         InputSendWindow queue;queue.reset(71);
         uint64_t sequence=0;
@@ -1446,7 +1473,8 @@ bool Transport::self_test(std::string& result) {
         if(!first.generate(a)||!second.generate(b)||a==b||!first.derive(b,ka)||!second.derive(a,kb)||!equal_key(ka,kb)){result="Ephemeral ECDH agreement failed";return false;}
         b[0]^=1;if(first.derive(b,kb)){result="Invalid ECDH public key accepted";return false;}
         Transport left,right;std::string error,id;std::mutex guard;std::condition_variable changed;bool text=false,frame=false,renamed=false;
-        bool ready_notified=false;TransportCallbacks received,sending;
+        bool ready_notified=false,version_received=false,reverse_version=false;TransportCallbacks received,sending;
+        sending.peer=[&](const Peer& peer){std::lock_guard lock(guard);if(peer.version==HIVEDESK_VERSION)reverse_version=true;changed.notify_all();};
         sending.frame_ready=[&](const std::string& peer){
             // Query readiness from the callback to catch accidental invocation
             // while the transport's queue/map locks are still held.
@@ -1455,15 +1483,15 @@ bool Transport::self_test(std::string& result) {
         };
         received.clipboard=[&](const std::string&,const std::wstring& value){std::lock_guard lock(guard);text=value==L"keyless";changed.notify_all();};
         received.frame=[&](const std::string&,EncodedFrame value){std::lock_guard lock(guard);frame=value.data==Bytes({1,2,3});changed.notify_all();};
-        received.peer=[&](const Peer& peer){std::lock_guard lock(guard);if(peer.name=="Renamed without disconnect")renamed=true;changed.notify_all();};
+        received.peer=[&](const Peer& peer){std::lock_guard lock(guard);if(peer.name=="Renamed without disconnect")renamed=true;if(peer.version==HIVEDESK_VERSION)version_received=true;changed.notify_all();};
         if(!left.start({"lan-a","LAN A","",0,false,true},sending,error)||!right.start({"lan-b","LAN B","",0,false,true},received,error)||
             !left.connect("127.0.0.1",right.impl_->cfg.port,id,error)){result="Keyless dual-channel handshake: "+error;return false;}
         left.rename("Renamed without disconnect");EncodedFrame picture;picture.width=2;picture.height=2;picture.keyframe=true;picture.data={1,2,3};
         bool ok=left.send_clipboard(id,L"keyless")&&left.send_frame(id,picture);
-        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(3),[&]{return text&&frame&&renamed&&ready_notified;})&&ok;}
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(3),[&]{return text&&frame&&renamed&&ready_notified&&version_received&&reverse_version;})&&ok;}
         Transport legacy;const auto old_key=generate_group_key();
         if(!legacy.start({"legacy","Legacy",old_key,0,false},{},error)||legacy.connect("127.0.0.1",right.impl_->cfg.port,id,error))ok=false;
-        if(!ok){result="Keyless encrypted channels, live rename, or legacy isolation failed";return false;}
+        if(!ok){result="Keyless encrypted channels, bidirectional version, live rename, or legacy isolation failed";return false;}
     }
     {
         auto hello=make_hello({"feature-test","Features","Test1234",47980,false},0);
