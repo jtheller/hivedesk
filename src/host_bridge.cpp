@@ -62,7 +62,8 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
             }
         }catch(const std::exception& e){if(!announced){announced=true;promise->set_value(e.what());}else log(std::string("Desktop service connection: ")+e.what());}
         if(!announced)promise->set_value("Desktop service closed before capture started.");
-        impl_->stopped=true;
+        {std::lock_guard lock(impl_->activation_mutex);impl_->stopped=true;}
+        impl_->activation_changed.notify_all();
         // The input owner notices this cancellation even if media failed while
         // Start was still establishing its independent pipe. Its ACK reader
         // closes that pipe and the broker releases all held input.
@@ -128,7 +129,8 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
 }
 void HostBridge::stop(){
     revoke_input();
-    impl_->stopped=true;
+    {std::lock_guard lock(impl_->activation_mutex);impl_->stopped=true;}
+    impl_->activation_changed.notify_all();
     impl_->downstream.notify();
     if(impl_->pipe!=INVALID_HANDLE_VALUE)CancelIoEx(impl_->pipe,nullptr);
     if(impl_->reader.joinable()){CancelSynchronousIo(impl_->reader.native_handle());impl_->reader.join();}

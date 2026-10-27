@@ -10,7 +10,7 @@ Existing alpha installations can upgrade through the same signed, idle-only OTA.
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
-0.4.0 warms the visible Hive computers before selection, retains their media
+0.4.3 warms the visible Hive computers before selection, retains their media
 resources after a single decoded picture, and promotes the selected session
 without rebuilding its decoder/window. Debug adds bounded per-frame and input
 traces. HEVC 4:4:4 codec settings are unchanged. See the

@@ -61,7 +61,7 @@ inline bool transfer(HANDLE pipe,void* data,size_t bytes,bool write,const std::a
     CloseHandle(operation.hEvent);return ok;
 }
 inline bool send(HANDLE pipe,Kind kind,const Bytes& data={},const std::atomic<bool>* cancel=nullptr){if(data.size()>MaxBytes)return false;uint32_t header[]{Magic,kind,uint32_t(data.size())};return transfer(pipe,header,sizeof(header),true,cancel)&&(data.empty()||transfer(pipe,const_cast<uint8_t*>(data.data()),data.size(),true,cancel));}
-inline bool receive(HANDLE pipe,Kind& kind,Bytes& data,const std::atomic<bool>* cancel=nullptr,uint32_t max_bytes=MaxBytes){uint32_t header[3]{};if(!transfer(pipe,header,sizeof(header),false,cancel)||header[0]!=Magic||header[1]<Start||header[1]>InputComplete||header[2]>max_bytes)return false;kind=Kind(header[1]);data.resize(header[2]);return data.empty()||transfer(pipe,data.data(),data.size(),false,cancel);}
+inline bool receive(HANDLE pipe,Kind& kind,Bytes& data,const std::atomic<bool>* cancel=nullptr,uint32_t max_bytes=MaxBytes){uint32_t header[3]{};if(!transfer(pipe,header,sizeof(header),false,cancel)||header[0]!=Magic||header[1]<Start||header[1]>Activated||header[2]>max_bytes)return false;kind=Kind(header[1]);data.resize(header[2]);return data.empty()||transfer(pipe,data.data(),data.size(),false,cancel);}
 inline bool valid_input(const InputEvent& e){switch(e.kind){
 case InputKind::Key:return e.a>0&&e.a<=255&&(e.b==0||e.b==1)&&(e.c==0||e.c==1);
 case InputKind::Absolute:return e.a>=0&&e.a<=65535&&e.b>=0&&e.b<=65535;

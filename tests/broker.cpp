@@ -135,6 +135,10 @@ int main(){try{
     }
     {Pipe p;std::atomic<bool> cancel=false;auto read=std::async(std::launch::async,[&]{broker::Bytes received;broker::Kind kind;return broker::receive(p.server,kind,received,&cancel);});Sleep(20);cancel=true;require(read.wait_for(std::chrono::seconds(2))==std::future_status::ready&&!read.get(),"Idle read cancellation");}
     {Pipe p;std::atomic<bool> cancel=false;broker::Bytes large(1024*1024,42);auto write=std::async(std::launch::async,[&]{return broker::send(p.server,broker::Frame,large,&cancel);});Sleep(20);cancel=true;require(write.wait_for(std::chrono::seconds(2))==std::future_status::ready&&!write.get(),"Blocked frame cancellation");}
+    {Pipe p;broker::Kind kind;broker::Bytes payload;
+        require(broker::send(p.client,broker::Activate)&&broker::receive(p.server,kind,payload)&&kind==broker::Activate&&payload.empty(),"Warm activation rejected by broker wire");
+        require(broker::send(p.server,broker::Activated)&&broker::receive(p.client,kind,payload)&&kind==broker::Activated&&payload.empty(),"Warm activation acknowledgement rejected by bridge wire");
+    }
     readiness_check();rate_extension_check();frame_composition_check();
     std::puts("PASS broker: framing, cursor ownership/provenance, mixed-version rejection, invalid input/headers, I/O cancellation, bounded frame credit, readiness wake races, and blocked-credit cancellation.");return 0;
 }catch(const std::exception& e){std::printf("FAIL broker: %s\n",e.what());return 1;}}

@@ -1281,6 +1281,8 @@ bool Transport::self_test(std::string& result) {
         Bytes request{WarmStart};u64(request,71);u32(request,100000);
         Bytes cancel{WarmCancel};u64(cancel,71);
         if(owner.dispatch(control,request)||owner.dispatch(control,cancel)){result="Unnegotiated prewarm accepted";return false;}
+        control.peer.features|=4096; // Broken 0.4.0-0.4.2 capability is reserved.
+        if(owner.dispatch(control,request)||owner.dispatch(control,cancel)){result="Legacy broken prewarm capability accepted";return false;}
         control.peer.features|=FeatureWarmStream;unsigned starts=0,cancels=0;
         owner.callbacks.start_stream=[&](const std::string&,const StreamSettings& settings){if(settings.warm&&settings.session==71&&settings.receiver_millihz==100000)++starts;};
         owner.callbacks.cancel_warm=[&](const std::string&,uint64_t session){if(session==71)++cancels;};

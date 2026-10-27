@@ -26,7 +26,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace hive {int host_check();}
+namespace hive {int host_check();int warm_broker_check();}
 namespace {
 using MonitorSide=hive::Telemetry::Side;
 class App {
@@ -767,12 +767,13 @@ private:
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false;
+    int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false,warm_check=false;
     HANDLE previous=nullptr;bool valid_arguments=true,recover=false,manual_restart=false;
     if(arguments){for(int i=1;i<count;++i){
         if(wcscmp(arguments[i],L"--background")==0)background=true;
         else if(wcscmp(arguments[i],L"--quiet")==0)quiet=true;
         else if(wcscmp(arguments[i],L"--host-check")==0)host_check=true;
+        else if(wcscmp(arguments[i],L"--warm-broker-check")==0)warm_check=true;
         else if(wcscmp(arguments[i],L"--restart")==0)manual_restart=true;
         else if(wcscmp(arguments[i],L"--restart-after")==0){if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
         else if(wcscmp(arguments[i],L"--recover-after")==0){recover=true;if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
@@ -807,6 +808,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!singleton)return 1;
     const DWORD singleton_status=GetLastError();
     if(host_check){CloseHandle(singleton);return hive::host_check();}
+    if(warm_check){CloseHandle(singleton);return hive::warm_broker_check();}
     if(singleton_status==ERROR_ALREADY_EXISTS){if(open_settings){const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr);DWORD process=0;GetWindowThreadProcessId(owner,&process);AllowSetForegroundWindow(process);PostMessageW(owner,WM_APP+45,0,0);}CloseHandle(singleton);return 0;}
     if(recovery_guard.value){CloseHandle(recovery_guard.value);recovery_guard.value=nullptr;}
     update_startup.release();
