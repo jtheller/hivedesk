@@ -8,6 +8,7 @@
 #include <vector>
 #include "hivedesk/update.h"
 #include "hivedesk/gpu_policy_restart.h"
+#include "hivedesk/recovery.h"
 
 namespace {
 constexpr wchar_t name[]=L"HiveDeskAgent";
@@ -21,10 +22,11 @@ void report(DWORD state,DWORD error=NO_ERROR) {
     service_status.dwWin32ExitCode=error;
     SetServiceStatus(status_handle,&service_status);
 }
-HANDLE host_process=nullptr,updater_process=nullptr;DWORD host_session=0;
+HANDLE host_process=nullptr,updater_process=nullptr,recovery_event=nullptr;DWORD host_session=0,recovery_session=0;
 void start_host() {
     if(host_process&&WaitForSingleObject(host_process,0)==WAIT_OBJECT_0){CloseHandle(host_process);host_process=nullptr;}
     DWORD session=WTSGetActiveConsoleSessionId();if(session==0xffffffff)return;
+    if(recovery_event&&recovery_session!=session){CloseHandle(recovery_event);recovery_event=nullptr;}
     if(host_process&&host_session==session&&WaitForSingleObject(host_process,0)==WAIT_TIMEOUT)return;
     if(host_process){if(WaitForSingleObject(host_process,0)==WAIT_TIMEOUT)TerminateProcess(host_process,0);CloseHandle(host_process);host_process=nullptr;}
     HANDLE user=nullptr;if(!WTSQueryUserToken(session,&user))return;
@@ -32,7 +34,8 @@ void start_host() {
     bool ok=GetTokenInformation(user,TokenUser,information,sizeof(information),&size)&&ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(information)->User.Sid,&sid);CloseHandle(user);if(!ok)return;
     // The ordinary tray process may query the broker executable identity, but
     // cannot read/write its memory, duplicate handles, or terminate it.
-    const std::wstring sddl=L"O:SYG:SYD:P(A;;GA;;;SY)(A;;0x00101000;;;"+std::wstring(sid)+L")";LocalFree(sid);
+    if(!recovery_event){recovery_event=hive::recovery::create_event(session,sid);recovery_session=session;}
+    const std::wstring sddl=L"O:SYG:SYD:P(A;;GA;;;SY)(A;;0x00121000;;;"+std::wstring(sid)+L")";LocalFree(sid);
     PSECURITY_DESCRIPTOR descriptor=nullptr;if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,&descriptor,nullptr))return;
     SECURITY_ATTRIBUTES attributes{sizeof(attributes),descriptor,FALSE};
     HANDLE self=nullptr,token=nullptr;
@@ -62,15 +65,26 @@ void WINAPI service_main(DWORD,LPWSTR*) {
     for(;;){
         // A policy restart exits only the idle broker. Observe its process
         // handle so the replacement does not wait for the 60-second watchdog.
-        HANDLE events[]={stop_event,session_event,host_process};
-        const auto wait=WaitForMultipleObjects(host_process?3:2,events,FALSE,60000);
+        std::vector<HANDLE> events{stop_event,session_event};
+        const DWORD recovery_index=DWORD(events.size());if(recovery_event)events.push_back(recovery_event);
+        const DWORD host_index=DWORD(events.size());if(host_process)events.push_back(host_process);
+        const auto wait=WaitForMultipleObjects(DWORD(events.size()),events.data(),FALSE,60000);
         if(wait==WAIT_OBJECT_0||wait==WAIT_FAILED)break;
-        if(host_process&&wait==WAIT_OBJECT_0+2){
+        if(recovery_event&&wait==WAIT_OBJECT_0+recovery_index){
+            // Explicit emergency restart bypasses broker/GPU cleanup and idle
+            // admission. The service acts only on its own pinned child handle.
+            if(host_process&&host_session==recovery_session){
+                if(hive::recovery::stop_process(host_process,0)){
+                    CloseHandle(host_process);host_process=nullptr;
+                    hive::update::log("Manual recovery: Host terminated; creating replacement.");
+                }else hive::update::log("Manual recovery: Windows could not terminate Host within deadline.");
+            }
+        }else if(host_process&&wait==WAIT_OBJECT_0+host_index){
             DWORD exit_code=0;GetExitCodeProcess(host_process,&exit_code);
             if(exit_code!=hive::gpu_policy_restart::BrokerRestartExitCode){
                 // Failed initialization must not create an unbounded spawn
                 // loop. Session/stop controls remain responsive during delay.
-                const auto retry=WaitForMultipleObjects(2,events,FALSE,1000);
+                const auto retry=WaitForMultipleObjects(2,events.data(),FALSE,1000);
                 if(retry==WAIT_OBJECT_0||retry==WAIT_FAILED)break;
             }
         }
@@ -78,6 +92,7 @@ void WINAPI service_main(DWORD,LPWSTR*) {
     }
     // The updater must survive this service being stopped by its own installer.
     if(updater_process)CloseHandle(updater_process);
+    if(recovery_event)CloseHandle(recovery_event);
     CloseHandle(session_event);CloseHandle(stop_event);if(host_process)CloseHandle(host_process);report(SERVICE_STOPPED);
 }
 }

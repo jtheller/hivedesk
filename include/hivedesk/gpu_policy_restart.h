@@ -68,14 +68,16 @@ inline bool parse_wait_handle(const wchar_t* text,HANDLE& result) {
     if(!value||value==std::numeric_limits<uintptr_t>::max())return false;
     result=reinterpret_cast<HANDLE>(value);return true;
 }
-inline bool wait_for_previous(HANDLE process) {
+inline bool valid_previous(HANDLE process) {
     const DWORD pid=GetProcessId(process);DWORD own_session=0,previous_session=0;
     wchar_t path[32768]{},own_path[32768]{};DWORD length=32768;
-    const bool valid=pid&&pid!=GetCurrentProcessId()&&
+    return pid&&pid!=GetCurrentProcessId()&&
         ProcessIdToSessionId(pid,&previous_session)&&ProcessIdToSessionId(GetCurrentProcessId(),&own_session)&&own_session==previous_session&&
         QueryFullProcessImageNameW(process,0,path,&length)&&GetModuleFileNameW(nullptr,own_path,32768)&&
         CompareStringOrdinal(path,-1,own_path,-1,TRUE)==CSTR_EQUAL;
-    const bool exited=valid&&WaitForSingleObject(process,INFINITE)==WAIT_OBJECT_0;
+}
+inline bool wait_for_previous(HANDLE process) {
+    const bool exited=valid_previous(process)&&WaitForSingleObject(process,INFINITE)==WAIT_OBJECT_0;
     CloseHandle(process);return exited;
 }
 // Creation happens while the old agent is still running. Failure leaves it
@@ -84,9 +86,9 @@ class Relaunch {
     PROCESS_INFORMATION child_{};
     bool committed_=false;
 public:
-    explicit Relaunch(bool show_settings=true) {
+    explicit Relaunch(bool show_settings=true,bool recover=false) {
         HANDLE previous=nullptr;
-        if(!DuplicateHandle(GetCurrentProcess(),GetCurrentProcess(),GetCurrentProcess(),&previous,SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,TRUE,0))throw std::runtime_error("Prepare video restart process handle");
+        if(!DuplicateHandle(GetCurrentProcess(),GetCurrentProcess(),GetCurrentProcess(),&previous,SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION|(recover?PROCESS_TERMINATE:0),TRUE,0))throw std::runtime_error("Prepare video restart process handle");
         SIZE_T size=0;InitializeProcThreadAttributeList(nullptr,1,0,&size);
         auto* attributes=static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(HeapAlloc(GetProcessHeap(),0,size));
         if(!attributes){CloseHandle(previous);throw std::runtime_error("Allocate video restart attributes");}
@@ -94,7 +96,7 @@ public:
         const bool listed=initialized&&UpdateProcThreadAttribute(attributes,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,&previous,sizeof(previous),nullptr,nullptr)!=FALSE;
         wchar_t module[32768]{};const bool path_ok=GetModuleFileNameW(nullptr,module,32768)!=0;
         const std::filesystem::path executable=module;
-        std::wstring command=L"\""+executable.wstring()+L"\" --restart-after "+std::to_wstring(reinterpret_cast<uintptr_t>(previous));
+        std::wstring command=L"\""+executable.wstring()+(recover?L"\" --recover-after ":L"\" --restart-after ")+std::to_wstring(reinterpret_cast<uintptr_t>(previous));
         if(!show_settings)command+=L" --quiet";
         STARTUPINFOEXW startup{};startup.StartupInfo.cb=sizeof(startup);startup.StartupInfo.dwFlags=STARTF_USESHOWWINDOW;startup.StartupInfo.wShowWindow=SW_HIDE;startup.lpAttributeList=attributes;
         const bool created=listed&&path_ok&&CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,TRUE,

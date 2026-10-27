@@ -256,7 +256,7 @@ struct Shell::Impl {
         POINT p{};GetCursorPos(&p);SetForegroundWindow(owner);
         int chosen=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,owner,nullptr);DestroyMenu(m);PostMessageW(owner,WM_NULL,0,0);
         if(chosen==1)show_panel(2);else if(chosen==2)settings_ui();else if(chosen==3)local(true);else if(chosen==4)SendMessageW(owner,WM_CLOSE,0,0);
-        else if(chosen==5){local(true);if(!callbacks.restart||!callbacks.restart())MessageBoxW(owner,L"Could not request restart. HiveDesk is still running.",L"HiveDesk",MB_OK|MB_ICONERROR);}
+        else if(chosen==5){if(!callbacks.restart||!callbacks.restart())MessageBoxW(owner,L"Could not start restart helper. HiveDesk is still running.",L"HiveDesk",MB_OK|MB_ICONERROR);}
     }
     std::pair<std::wstring,std::wstring> card_label(int index) const {
         if(index==0)return {config.device_name.empty()?L"This computer":config.device_name,L"This computer"};

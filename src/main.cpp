@@ -11,6 +11,7 @@
 #include "hivedesk/session_control.h"
 #include "hivedesk/update.h"
 #include "hivedesk/gpu_policy_restart.h"
+#include "hivedesk/recovery.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <algorithm>
@@ -130,12 +131,14 @@ public:
             wake_.notify_one();return true;
         };
         callbacks.restart=[this] {
-            return enqueue([this]{
-                if(updating_||closing_)return;
-                hive::gpu_policy_restart::Relaunch relaunch(false);
-                if(!relaunch.commit())throw std::runtime_error("Could not restart HiveDesk; the current process is still running.");
-                updating_=true;status("Restarting HiveDesk.");shell_.quit();
-            });
+            // This callback runs directly on the tray thread. Do not acquire
+            // session/queue locks or release input before arming the helper:
+            // any of those paths may be precisely what needs recovery.
+            try {
+                hive::gpu_policy_restart::Relaunch relaunch(false,true);
+                if(!relaunch.commit())throw std::runtime_error("Could not start restart helper");
+                return true; // Helper posts close and enforces its own deadline.
+            } catch(...) {return false;}
         };
         std::string error;
         if(!shell_.create(instance,{config_.name,config_.group_key,config_.stream,config_.desktop},std::move(callbacks),error))throw std::runtime_error(error);
@@ -618,21 +621,47 @@ private:
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false;
-    HANDLE previous=nullptr;bool valid_arguments=true;
+    HANDLE previous=nullptr;bool valid_arguments=true,recover=false,manual_restart=false;
     if(arguments){for(int i=1;i<count;++i){
         if(wcscmp(arguments[i],L"--background")==0)background=true;
         else if(wcscmp(arguments[i],L"--quiet")==0)quiet=true;
         else if(wcscmp(arguments[i],L"--host-check")==0)host_check=true;
+        else if(wcscmp(arguments[i],L"--restart")==0)manual_restart=true;
         else if(wcscmp(arguments[i],L"--restart-after")==0){if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
+        else if(wcscmp(arguments[i],L"--recover-after")==0){recover=true;if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
     }LocalFree(arguments);}open_settings=!background&&!quiet;
-    if(!valid_arguments)return ERROR_INVALID_PARAMETER;
-    if(previous&&!hive::gpu_policy_restart::wait_for_previous(previous))return ERROR_INVALID_HANDLE;
+    if(!valid_arguments||(manual_restart&&previous))return ERROR_INVALID_PARAMETER;
+    // Also works when the tray's message loop cannot open its context menu.
+    if(manual_restart){
+        quiet=true;open_settings=false;
+        const HWND owner=FindWindowW(L"HiveDesk.Owner",nullptr);DWORD pid=0;
+        if(owner)GetWindowThreadProcessId(owner,&pid);
+        if(pid){previous=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_TERMINATE,FALSE,pid);if(!previous)return ERROR_ACCESS_DENIED;recover=true;}
+    }
+    hive::recovery::Handle recovery_guard;
+    if(recover){
+        recovery_guard.value=CreateMutexW(nullptr,FALSE,L"Local\\HiveDesk.ManualRecovery.v1");
+        const DWORD guard_error=GetLastError();
+        if(!recovery_guard.value||guard_error==ERROR_ALREADY_EXISTS){CloseHandle(previous);return recovery_guard.value?0:ERROR_ACCESS_DENIED;}
+        bool forced=false;
+        if(!hive::recovery::previous(previous,forced)){
+            hive::log("Recovery failed: predecessor identity or bounded termination failed.");
+            MessageBoxW(nullptr,L"Windows could not finish stopping HiveDesk. A replacement was not started. Restart Windows if the graphics driver remains stuck.",L"HiveDesk restart failed",MB_OK|MB_ICONERROR);
+            return ERROR_PROCESS_ABORTED;
+        }
+        hive::log(forced?"Manual recovery: forced old agent to exit.":"Manual recovery: old agent exited normally.");
+        const auto broker=hive::recovery::restart_broker();
+        hive::log(broker==hive::recovery::BrokerResult::Restarted?"Manual recovery: old Host stopped by service.":
+            broker==hive::recovery::BrokerResult::Requested?"Manual recovery: Host reset requested.":
+            broker==hive::recovery::BrokerResult::Unavailable?"Manual recovery: service reset unavailable; restarting tray only.":"Manual recovery: Host reset failed or timed out.");
+    } else if(previous&&!hive::gpu_policy_restart::wait_for_previous(previous))return ERROR_INVALID_HANDLE;
     hive::update::StartupGuard update_startup;if(!update_startup.allowed())return 0;
     HANDLE singleton=CreateMutexW(nullptr,FALSE,L"Local\\HiveDesk.Desktop.Agent");
     if(!singleton)return 1;
     const DWORD singleton_status=GetLastError();
     if(host_check){CloseHandle(singleton);return hive::host_check();}
     if(singleton_status==ERROR_ALREADY_EXISTS){if(open_settings){const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr);DWORD process=0;GetWindowThreadProcessId(owner,&process);AllowSetForegroundWindow(process);PostMessageW(owner,WM_APP+45,0,0);}CloseHandle(singleton);return 0;}
+    if(recovery_guard.value){CloseHandle(recovery_guard.value);recovery_guard.value=nullptr;}
     update_startup.release();
     int result=1;
     try {hive::log("HiveDesk " HIVEDESK_VERSION " starting");auto config=hive::load_config();if(background&&!config.desktop.startup){CloseHandle(singleton);return 0;}hive::set_startup(config.desktop.startup);App app(std::move(config));result=app.run(instance,open_settings);}
