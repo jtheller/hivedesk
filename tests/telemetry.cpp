@@ -29,7 +29,7 @@ int main(){
             monitor.viewer("peer",stats,2560,1440);
             monitor.select(hive::Telemetry::Side::Host,"outbound",90,"Receiver");
             hive::VideoSendDiagnostics send;send.available=true;send.connection=4;send.submitted_packets=11;send.completed_packets=10;send.completed_bytes=1000000;
-            send.failed_packets=1;send.queue_expired=2;send.samples=11;send.sample_age_us=700;send.encrypt_p95_us=200;send.send_p95_us=1900;send.send_max_us=25000;send.ready_gap_p95_us=80;
+            send.failed_packets=1;send.queue_expired=2;send.samples=11;send.sample_age_us=700;send.encrypt_p95_us=200;send.send_p95_us=1900;send.send_max_us=25000;send.ready_gap_p95_us=80;send.inflight=2;
             monitor.video_send("outbound",90,send);
             auto obsolete=send;obsolete.completed_packets=999;
             monitor.video_send("outbound",89,obsolete);monitor.video_send("different",90,obsolete);
@@ -53,7 +53,7 @@ int main(){
             require(value.find("\"service_sample_age_ms\":null,\"receive_sample_age_ms\":null,\"transit_excess_ms\":3.300")!=std::string::npos,"Unavailable samples appeared fresh");
             require(value.find("\"nvdec_map_ms\":1.500,\"convert_ms\":0.700,\"draw_ms\":0.090,\"present_gap_p95_ms\":12.000,\"present_gap_max_ms\":35.000")!=std::string::npos,"Missing viewer stalls/cadence metrics");
             require(value.find("\"completed_packets\":10,\"completed_bytes\":1000000,\"failed_packets\":1,\"queue_expired\":2")!=std::string::npos&&value.find("\"completed_packets\":999")==std::string::npos,"Video send counters or session isolation failed");
-            require(value.find("\"send_p95_ms\":1.900,\"send_max_ms\":25.000")!=std::string::npos&&value.find("\"ready_gap_p95_ms\":0.080")!=std::string::npos,"Missing wire completion and ready dispatch costs");
+            require(value.find("\"inflight\":2,\"send_p95_ms\":1.900,\"send_max_ms\":25.000")!=std::string::npos&&value.find("\"ready_gap_p95_ms\":0.080")!=std::string::npos,"Missing bounded in-flight writes, wire completion and ready dispatch costs");
             require(value.find("\"dedicated\":true,\"ready\":true,\"session\":9")!=std::string::npos&&value.find("\"acknowledged\":999")==std::string::npos,"Input diagnostics session isolation failed");
             require(value.find("\"capture_to_send_p99_ms\":0.450")!=std::string::npos&&value.find("\"ack_roundtrip_p50_ms\":1.800,\"ack_roundtrip_p95_ms\":3.000,\"ack_roundtrip_p99_ms\":4.200")!=std::string::npos,"Input stage units/percentiles missing");
             require(std::filesystem::exists(directory/L"diagnostics.previous.jsonl"),"History did not rotate");
