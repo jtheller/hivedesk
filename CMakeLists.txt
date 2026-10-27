@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(HiveDesk VERSION 0.1.0 LANGUAGES CXX)
-set(HIVEDESK_VERSION "0.1.0-alpha.38")
+set(HIVEDESK_VERSION "0.1.0-alpha.39")
 add_compile_definitions(HIVEDESK_VERSION="${HIVEDESK_VERSION}")
 enable_language(RC)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -162,7 +162,12 @@ target_link_libraries(HiveDeskMediaReadyCheck PRIVATE hive_core)
 add_executable(HiveDeskMediaFreshnessCheck tests/media_freshness.cpp)
 target_link_libraries(HiveDeskMediaFreshnessCheck PRIVATE hive_core)
 
-# Explicit interactive native shell probe; no network or remote input.
+# Waiting-screen regression runs on an isolated, noninteractive window station.
+add_executable(HiveDeskWaitingCheck tests/waiting_screen.cpp src/shell.cpp)
+target_link_libraries(HiveDeskWaitingCheck PRIVATE hive_core shell32 dcomp d2d1 msimg32)
+add_test(NAME waiting_screen COMMAND HiveDeskWaitingCheck)
+set_tests_properties(waiting_screen PROPERTIES TIMEOUT 30)
+# Explicit interactive native shell probes; never part of normal CTest.
 add_executable(HiveDeskShellSmoke tests/shell_smoke.cpp src/shell.cpp)
 target_include_directories(HiveDeskShellSmoke PRIVATE include)
 target_link_libraries(HiveDeskShellSmoke PRIVATE hive_core user32 gdi32 shell32 dwmapi dcomp d2d1 d3d11 msimg32)

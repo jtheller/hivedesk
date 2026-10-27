@@ -35,6 +35,8 @@ public:
     void close();
     std::string stats() const;
     bool has_frame() const;
+    // First successful Present submission for this open; not a scanout claim.
+    bool has_presented_frame() const;
     CursorPresentation cursor_presentation() const;
     StreamFeedback feedback() const;
     ViewerDiagnostics diagnostics() const;

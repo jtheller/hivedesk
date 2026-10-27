@@ -21,7 +21,10 @@ class PanelComposition {
     Ptr<IDCompositionSurface> surface_;
     Ptr<IDCompositionRectangleClip> clip_;
     Ptr<IDCompositionRectangleClip> list_clip_;
+    Ptr<IDCompositionVisual> backdrop_;
+    Ptr<IDCompositionScaleTransform> backdrop_scale_;
     UINT width_=0,height_=0;
+    bool detached_=false;
     float fade_from_=0,fade_to_=0,fade_seconds_=0;
     ULONGLONG fade_start_=0;
     static void check(HRESULT result) { if(FAILED(result))throw std::runtime_error("Switcher GPU composition failed."); }
@@ -41,6 +44,36 @@ class PanelComposition {
         else check(opacity_->SetOpacity(to));
     }
 public:
+    // A full-screen waiting surface must never fade through to the previous
+    // machine. Keep an opaque neutral backing while only the snapshot fades in.
+    void cover(float width,float height,bool entering,bool discard=false) {
+        if(!backdrop_){
+            Ptr<IDCompositionSurface> surface;
+            check(device_->CreateSurface(1,1,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED,&surface));
+            Ptr<IDXGISurface> texture;POINT offset{};
+            check(surface->BeginDraw(nullptr,IID_PPV_ARGS(&texture),&offset));
+            Ptr<ID2D1RenderTarget> canvas;
+            const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+            HRESULT result=factory_->CreateDxgiSurfaceRenderTarget(texture.Get(),&properties,&canvas);
+            if(SUCCEEDED(result)){
+                Ptr<ID2D1SolidColorBrush> brush;result=canvas->CreateSolidColorBrush(D2D1::ColorF(19/255.0f,22/255.0f,29/255.0f,1),&brush);
+                if(SUCCEEDED(result)){canvas->BeginDraw();canvas->FillRectangle(D2D1::RectF(float(offset.x),float(offset.y),float(offset.x+1),float(offset.y+1)),brush.Get());result=canvas->EndDraw();}
+            }
+            const HRESULT end=surface->EndDraw();check(result);check(end);
+            check(device_->CreateVisual(&backdrop_));check(backdrop_->SetContent(surface.Get()));
+            check(device_->CreateScaleTransform(&backdrop_scale_));check(backdrop_->SetTransform(backdrop_scale_.Get()));
+            check(visual_->AddVisual(backdrop_.Get(),FALSE,preview_.Get()));
+            check(preview_->SetEffect(list_opacity_.Get()));
+        }
+        check(backdrop_scale_->SetScaleX(width));check(backdrop_scale_->SetScaleY(height));
+        check(clip_->SetLeft(0.0f));check(clip_->SetTop(0.0f));check(clip_->SetRight(width));check(clip_->SetBottom(height));
+        check(list_clip_->SetTop(height));check(list_clip_->SetBottom(height));
+        if(discard){check(preview_->SetContent(nullptr));check(list_->SetContent(nullptr));detached_=true;}
+        fade(1,1,0);
+        if(entering&&animations()){auto motion=tween(0,1,.18f);check(list_opacity_->SetOpacity(motion.Get()));}
+        else check(list_opacity_->SetOpacity(1.0f));
+        check(device_->Commit());
+    }
     void create(HWND window) {
         check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&gpu_,nullptr,nullptr));
         Ptr<IDXGIDevice> dxgi;check(gpu_.As(&dxgi));
@@ -58,11 +91,12 @@ public:
         check(device_->Commit());
         SetPropW(window,L"HiveDesk.Composited",reinterpret_cast<HANDLE>(1));
     }
-    void present(const void* bgra,UINT width,UINT height) {
+    void present(const void* bgra,UINT width,UINT height,bool commit=true) {
         if(width!=width_||height!=height_) {
             surface_.Reset();check(device_->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED,&surface_));
             check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));width_=width;height_=height;
         }
+        if(detached_){check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));detached_=false;}
         Ptr<IDXGISurface> texture;POINT offset{};
         check(surface_->BeginDraw(nullptr,IID_PPV_ARGS(&texture),&offset));
         HRESULT result=S_OK;
@@ -80,7 +114,7 @@ public:
                 }
             }
         }
-        const HRESULT end=surface_->EndDraw();check(result);check(end);check(device_->Commit());
+        const HRESULT end=surface_->EndDraw();check(result);check(end);if(commit)check(device_->Commit());
     }
     void show(float width,float height,float previous_height,bool entering,bool reversing) {
         check(clip_->SetLeft(0.0f));check(clip_->SetTop(0.0f));check(clip_->SetRight(width));

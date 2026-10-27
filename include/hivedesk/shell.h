@@ -52,6 +52,8 @@ public:
     std::wstring cached_clipboard() const;
     void show_settings();
     void update_thumbnail(const std::string& peer, Thumbnail);
+    // JPEG decoding uses the shell worker, independent of connection startup.
+    void update_snapshot(const std::string& peer, Snapshot);
     void observe_cursor(const std::string& controller);
     void update_cursor(const std::string& peer, CursorState);
     void update_cursor_composition(const std::string& peer,uint64_t session,uint64_t sequence,CursorComposition);

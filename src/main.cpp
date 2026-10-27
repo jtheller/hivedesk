@@ -42,6 +42,7 @@ public:
             const std::lock_guard lock(view_intent_mutex_);
             if(updating_)return;
             const auto epoch=++generation_;
+            request_snapshot(peer);
             enqueue([this,peer,epoch]{
                 if(epoch!=generation_)return;
                 go_local(active_.exchange(nullptr),false);
@@ -62,12 +63,11 @@ public:
             {const std::lock_guard lock(kick_mutex_);kick_pending_=target;}
             kick_wake_.notify_one();
         };
-        callbacks.panel_opened=[this] { enqueue([this] {
-            const auto request=++snapshot_sequence_;
+        callbacks.panel_opened=[this] {
             for(const auto& peer:transport_.peers())if(peer.features&hive::FeatureDesktopAux) {
-                if(transport_.request_snapshot(peer.id,request))snapshot_requests_[peer.id]=request;
+                request_snapshot(peer.id);
             }
-        }); };
+        };
         callbacks.cursor_changed=[this](const std::string& peer,const hive::CursorState& cursor) {
             const auto target=hosting_.load();
             return !closing_&&target&&!target->revoked&&target->peer==peer&&transport_.send_cursor(peer,cursor);
@@ -285,13 +285,15 @@ private:
             });
         };
         callbacks.snapshot=[this](const std::string& peer,hive::Snapshot snapshot) {
-            enqueue([this,peer,snapshot=std::move(snapshot)] {
+            {
+                const std::lock_guard lock(snapshot_reply_mutex_);
                 const auto request=snapshot_requests_.find(peer);
                 if(request==snapshot_requests_.end()||request->second!=snapshot.request)return;
                 snapshot_requests_.erase(request);
-                try{shell_.update_thumbnail(peer,hive::decode_snapshot(snapshot));}
-                catch(const std::exception& e){hive::log(std::string("Snapshot decode failed: ")+e.what());}
-            });
+            }
+            // Startup may wait eight seconds on the command worker. Snapshot
+            // decoding and UI publication must continue throughout that wait.
+            shell_.update_snapshot(peer,std::move(snapshot));
         };
         callbacks.cursor=[this](const std::string& peer,hive::CursorState cursor) {
             const auto target=active_.load();if(!closing_&&target&&*target==peer)shell_.update_cursor(peer,std::move(cursor));
@@ -459,8 +461,15 @@ private:
         reconnect_.attempted(GetTickCount64());
         select(peer,epoch);
     }
+    void request_snapshot(const std::string& peer) {
+        const std::lock_guard lock(snapshot_reply_mutex_);
+        const auto request=++snapshot_sequence_;
+        snapshot_requests_[peer]=request;
+        if(!transport_.request_snapshot(peer,request))snapshot_requests_.erase(peer);
+    }
     void select(std::string peer,uint64_t epoch) {
         if(epoch!=generation_||closing_)return;
+        request_snapshot(peer);
         go_local(active_.exchange(nullptr),false);
         remote_size_=0;received_frames_=0;
         const auto peers=transport_.peers();
@@ -511,13 +520,18 @@ private:
             if(transport_.connection_token(peer)!=active_connection_){failure="Connection changed while starting video; retrying.";break;}
             const auto state=viewer_.stats();
             if(state.find("Media error:")==0) {failure=state;break;}
-            if(viewer_.has_frame()&&(!active_dedicated_input_||transport_.input_ready(peer,stream.session))) {ready=true;break;}
+            // The waiting cover already makes the viewer visible. Keep it
+            // opaque until this session has actually submitted its first image,
+            // not merely finished decoding while the old HWND image remains.
+            if(viewer_.has_presented_frame()&&(!active_dedicated_input_||transport_.input_ready(peer,stream.session))) {ready=true;break;}
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if(epoch!=generation_||closing_) {go_local(active_.exchange(nullptr),false);return;}
         if(!ready) {
-            if(failure.empty()&&active_dedicated_input_&&viewer_.has_frame())
-                failure="The desktop is visible, but its input channel did not become ready. Install the same HiveDesk version on the controlled computer.";
+            if(failure.empty()&&viewer_.has_frame()&&!viewer_.has_presented_frame())
+                failure="Desktop decoded, but the first image was not presented. Retrying with the connection snapshot visible.";
+            if(failure.empty()&&active_dedicated_input_&&viewer_.has_presented_frame())
+                failure="The desktop is ready, but its input channel did not become ready. Install the same HiveDesk version on the controlled computer.";
             if(failure.empty()) failure=received_frames_.load()==0?
                 "Connected to "+hive::narrow(label)+", but no video frames arrived. Check capture/encoding on that computer.":
                 "Received "+std::to_string(received_frames_.load())+" video frames from "+hive::narrow(label)+", but none could be displayed. "+viewer_.stats();
@@ -588,6 +602,7 @@ private:
     hive::MediaViewer viewer_;
     hive::Telemetry telemetry_{hive::data_directory()};
     std::mutex snapshot_mutex_;std::map<std::string,uint64_t> snapshot_pending_;
+    std::mutex snapshot_reply_mutex_;
     std::map<std::string,uint64_t> snapshot_requests_;uint64_t snapshot_sequence_=0;
     hive::Snapshot snapshot_cache_;std::chrono::steady_clock::time_point snapshot_time_{};
     std::atomic<std::shared_ptr<const std::string>> active_,last_controlled_;

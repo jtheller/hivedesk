@@ -1,0 +1,83 @@
+#include "hivedesk/shell.h"
+#include <windows.h>
+#include <algorithm>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace {
+void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
+HWND find(const wchar_t* name){return FindWindowW(name,nullptr);}
+// The isolated station itself is invisible; inspect the child window show state.
+bool shown(HWND window){return (GetWindowLongW(window,GWL_STYLE)&WS_VISIBLE)!=0;}
+std::wstring title(HWND window){wchar_t text[1024]{};GetWindowTextW(window,text,1024);return text;}
+void pump(DWORD ms){
+    const auto end=GetTickCount64()+ms;
+    do{MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}Sleep(1);}while(GetTickCount64()<end);
+}
+hive::Thumbnail image(uint8_t value){
+    hive::Thumbnail result;result.bgra.resize(size_t(hive::SnapshotWidth)*hive::SnapshotHeight*4,value);return result;
+}
+int probe(){
+    // The entire child runs on a noninteractive window station, including its
+    // input worker. No SwitchDesktop, SendInput, or physical cursor movement.
+    wchar_t station[256]{};DWORD size=0;
+    require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_NAME,station,sizeof(station),&size)!=FALSE,"Read test station");
+    USEROBJECTFLAGS flags{};require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)!=FALSE&&!(flags.dwFlags&WSF_VISIBLE),"Refuse UI probe on an interactive window station");
+    hive::Shell shell;hive::ShellConfig config;config.device_name=L"Waiting test";config.desktop.tray_icon=false;
+    hive::ShellCallbacks callbacks;unsigned selected=0;
+    callbacks.select_peer=[&](const std::string&){++selected;};
+    std::string error;require(shell.create(GetModuleHandleW(nullptr),config,std::move(callbacks),error),error.c_str());
+    shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Computer C","",47980,true}});
+    const auto owner=find(L"HiveDesk.Owner"),panel=find(L"HiveDesk.Switcher"),waiting=find(L"HiveDesk.Waiting");
+    require(owner&&panel&&waiting,"Missing shell windows");
+    KillTimer(owner,1); // Disable automatic hot corner sampling in the isolated probe.
+    const int dpi=int(GetDpiForWindow(panel));const auto px=[&](int n){return MulDiv(n,dpi,96);};
+    const auto select=[&](int index){
+        SendMessageW(owner,WM_HOTKEY,81,0);
+        const int tile=(px(200)-2*px(12))*9/16;
+        SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));
+    };
+    shell.update_thumbnail("a",image(80));select(1);
+    require(selected==1&&shown(waiting)&&title(waiting).find(L"Computer A")!=std::wstring::npos&&title(waiting).find(L"Snapshot")!=std::wstring::npos,"A cached snapshot was not shown immediately");
+    select(2);
+    require(selected==2&&shown(waiting)&&title(waiting).find(L"Computer B")!=std::wstring::npos&&title(waiting).find(L"Snapshot")==std::wstring::npos,"B reused A's snapshot");
+    std::thread late([&]{shell.update_thumbnail("a",image(130));shell.show_remote("a",L"Computer A",1);});late.join();pump(20);
+    require(shown(waiting)&&title(waiting).find(L"Computer B")!=std::wstring::npos&&title(waiting).find(L"Snapshot")==std::wstring::npos,"Late A completion changed B's waiting screen");
+    shell.update_thumbnail("b",image(180));
+    require(title(waiting).find(L"Snapshot")!=std::wstring::npos,"Fresh B snapshot did not update while connecting");
+    shell.show_remote("b",L"Computer B",2); // Simulates the prepared-first-frame notification.
+    select(3);SendMessageW(owner,WM_TIMER,4,0);
+    require(selected==3&&shown(waiting)&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Previous fade timer hid the next machine");
+    shell.show_remote("c",L"Computer C",3);pump(260);
+    require(!shown(waiting)&&shown(shell.viewer_window()),"First frame did not dismiss the waiting layer");
+    shell.show_reconnecting("c");
+    require(shown(waiting)&&title(waiting).find(L"Reconnecting")!=std::wstring::npos&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Reconnection reused stale video instead of a waiting screen");
+    shell.show_local();shell.show_remote("c",L"Computer C",4);shell.update_thumbnail("c",image(220));pump(260);
+    require(!shown(waiting)&&!shown(shell.viewer_window()),"Canceled connection reopened on a late completion");
+    return 0;
+}
+}
+int wmain(int argc,wchar_t**){
+    if(argc>1){try{return probe();}catch(const std::exception& e){std::fprintf(stderr,"FAIL waiting screen: %s\n",e.what());return 1;}}
+    const std::wstring name=L"HiveDeskWaitingTest-"+std::to_wstring(GetCurrentProcessId());
+    HWINSTA original=GetProcessWindowStation(),station=CreateWindowStationW(nullptr,0,WINSTA_ALL_ACCESS,nullptr);
+    if(!station){std::printf("FAIL create noninteractive window station: %lu\n",GetLastError());return 1;}
+    HDESK desktop=nullptr;
+    if(SetProcessWindowStation(station)){desktop=CreateDesktopW(name.c_str(),nullptr,nullptr,0,GENERIC_ALL,nullptr);SetProcessWindowStation(original);}
+    if(!desktop){CloseWindowStation(station);std::puts("FAIL create isolated desktop");return 1;}
+    wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
+    wchar_t station_name[256]{};DWORD needed=0;GetUserObjectInformationW(station,UOI_NAME,station_name,sizeof(station_name),&needed);
+    std::wstring command=L"\""+std::wstring(executable)+L"\" --child",location=std::wstring(station_name)+L"\\"+name;
+    STARTUPINFOW startup{sizeof(startup)};startup.lpDesktop=location.data();startup.dwFlags=STARTF_USESHOWWINDOW;startup.wShowWindow=SW_HIDE;
+    PROCESS_INFORMATION child{};DWORD code=1;
+    if(CreateProcessW(executable,command.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startup,&child)){
+        if(WaitForSingleObject(child.hProcess,20000)==WAIT_OBJECT_0)GetExitCodeProcess(child.hProcess,&code);
+        else{TerminateProcess(child.hProcess,124);WaitForSingleObject(child.hProcess,5000);code=124;}
+        CloseHandle(child.hThread);CloseHandle(child.hProcess);
+    }
+    CloseDesktop(desktop);CloseWindowStation(station);
+    std::printf("%s waiting UI: isolated station, snapshot identity, late replies, first-frame fade, rapid reselection, reconnect and cancel (exit %lu).\n",code?"FAIL":"PASS",code);
+    return code?1:0;
+}

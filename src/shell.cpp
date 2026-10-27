@@ -60,7 +60,9 @@ bool number(const std::wstring& s,uint32_t& out) {
 }
 struct Shell::Impl {
     HINSTANCE instance{};HICON app_icon{},app_small_icon{}; HWND owner{},viewer{},panel{},settings{},prior_focus{};
-    HANDLE settings_process{};HWND health_badge{};
+    HANDLE settings_process{};HWND health_badge{},waiting{};
+    PanelComposition waiting_composition;
+    bool waiting_visible=false,waiting_fading=false,waiting_retry=false;
     gpu_policy_restart::SettingsAdmission settings_restart;
     StreamHealth stream_health{};SlowIndicator slow_indicator;ULONGLONG last_stream_tick=0;
     SourceDiagnostics source_diagnostics{};ViewerDiagnostics viewer_diagnostics{};ULONGLONG source_stats_time=0,health_time=0;
@@ -128,19 +130,65 @@ struct Shell::Impl {
         if(panel)ShowWindow(panel,SW_HIDE);
         publish_input();
     }
-    void remember_view() {
-        // Capture only this app's visible viewer, never settings or another foreground app.
-        // Hide our own Switcher and wait for composition before reading back the last view.
-        if(active_id.empty()||!viewer||!IsWindowVisible(viewer)||(settings&&IsWindowVisible(settings))||GetForegroundWindow()!=viewer)return;
-        hide_panel();UpdateWindow(viewer);DwmFlush();
-        RECT client{};GetClientRect(viewer,&client);if(client.right<=0||client.bottom<=0)return;
-        HDC source=GetDC(viewer);if(!source)return;
-        HDC destination=CreateCompatibleDC(source);HBITMAP image=CreateCompatibleBitmap(source,672,378);
-        if(!destination||!image){if(destination)DeleteDC(destination);if(image)DeleteObject(image);ReleaseDC(viewer,source);return;}
-        HGDIOBJ old=SelectObject(destination,image);SetStretchBltMode(destination,HALFTONE);SetBrushOrgEx(destination,0,0,nullptr);
-        BOOL copied=StretchBlt(destination,0,0,672,378,source,0,0,client.right,client.bottom,SRCCOPY);
-        SelectObject(destination,old);DeleteDC(destination);ReleaseDC(viewer,source);
-        if(copied){auto& cached=thumbnails[active_id];if(cached)DeleteObject(cached);cached=image;}else DeleteObject(image);
+    void hide_waiting() {
+        KillTimer(owner,4);waiting_visible=waiting_fading=false;
+        if(waiting)ShowWindow(waiting,SW_HIDE);
+    }
+    void paint_waiting(bool entering) {
+        const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+        BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;
+        info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* pixels=nullptr;
+        HDC dc=CreateCompatibleDC(nullptr);HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
+        if(!dc||!bitmap){if(bitmap)DeleteObject(bitmap);if(dc)DeleteDC(dc);throw std::runtime_error("Could not create waiting screen");}
+        const auto previous=SelectObject(dc,bitmap);fill(dc,{0,0,width,height},Background);
+        const auto snapshot=thumbnails.find(pending_id);
+        if(snapshot!=thumbnails.end()){
+            HDC source=CreateCompatibleDC(dc);const auto prior=SelectObject(source,snapshot->second);
+            const double scale=std::min(double(width)/SnapshotWidth,double(height)/SnapshotHeight);
+            const int w=int(SnapshotWidth*scale),h=int(SnapshotHeight*scale);
+            SetStretchBltMode(dc,HALFTONE);SetBrushOrgEx(dc,0,0,nullptr);
+            StretchBlt(dc,(width-w)/2,(height-h)/2,w,h,source,0,0,SnapshotWidth,SnapshotHeight,SRCCOPY);
+            SelectObject(source,prior);DeleteDC(source);
+        }
+        auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==pending_id;});
+        const auto label=peer==peers.end()?wide(pending_id):wide(peer->name);
+        const int left=px(24),bottom=height-px(24);
+        RECT badge{left,bottom-px(74),std::min(width-left,left+px(480)),bottom};fill(dc,badge,Background);
+        fill(dc,{left,badge.top,left+px(3),bottom},accent);
+        draw_text(dc,title_font,label,{left+px(16),badge.top+px(5),badge.right-px(12),badge.top+px(38)},Text);
+        std::wstring message=waiting_retry?L"Reconnecting":L"Connecting";
+        if(snapshot!=thumbnails.end())message+=L"  \x00b7  Snapshot";
+        message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
+        draw_text(dc,small_font,message,{left+px(16),badge.top+px(39),badge.right-px(12),bottom-px(5)},Muted);
+        GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
+        try{waiting_composition.present(pixels,width,height,false);waiting_composition.cover(float(width),float(height),entering);}
+        catch(...){SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);throw;}
+        SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);
+        SetWindowTextW(waiting,(L"HiveDesk - "+message+L" - "+label).c_str());
+    }
+    void begin_waiting(const std::string& id,bool retry) {
+        KillTimer(owner,4);waiting_fading=false;waiting_retry=retry;
+        if(active_id!=id)previous_id=active_id;
+        if(!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
+        active_id=id;remote=true;reconnecting=true;input_session=0;publish_input();
+        reset_remote_cursor();
+        try{
+            const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+            waiting_composition.cover(float(width),float(height),false,true);
+            SetWindowPos(waiting,HWND_TOP,0,0,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+            paint_waiting(true);
+        }catch(const std::exception&){
+            // Never expose the previous swap chain if composition failed.
+            local(true);status=L"Could not display the connection screen.";return;
+        }
+        waiting_visible=true;
+        const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
+        SetWindowPos(waiting,HWND_TOP,0,0,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SetWindowPos(viewer,HWND_TOP,0,0,width,height,SWP_SHOWWINDOW);
+        // Showing an owner can change its owned popup visibility. Reassert the
+        // prepared cover after the viewer becomes visible, before activation.
+        SetWindowPos(waiting,HWND_TOP,0,0,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SetForegroundWindow(viewer);SetFocus(viewer);SetCursor(LoadCursorW(nullptr,IDC_ARROW));
     }
     void reset_remote_cursor() {
         stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;debug_pulses={};slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
@@ -194,7 +242,7 @@ struct Shell::Impl {
     }
     void local(bool notify) {
         ++generation;remote=false;reconnecting=false;input_session=0;publish_input();
-        remember_view();
+        hide_waiting();
         selection_armed=false;pending_id.clear();
         if(!active_id.empty())previous_id=active_id;active_id.clear();
         ShowWindow(viewer,SW_HIDE);hide_panel();ReleaseCapture();ClipCursor(nullptr);reset_remote_cursor();
@@ -203,13 +251,14 @@ struct Shell::Impl {
     }
     void select(const std::string& id) {
         if(id.empty()){local(true);return;}
-        if(id==active_id&&remote){hide_panel();return;}
+        if(id==active_id&&remote&&!reconnecting){hide_panel();return;}
         auto it=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==id;});
         if(it==peers.end()){status=L"Computer is no longer in the device list.";InvalidateRect(panel,nullptr,FALSE);return;}
         ++generation;remote=false;reconnecting=false;input_session=0;publish_input();
-        remember_view();
         reset_remote_cursor();
         remote_width=remote_height=0;selection_armed=true;pending_id=id;ReleaseCapture();ClipCursor(nullptr);hide_panel();
+        begin_waiting(id,false);
+        if(!selection_armed)return;
         if(callbacks.select_peer)callbacks.select_peer(id);
     }
     void show_remote_ui(const std::string& id,const std::wstring& label,uint64_t session) {
@@ -219,6 +268,10 @@ struct Shell::Impl {
         if(!remote&&!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
         if(!remote||active_id!=id||input_session!=session)remote_cursor_composition.reset(session);
         active_id=id;input_session=session;remote=true;SetWindowTextW(viewer,(L"HiveDesk - "+label).c_str());
+        if(waiting_visible&&!waiting_fading){
+            waiting_fading=true;
+            try{SetTimer(owner,4,waiting_composition.hide(),nullptr);}catch(const std::exception&){hide_waiting();}
+        }
         SetWindowPos(viewer,HWND_TOP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),SWP_SHOWWINDOW);
         SetForegroundWindow(viewer);SetFocus(viewer);confine_mouse();hide_panel();apply_remote_position();apply_remote_cursor();
         publish_input();
@@ -317,7 +370,7 @@ struct Shell::Impl {
         if(GetTickCount64()-last_stream_tick>=100){last_stream_tick=GetTickCount64();if(callbacks.stream_tick)callbacks.stream_tick();}
         const bool warning=slow_indicator.update(GetTickCount64(),stream_health);
         if(health_badge) {
-            if(remote&&(reconnecting||warning||config.desktop.debug_overlay)&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
+            if(remote&&!waiting_visible&&(reconnecting||warning||config.desktop.debug_overlay)&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
                 const int width=px(reconnecting?280:config.desktop.debug_overlay?460:136),height=px(!reconnecting&&config.desktop.debug_overlay?474:30);RECT bounds{};GetWindowRect(health_badge,&bounds);
                 const int inset=px(16);
@@ -551,7 +604,7 @@ struct Shell::Impl {
                 std::shared_ptr<ClipboardJob> job;{std::lock_guard lock(s->jobs_mutex);auto it=s->jobs.find(static_cast<uint64_t>(w));if(it!=s->jobs.end())job=it->second;}
                 if(job){std::lock_guard lock(job->mutex);try{s->write_clipboard(job->value);job->done=true;}catch(const std::exception& e){job->error=e.what();}return job->done?1:0;}return 0;
             }
-            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel();else if(w==3){KillTimer(window,3);s->show_panel(2);s->panel_summoned=s->panel_mode!=0;s->publish_input();}return 0;
+            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel();else if(w==3){KillTimer(window,3);s->show_panel(2);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
             case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:case WM_SETTINGCHANGE:s->system_color();return 0;
             case WM_CLIPBOARDUPDATE:s->read_clipboard(true);return 0;
             case TrayMessage:
@@ -589,6 +642,14 @@ struct Shell::Impl {
                 }break;
             }
         }
+        if(window==s->waiting){
+            switch(message){
+            case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
+            case WM_SETCURSOR:SetCursor(LoadCursorW(nullptr,IDC_ARROW));return TRUE;
+            case WM_ERASEBKGND:return 1;
+            case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(window,&ps);EndPaint(window,&ps);return 0;}
+            }
+        }
         if(window==s->viewer) {
             switch(message){
             case WM_SETCURSOR:if(s->remote){s->apply_remote_cursor();return TRUE;}break;
@@ -606,7 +667,7 @@ struct Shell::Impl {
         debug_font=CreateFontW(-px(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Consolas");
         small_font=CreateFontW(-px(13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
         title_font=CreateFontW(-px(24),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-        for(const wchar_t* name:{L"HiveDesk.Owner",L"HiveDesk.Viewer",L"HiveDesk.Switcher",L"HiveDesk.Settings",L"HiveDesk.Health"}) {
+        for(const wchar_t* name:{L"HiveDesk.Owner",L"HiveDesk.Viewer",L"HiveDesk.Switcher",L"HiveDesk.Settings",L"HiveDesk.Health",L"HiveDesk.Waiting"}) {
             WNDCLASSEXW c{};c.cbSize=sizeof(c);c.lpfnWndProc=window_proc;c.hInstance=instance;c.hCursor=LoadCursorW(nullptr,IDC_ARROW);c.hbrBackground=background_brush;c.lpszClassName=name;c.hIcon=app_icon;c.hIconSm=app_small_icon;
             if(!RegisterClassExW(&c)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS){error="Could not register native UI classes.";return false;}
         }
@@ -617,9 +678,10 @@ struct Shell::Impl {
         viewer=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
         panel=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Switcher",L"HiveDesk computers",WS_POPUP,0,0,px(200),px(123),nullptr,nullptr,instance,this);
         health_badge=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED|WS_EX_TRANSPARENT,L"HiveDesk.Health",L"Stream status",WS_POPUP,0,0,px(136),px(30),viewer,nullptr,instance,this);
+        waiting=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Waiting",L"HiveDesk connection",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),viewer,nullptr,instance,this);
 
-        if(!owner||!viewer||!panel){error="Could not create native desktop windows.";return false;}
-        try{composition.create(panel);}catch(const std::exception& e){error=e.what();return false;}system_color();
+        if(!owner||!viewer||!panel||!waiting){error="Could not create native desktop windows.";return false;}
+        try{composition.create(panel);waiting_composition.create(waiting);}catch(const std::exception& e){error=e.what();return false;}system_color();
         // GetAsyncKeyState cannot distinguish remote-injected modifiers. Start
         // physical shortcut state empty and populate it from non-injected hooks.
         publish_input();
@@ -643,7 +705,7 @@ struct Shell::Impl {
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
         if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);RemoveClipboardFormatListener(owner);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
-        if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(viewer)DestroyWindow(viewer);
+        if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
         if(owner){MSG m{};while(PeekMessageW(&m,owner,UiTask,UiTask,PM_REMOVE))delete reinterpret_cast<std::function<void()>*>(m.lParam);DestroyWindow(owner);}
         for(auto& item:thumbnails)DeleteObject(item.second);thumbnails.clear();
         for(auto& item:prior_thumbnails)DeleteObject(item.second);prior_thumbnails.clear();
@@ -663,8 +725,7 @@ void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->gener
     if(g!=s->generation.load()||!s->selection_armed||s->pending_id!=peer||s->reconnecting)return;
     // Keep the selection armed so a first frame can restore immersion, while
     // local()/Escape still invalidates every delayed UI completion.
-    s->show_remote_ui(peer,L"Reconnecting",0);s->reconnecting=true;s->publish_input();
-    s->reset_remote_cursor();InvalidateRect(s->health_badge,nullptr,FALSE);s->timer();
+    s->begin_waiting(peer,true);
 });}
 void Shell::set_remote_size(uint32_t width,uint32_t height){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,width,height,g]{if(g==s->generation.load()){s->remote_width=width;s->remote_height=height;s->publish_input();}});}
 void Shell::show_local(){impl_->dispatch([s=impl_]{s->local(false);});}
@@ -688,7 +749,13 @@ void Shell::update_thumbnail(const std::string& peer,Thumbnail thumbnail) {
         auto& cached=s->thumbnails[peer];if(cached)s->prior_thumbnails[peer]=cached;cached=bitmap;
         BOOL animations=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
         s->thumbnail_fades[peer]=GetTickCount64()-(animations?0:180);InvalidateRect(s->panel,nullptr,FALSE);
+        if(s->waiting_visible&&!s->waiting_fading&&s->pending_id==peer){
+            try{s->paint_waiting(false);}catch(const std::exception&){s->local(true);}
+        }
     });
+}
+void Shell::update_snapshot(const std::string& peer,Snapshot snapshot) {
+    impl_->enqueue([this,peer,snapshot=std::move(snapshot)]{update_thumbnail(peer,decode_snapshot(snapshot));});
 }
 void Shell::observe_cursor(const std::string& controller) {
     impl_->dispatch([s=impl_,controller] {

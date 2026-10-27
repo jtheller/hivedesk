@@ -1260,6 +1260,7 @@ void MediaViewer::close() {
 }
 std::string MediaViewer::stats() const { std::lock_guard guard(impl_->mutex); return impl_->status; }
 bool MediaViewer::has_frame() const { std::lock_guard guard(impl_->mutex); return impl_->displayed && !impl_->stopping; }
+bool MediaViewer::has_presented_frame() const { std::lock_guard guard(impl_->mutex); return impl_->live_totals[2]!=0 && !impl_->stopping; }
 CursorPresentation MediaViewer::cursor_presentation() const {std::lock_guard guard(impl_->mutex);return impl_->cursor;}
 StreamFeedback MediaViewer::feedback() const {
     std::lock_guard guard(impl_->mutex);if(impl_->stopping)return {};

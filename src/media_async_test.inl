@@ -136,7 +136,10 @@ bool media_async_decode_self_test(std::string& report){
             const auto deadline=Clock::now()+std::chrono::seconds(2);
             while(!viewer.has_frame()&&Clock::now()<deadline){MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(2);}
             require(viewer.has_frame()&&!IsWindowVisible(live.value),"Hidden viewer failed prepared-pixel handshake");
+            while(!viewer.has_presented_frame()&&Clock::now()<deadline){MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(2);}
+            require(viewer.has_presented_frame(),"First submitted-image gate depended on revealing the waiting cover");
             const auto began=Clock::now();viewer.close();require(Clock::now()-began<std::chrono::seconds(1),"Viewer shutdown failed to join workers");
+            require(!viewer.has_presented_frame(),"Closed viewer retained an eligible first-frame signal");
         }
         report="PASS async NVDEC: bounded parser/map overlap, ordered colors, held-surface format drain, post-credit admission, cancellation/error propagation, latest-only GPU burst, static Present retry, epoch rejection and hidden live-view startup/close. No desktop capture/input or scanout claim.";return true;
     }catch(const std::exception& error){report="FAIL async NVDEC: "+phase+": "+error.what();return false;}
