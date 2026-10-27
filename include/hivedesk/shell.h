@@ -3,9 +3,13 @@
 #include "input_diagnostics.h"
 #include <windows.h>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 namespace hive {
+// The renderer holds this lease until its worker/swap chain has stopped. Shell
+// hides retired windows immediately and destroys them only after lease release.
+struct ViewerSurface { HWND window{};std::string peer; };
 struct ShellConfig {
     std::wstring device_name;
     std::string group_key;
@@ -40,8 +44,9 @@ public:
     int run();
     void quit();
     HWND viewer_window() const;
+    std::shared_ptr<const ViewerSurface> viewer_surface() const;
     void update_peers(const std::vector<Peer>&);
-    void show_remote(const std::string& peer, const std::wstring& label,uint64_t session=0);
+    void show_remote(const std::string& peer, const std::wstring& label,uint64_t session=0,HWND surface=nullptr);
     void show_reconnecting(const std::string& peer);
     void set_remote_size(uint32_t width, uint32_t height);
     void show_local();

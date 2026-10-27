@@ -61,6 +61,8 @@ bool number(const std::wstring& s,uint32_t& out) {
 struct Shell::Impl {
     HINSTANCE instance{};HICON app_icon{},app_small_icon{}; HWND owner{},viewer{},panel{},settings{},prior_focus{};
     HANDLE settings_process{};HWND health_badge{},waiting{};
+    std::atomic<std::shared_ptr<const ViewerSurface>> viewer_surface;
+    std::vector<std::shared_ptr<const ViewerSurface>> retired_viewers;
     PanelComposition waiting_composition;
     bool waiting_visible=false,waiting_fading=false,waiting_retry=false;
     gpu_policy_restart::SettingsAdmission settings_restart;
@@ -130,6 +132,42 @@ struct Shell::Impl {
         if(panel)ShowWindow(panel,SW_HIDE);
         publish_input();
     }
+    void collect_viewers() {
+        std::erase_if(retired_viewers,[](const auto& surface){
+            if(surface.use_count()!=1)return false;
+            DestroyWindow(surface->window);return true;
+        });
+    }
+    bool replace_viewer(const std::string& peer) {
+        // A reused flip-model HWND can expose its last DWM image before the
+        // asynchronous waiting-cover commit. Never show that HWND again for a
+        // new selection, even if its render worker is still finishing a frame.
+        const HWND next=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,
+            0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
+        if(!next)return false;
+        const HWND next_waiting=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,
+            L"HiveDesk.Waiting",L"HiveDesk connection",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),next,nullptr,instance,this);
+        if(!next_waiting){DestroyWindow(next);return false;}
+        PanelComposition next_composition;
+        try{
+            next_composition.create(next_waiting);
+            next_composition.cover(float(GetSystemMetrics(SM_CXSCREEN)),float(GetSystemMetrics(SM_CYSCREEN)),false,true);
+        }catch(const std::exception&){DestroyWindow(next);return false;}
+        auto surface=std::make_shared<const ViewerSurface>(ViewerSurface{next,peer});
+        if(!IsWindowVisible(viewer)&&!remote)prior_focus=GetForegroundWindow();
+        ShowWindow(viewer,SW_HIDE);
+        // The waiting HWND also retains its previous snapshot/fade in DWM.
+        // Give it a fresh target, rather than racing a reset commit against Show.
+        KillTimer(owner,4);waiting_visible=waiting_fading=false;
+        ShowWindow(waiting,SW_HIDE);DestroyWindow(waiting);
+        waiting=next_waiting;waiting_composition=std::move(next_composition);
+        // Move the remaining owned popup before retiring its owner.
+        SetWindowLongPtrW(health_badge,GWLP_HWNDPARENT,reinterpret_cast<LONG_PTR>(next));
+        viewer=next;
+        if(auto previous=viewer_surface.exchange(std::move(surface)))retired_viewers.push_back(std::move(previous));
+        collect_viewers();return true;
+    }
     void hide_waiting() {
         KillTimer(owner,4);waiting_visible=waiting_fading=false;
         if(waiting)ShowWindow(waiting,SW_HIDE);
@@ -169,7 +207,7 @@ struct Shell::Impl {
     void begin_waiting(const std::string& id,bool retry) {
         KillTimer(owner,4);waiting_fading=false;waiting_retry=retry;
         if(active_id!=id)previous_id=active_id;
-        if(!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
+        if(!IsWindowVisible(viewer)&&!prior_focus)prior_focus=GetForegroundWindow();
         active_id=id;remote=true;reconnecting=true;input_session=0;publish_input();
         reset_remote_cursor();
         try{
@@ -242,6 +280,8 @@ struct Shell::Impl {
     }
     void local(bool notify) {
         ++generation;remote=false;reconnecting=false;input_session=0;publish_input();
+        // Remove video before its cover, including Escape during a fade.
+        ShowWindow(viewer,SW_HIDE);
         hide_waiting();
         selection_armed=false;pending_id.clear();
         if(!active_id.empty())previous_id=active_id;active_id.clear();
@@ -254,7 +294,9 @@ struct Shell::Impl {
         if(id==active_id&&remote&&!reconnecting){hide_panel();return;}
         auto it=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==id;});
         if(it==peers.end()){status=L"Computer is no longer in the device list.";InvalidateRect(panel,nullptr,FALSE);return;}
-        ++generation;remote=false;reconnecting=false;input_session=0;publish_input();
+        ++generation;input_session=0;publish_input();
+        if(!replace_viewer(id)){local(true);status=L"Could not create the desktop window.";return;}
+        remote=false;reconnecting=false;publish_input();
         reset_remote_cursor();
         remote_width=remote_height=0;selection_armed=true;pending_id=id;ReleaseCapture();ClipCursor(nullptr);hide_panel();
         begin_waiting(id,false);
@@ -362,6 +404,7 @@ struct Shell::Impl {
         if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
     }
     void timer() {
+        collect_viewers();
         // Latest-state mailbox: no per-report UI messages or stale report FIFO.
         std::optional<PendingSource> incoming;
         {std::lock_guard lock(source_mutex);incoming=std::move(pending_source);pending_source.reset();}
@@ -569,6 +612,8 @@ struct Shell::Impl {
         Impl* s=reinterpret_cast<Impl*>(GetWindowLongPtrW(window,GWLP_USERDATA));
         if(message==WM_NCCREATE){s=static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(s));}
         if(!s)return DefWindowProcW(window,message,w,l);
+        if(message==WM_CLOSE&&window!=s->viewer&&std::any_of(s->retired_viewers.begin(),s->retired_viewers.end(),
+            [window](const auto& surface){return surface->window==window;}))return 0;
         if(window==s->health_badge) {
             if(message==WM_NCHITTEST)return HTTRANSPARENT;
             if(message==WM_ERASEBKGND)return 1;
@@ -676,6 +721,7 @@ struct Shell::Impl {
         // zero-size tool window, so the first real settings/viewer show is honored.
         if(owner){ShowWindow(owner,SW_SHOWNOACTIVATE);ShowWindow(owner,SW_HIDE);}
         viewer=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
+        if(viewer)viewer_surface.store(std::make_shared<const ViewerSurface>(ViewerSurface{viewer,{}}));
         panel=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Switcher",L"HiveDesk computers",WS_POPUP,0,0,px(200),px(123),nullptr,nullptr,instance,this);
         health_badge=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED|WS_EX_TRANSPARENT,L"HiveDesk.Health",L"Stream status",WS_POPUP,0,0,px(136),px(30),viewer,nullptr,instance,this);
         waiting=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Waiting",L"HiveDesk connection",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),viewer,nullptr,instance,this);
@@ -706,6 +752,8 @@ struct Shell::Impl {
         if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);RemoveClipboardFormatListener(owner);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
         if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
+        for(const auto& surface:retired_viewers)DestroyWindow(surface->window);
+        retired_viewers.clear();viewer_surface.store(nullptr);
         if(owner){MSG m{};while(PeekMessageW(&m,owner,UiTask,UiTask,PM_REMOVE))delete reinterpret_cast<std::function<void()>*>(m.lParam);DestroyWindow(owner);}
         for(auto& item:thumbnails)DeleteObject(item.second);thumbnails.clear();
         for(auto& item:prior_thumbnails)DeleteObject(item.second);prior_thumbnails.clear();
@@ -718,9 +766,10 @@ Shell::Shell():impl_(new Impl){}
 Shell::~Shell(){delete impl_;}
 bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks callbacks,std::string& error){return impl_->create(instance,config,std::move(callbacks),error);}
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
-HWND Shell::viewer_window()const{return impl_->viewer;}
+HWND Shell::viewer_window()const{const auto surface=viewer_surface();return surface?surface->window:nullptr;}
+std::shared_ptr<const ViewerSurface> Shell::viewer_surface()const{return impl_->viewer_surface.load();}
 void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl_,peers]{s->peers=peers;s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));InvalidateRect(s->panel,nullptr,FALSE);});}
-void Shell::show_remote(const std::string& peer,const std::wstring& label,uint64_t session){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,peer,label,session,g]{if(g==s->generation.load())s->show_remote_ui(peer,label,session);});}
+void Shell::show_remote(const std::string& peer,const std::wstring& label,uint64_t session,HWND surface){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,peer,label,session,g,surface]{if(g==s->generation.load()&&(!surface||surface==s->viewer))s->show_remote_ui(peer,label,session);});}
 void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->generation.load();impl_->dispatch([s=impl_,peer,g]{
     if(g!=s->generation.load()||!s->selection_armed||s->pending_id!=peer||s->reconnecting)return;
     // Keep the selection armed so a first frame can restore immersion, while

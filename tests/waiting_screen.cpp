@@ -30,7 +30,8 @@ int probe(){
     callbacks.select_peer=[&](const std::string&){++selected;};
     std::string error;require(shell.create(GetModuleHandleW(nullptr),config,std::move(callbacks),error),error.c_str());
     shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Computer C","",47980,true}});
-    const auto owner=find(L"HiveDesk.Owner"),panel=find(L"HiveDesk.Switcher"),waiting=find(L"HiveDesk.Waiting");
+    const auto owner=find(L"HiveDesk.Owner"),panel=find(L"HiveDesk.Switcher");
+    HWND waiting=find(L"HiveDesk.Waiting");
     require(owner&&panel&&waiting,"Missing shell windows");
     KillTimer(owner,1); // Disable automatic hot corner sampling in the isolated probe.
     const int dpi=int(GetDpiForWindow(panel));const auto px=[&](int n){return MulDiv(n,dpi,96);};
@@ -38,6 +39,7 @@ int probe(){
         SendMessageW(owner,WM_HOTKEY,81,0);
         const int tile=(px(200)-2*px(12))*9/16;
         SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));
+        waiting=find(L"HiveDesk.Waiting");
     };
     shell.update_thumbnail("a",image(80));select(1);
     require(selected==1&&shown(waiting)&&title(waiting).find(L"Computer A")!=std::wstring::npos&&title(waiting).find(L"Snapshot")!=std::wstring::npos,"A cached snapshot was not shown immediately");
@@ -56,6 +58,32 @@ int probe(){
     require(shown(waiting)&&title(waiting).find(L"Reconnecting")!=std::wstring::npos&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Reconnection reused stale video instead of a waiting screen");
     shell.show_local();shell.show_remote("c",L"Computer C",4);shell.update_thumbnail("c",image(220));pump(260);
     require(!shown(waiting)&&!shown(shell.viewer_window()),"Canceled connection reopened on a late completion");
+    // DEVG -> VI -> DEVG -> 6Re: keep the VI renderer lease alive to
+    // simulate an old worker/flip surface that has not finished shutting down.
+    select(1);auto vi=shell.viewer_surface();
+    require(vi&&vi->peer=="a","VI surface binding missing");
+    shell.show_remote("a",L"Computer A",10,vi->window);pump(260);
+    require(shown(vi->window)&&!shown(waiting),"VI first frame not revealed");
+    const auto vi_waiting=waiting;
+    select(0);
+    require(IsWindow(vi->window)&&!shown(vi->window),"Return to local exposed or destroyed a leased video window");
+    select(3);auto six=shell.viewer_surface();
+    require(six&&six->peer=="c"&&six->window!=vi->window&&shown(six->window)&&
+        IsWindow(vi->window)&&!shown(vi->window)&&shown(waiting)&&waiting!=vi_waiting,
+        "6Re reused or exposed VI's retained video/waiting surface");
+    SendMessageW(vi->window,WM_CLOSE,0,0);
+    require(IsWindow(vi->window)&&!shown(vi->window),"Late close destroyed a renderer's leased surface");
+    shell.show_remote("c",L"Computer C",11,vi->window);pump(260);
+    require(shown(waiting),"A stale surface completion dismissed the new cover");
+    shell.show_remote("c",L"Computer C",12,six->window);pump(260);
+    require(!shown(waiting)&&shown(six->window)&&!shown(vi->window),"6Re failed to reveal its own surface");
+    select(1);shell.show_remote("a",L"Computer A",10,vi->window);pump(260);
+    require(shown(waiting)&&shell.viewer_window()!=vi->window,"Same-peer reselection accepted a previous renderer completion");
+    const auto old_vi=vi->window;vi.reset();select(2);
+    require(!IsWindow(old_vi)&&IsWindow(six->window)&&!shown(six->window),"Retired video lifetime ignored renderer leases");
+    const auto old_six=six->window;six.reset();select(1);
+    require(!IsWindow(old_six),"Retired renderer window leaked after lease release");
+    shell.show_local();
     return 0;
 }
 }

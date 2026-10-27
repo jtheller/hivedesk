@@ -490,21 +490,24 @@ private:
         const bool automatic=negotiated!=connected_peers.end()&&(negotiated->features&hive::FeatureAutomaticStream);
         std::string error;
         active_connection_=transport_.connection_token(peer);if(!active_connection_)return;
-        {const std::lock_guard lock(view_mutex_);if(!viewer_.open(shell_.viewer_window(),error,
+        {const std::lock_guard lock(view_mutex_);
+            view_surface_=shell_.viewer_surface();
+            if(!view_surface_||view_surface_->peer!=peer)return;
+            if(!viewer_.open(view_surface_->window,error,
             [this,peer,epoch](const hive::CursorPresentation& cursor){
                 if(epoch==generation_&&!closing_)
                     shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
             })){status("Viewer failed: "+error);return;}}
-        if(epoch!=generation_||closing_) {const std::lock_guard lock(view_mutex_);viewer_.close();return;}
+        if(epoch!=generation_||closing_) {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();return;}
         // The control stream delivers clipboard before Start/InputEnable. The
         // separate input lane is armed only after that handoff has completed.
-        if(!transport_.send_clipboard(peer,shell_.cached_clipboard())) {const std::lock_guard lock(view_mutex_);viewer_.close();status("Could not send clipboard handoff.");return;}
+        if(!transport_.send_clipboard(peer,shell_.cached_clipboard())) {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();status("Could not send clipboard handoff.");return;}
         hive::StreamSettings stream;
         if(automatic){stream.session=++session_sequence_;stream.receiver_millihz=refresh;}
         else {stream.fps=std::max(1u,refresh/1000);stream.bitrate_mbps=80;status("Peer uses legacy streaming. Update both computers for automatic quality.");}
         {
             const std::lock_guard lock(view_intent_mutex_);
-            if(epoch!=generation_||closing_){const std::lock_guard view_lock(view_mutex_);viewer_.close();return;}
+            if(epoch!=generation_||closing_){const std::lock_guard view_lock(view_mutex_);viewer_.close();view_surface_.reset();return;}
             auto controlled=std::make_shared<const std::string>(peer);
             last_controlled_.store(controlled);active_.store(std::move(controlled));
             active_session_=stream.session;
@@ -540,7 +543,7 @@ private:
         {
             const std::lock_guard lock(view_intent_mutex_);
             if(epoch==generation_&&!closing_&&view_control_&&view_control_->session==stream.session){
-                view_ready_=true;reconnect_.connected();shell_.show_remote(peer,label,stream.session);
+                view_ready_=true;reconnect_.connected();shell_.show_remote(peer,label,stream.session,view_surface_->window);
                 // A successful first present can precede the queued UI session
                 // switch. Replay after show_remote; sequence guards reject any
                 // replay overtaken by a newer presentation callback.
@@ -560,7 +563,7 @@ private:
             if(notify_source){if(dedicated&&old_session)transport_.end_input(*previous,old_session);else transport_.send_input(*previous,{hive::InputKind::ReleaseAll,0,0,0});transport_.stop_stream(*previous);}
             auto expected=previous;last_controlled_.compare_exchange_strong(expected,nullptr);
         }
-        {const std::lock_guard lock(view_mutex_);viewer_.close();}
+        {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();}
         if(!closing_&&notify_shell)shell_.show_local();
     }
     void finish_shutdown() {
@@ -571,7 +574,7 @@ private:
         const auto previous=last_controlled_.exchange(nullptr);
         if(previous) {const auto session=active_session_.exchange(0);if(active_dedicated_input_.exchange(false)&&session)transport_.end_input(*previous,session);else transport_.send_input(*previous,{hive::InputKind::ReleaseAll,0,0,0});transport_.stop_stream(*previous);}
         {const std::lock_guard lock(host_mutex_);input_ready_=false;clipboard_pending_=false;staged_clipboards_.clear();hosting_.store(nullptr);host_.stop();}
-        {const std::lock_guard lock(view_mutex_);viewer_.close();}
+        {const std::lock_guard lock(view_mutex_);viewer_.close();view_surface_.reset();}
         transport_.stop();hive::release_injected_input();
         telemetry_.clear(MonitorSide::View);telemetry_.clear(MonitorSide::Host);
     }
@@ -599,6 +602,7 @@ private:
     hive::Shell shell_;
     hive::Transport transport_;
     hive::HostBridge host_;
+    std::shared_ptr<const hive::ViewerSurface> view_surface_;
     hive::MediaViewer viewer_;
     hive::Telemetry telemetry_{hive::data_directory()};
     std::mutex snapshot_mutex_;std::map<std::string,uint64_t> snapshot_pending_;
