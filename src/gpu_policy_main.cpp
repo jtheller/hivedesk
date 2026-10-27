@@ -2,10 +2,13 @@
 #include "nvapi_drs.h"
 #include <windows.h>
 #include <shlobj.h>
+#include <shellapi.h>
+#include <sddl.h>
 #include <algorithm>
 #include <cstdio>
 #include <cwctype>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -25,9 +28,49 @@ struct Handle {
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
 };
+struct MutexOwner {
+    HANDLE value;
+    ~MutexOwner(){ReleaseMutex(value);}
+};
 void win_check(bool success, const char* what) {
     if (!success) throw std::runtime_error(std::string(what) + " (Windows " + std::to_string(GetLastError()) + ").");
 }
+struct NvError : std::runtime_error {
+    int status;
+    NvError(int value,const std::string& text):std::runtime_error(text),status(value){}
+};
+bool elevated() {
+    Handle token;win_check(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token.value)!=FALSE,"Read process permissions");
+    TOKEN_ELEVATION value{};DWORD bytes{};
+    win_check(GetTokenInformation(token.value,TokenElevation,&value,sizeof(value),&bytes)!=FALSE,"Read elevation state");
+    return value.TokenIsElevated!=0;
+}
+std::wstring user_sid() {
+    Handle token;win_check(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token.value)!=FALSE,"Read user identity");
+    DWORD bytes{};GetTokenInformation(token.value,TokenUser,nullptr,0,&bytes);
+    std::vector<unsigned char> buffer(bytes);
+    win_check(GetTokenInformation(token.value,TokenUser,buffer.data(),bytes,&bytes)!=FALSE,"Read user identity");
+    LPWSTR sid{};win_check(ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid,&sid)!=FALSE,"Format user identity");
+    std::wstring result(sid);LocalFree(sid);return result;
+}
+// Driver access may need elevation; user-controlled backup paths must not gain
+// administrator filesystem rights. Perform every journal operation with the
+// original user's filtered token, including when manually launched elevated.
+class UserFiles {
+    bool impersonating_=false;
+public:
+    UserFiles() {
+        if(!elevated())return;
+        Handle token;win_check(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token.value)!=FALSE,"Read user file permissions");
+        TOKEN_LINKED_TOKEN linked{};DWORD bytes{};
+        win_check(GetTokenInformation(token.value,TokenLinkedToken,&linked,sizeof(linked),&bytes)!=FALSE,"Read original user file permissions");
+        Handle original(linked.LinkedToken),impersonation;
+        win_check(DuplicateToken(original.value,SecurityImpersonation,&impersonation.value)!=FALSE,"Prepare user file permissions");
+        win_check(SetThreadToken(nullptr,impersonation.value)!=FALSE,"Use original user file permissions");
+        impersonating_=true;
+    }
+    ~UserFiles(){if(impersonating_&&!RevertToSelf())TerminateProcess(GetCurrentProcess(),1);}
+};
 void put(NvAPI_UnicodeString& dest, const std::wstring& source) {
     if (source.size() >= std::size(dest)) throw std::runtime_error("Driver profile text exceeds its supported length.");
     std::fill(std::begin(dest), std::end(dest), NvU16{});
@@ -66,7 +109,8 @@ struct NvApi {
             const auto error = reinterpret_cast<int (__cdecl*)(int, char*)>(query(0x6c2d048c));
             if (error) error(result, text);
         }
-        throw std::runtime_error(std::string(what) + ": " + text + " (" + std::to_string(result) + ").");
+        if(result==-175)throw NvError(result,std::string(what)+": NVIDIA denied permission to save application settings (-175).");
+        throw NvError(result,std::string(what) + ": " + (text[0]?text:"NVIDIA driver error") + " (" + std::to_string(result) + ").");
     }
 };
 class NvidiaDriver final : public Driver {
@@ -196,6 +240,7 @@ class FileStorage final : public Storage {
 public:
     explicit FileStorage(std::filesystem::path path) : path_(std::move(path)) {}
     std::optional<Journal> read() override {
+        UserFiles permissions;
         Handle file(CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
         if (file.value == INVALID_HANDLE_VALUE) {
             if (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND) return {};
@@ -222,6 +267,7 @@ public:
         return journal;
     }
     void write(const Journal& journal) override {
+        UserFiles permissions;
         std::filesystem::create_directories(path_.parent_path());
         std::vector<std::uint8_t> bytes; number(bytes, 0x31504448); number(bytes, 1); number(bytes, static_cast<std::uint32_t>(journal.phase));
         strings(bytes, journal.targets); number(bytes, static_cast<std::uint32_t>(journal.entries.size()));
@@ -239,6 +285,7 @@ public:
         win_check(MoveFileExW(temporary.c_str(), path_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "Commit GPU policy backup");
     }
     void clear() override {
+        UserFiles permissions;
         if (!DeleteFileW(path_.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) win_check(false, "Remove restored GPU policy backup");
     }
 };
@@ -248,12 +295,7 @@ void print(const Result& result) {
     std::printf("HiveDesk-Gpu-Policy-1\nstatus=%s\nrestart=%d\ncode=%s\nmessage=%s\n",
         result.status.c_str(), result.restart ? 1 : 0, result.code.c_str(), message.c_str());
 }
-}
-int wmain(int argc, wchar_t** argv) {
-    try {
-        if (argc != 2) throw std::runtime_error("Expected --status, --enable or --restore.");
-        const std::wstring_view argument(argv[1]);
-        const auto action = argument == L"--status" ? Action::status : argument == L"--enable" ? Action::enable : argument == L"--restore" ? Action::restore : throw std::runtime_error("Unknown GPU policy command.");
+Result execute(Action action) {
         wchar_t module[32768]{}; const auto length = GetModuleFileNameW(nullptr, module, static_cast<DWORD>(std::size(module)));
         win_check(length && length < std::size(module), "Locate GPU policy helper");
         const auto directory = std::filesystem::path(module).parent_path();
@@ -269,10 +311,63 @@ int wmain(int argc, wchar_t** argv) {
         Handle mutex(CreateMutexW(nullptr, FALSE, lock_name.c_str())); win_check(mutex.value != nullptr, "Create GPU policy lock");
         const auto wait = WaitForSingleObject(mutex.value, 5000);
         if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) throw std::runtime_error("Another GPU policy change is still running.");
+        MutexOwner ownership{mutex.value};
         FileStorage storage(root / L"HiveDesk" / (L"gpu-policy-" + id + L".bin"));
         NvidiaDriver driver;
         const auto result = run(driver, storage, targets, action);
-        ReleaseMutex(mutex.value); print(result); return result.success ? 0 : 2;
+        return result;
+}
+Result elevate_change(Action action) {
+    wchar_t module[32768]{};const auto length=GetModuleFileNameW(nullptr,module,static_cast<DWORD>(std::size(module)));
+    win_check(length&&length<std::size(module),"Locate GPU policy helper");
+    // No arbitrary commands, executable paths, profile names or journal paths
+    // cross this boundary. Alternate administrator accounts are rejected.
+    const auto arguments=std::wstring(action==Action::enable?L"--elevated-enable ":L"--elevated-restore ")+user_sid();
+    SHELLEXECUTEINFOW launch{sizeof(launch)};launch.fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI;
+    launch.lpVerb=L"runas";launch.lpFile=module;launch.lpParameters=arguments.c_str();launch.nShow=SW_HIDE;
+    if(!ShellExecuteExW(&launch)) {
+        if(GetLastError()==ERROR_CANCELLED)return {"unavailable","elevation_cancelled","Administrator permission was cancelled. GPU policy was not confirmed.",false,false};
+        win_check(false,"Request administrator permission");
+    }
+    Handle child(launch.hProcess);
+    win_check(child.value&&child.value!=INVALID_HANDLE_VALUE,"Open elevated helper");
+    win_check(WaitForSingleObject(child.value,INFINITE)==WAIT_OBJECT_0,"Wait for GPU policy save");
+    DWORD code{};win_check(GetExitCodeProcess(child.value,&code)!=FALSE,"Read GPU policy save result");
+    if(code==11)return {"unavailable","access_denied","NVIDIA still denied saving with administrator permission (-175). Restarting HiveDesk will not fix this permission error.",false,false};
+    if(code==12)return {"unavailable","wrong_user","Approve with the same Windows account; another administrator cannot use your policy backup.",false,false};
+    if(code!=0&&code!=10)return {"unavailable","elevated_save_failed","The elevated GPU policy change failed. Its actual state will be checked again.",false,false};
+    auto result=execute(Action::status);
+    if(!result.success||result.status!=(action==Action::enable?"enabled":"disabled"))
+        return {"unavailable","verify_failed","The driver did not confirm the requested GPU policy after administrator approval.",false,false};
+    result.restart=result.restart||code==10;return result;
+}
+Result with_permissions(Action action,bool admin,const std::function<Result(Action)>& operation,
+    const std::function<Result(Action)>& retry) {
+    try{return operation(action);}
+    catch(const NvError& error){
+        if(error.status!=-175||action==Action::status||admin)throw;
+        return retry(action);
+    }
+}
+}
+int wmain(int argc, wchar_t** argv) {
+    try {
+        if(argc!=2&&argc!=3)throw std::runtime_error("Expected --status, --enable or --restore.");
+        const std::wstring_view argument(argv[1]);
+        const bool child=argc==3&&(argument==L"--elevated-enable"||argument==L"--elevated-restore");
+        if((argc==3&&!child)||(child&&(!elevated()||user_sid()!=argv[2])))return 12;
+        const auto action=argument==L"--status"?Action::status:
+            argument==L"--enable"||(child&&argument==L"--elevated-enable")?Action::enable:
+            argument==L"--restore"||(child&&argument==L"--elevated-restore")?Action::restore:
+            throw std::runtime_error("Unknown GPU policy command.");
+        Result result;
+        try {result=with_permissions(action,elevated(),execute,elevate_change);}
+        catch(const NvError& error) {
+            if(error.status!=-175)throw;
+            if(child)return 11;
+            print({"unavailable","access_denied",error.what(),false,false});return 1;
+        }
+        print(result);return !result.success?2:child&&result.restart?10:0;
     } catch (const std::exception& error) {
         print({"unavailable", "operation_failed", error.what(), false, false}); return 1;
     }

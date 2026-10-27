@@ -104,6 +104,16 @@ void new_profile_external_edits() {
     driver.disk.begin()->second.apps.push_back(L"another.exe");
     require(run(driver, store, targets, Action::restore).code == "external_change", "New unrelated app blocks restoration of its now-shared profile");
 }
+void untrusted_backup_scope() {
+    FakeDriver driver;MemoryStorage store;
+    run(driver,store,targets,Action::enable);
+    const auto commits=driver.commits;
+    auto& entry=store.value->entries.front();
+    entry.apps.push_back(L"unrelated.exe");
+    driver.disk.at(entry.name).apps=entry.apps;
+    require(run(driver,store,targets,Action::restore).code=="journal_invalid","A forged backup expanded the elevated write scope");
+    require(driver.commits==commits,"Invalid backup changed driver settings");
+}
 void interrupted_transactions() {
     FakeDriver driver; MemoryStorage store; store.fail_write = 1;
     throws([&] { run(driver, store, targets, Action::enable); }, "Precommit journal failure must propagate");
@@ -156,7 +166,7 @@ void existing_max_and_scope() {
 int main() {
     try {
         new_profiles_roundtrip(); explicit_and_inherited_roundtrip(); shared_and_external_profiles();
-        new_profile_external_edits(); interrupted_transactions(); after_commit_journal_failure(); existing_max_and_scope();
+        new_profile_external_edits(); untrusted_backup_scope(); interrupted_transactions(); after_commit_journal_failure(); existing_max_and_scope();
         std::puts("PASS: GPU policy transaction, restoration, crash recovery and external-change isolation"); return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

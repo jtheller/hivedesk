@@ -45,6 +45,9 @@ std::optional<Result> validate(Driver& driver, const Journal& journal, const std
     if (!same_apps(journal.targets, targets) || journal.entries.empty() || journal.entries.size() > 2)
         return conflict("journal_invalid", "The saved GPU policy backup does not match this installation.");
     for (const auto& entry : journal.entries) {
+        Profile recorded;recorded.apps=entry.apps;
+        if(!safe_apps(recorded,targets))
+            return conflict("journal_invalid","The GPU policy backup contains applications outside this installation.");
         const auto current = driver.find_profile(entry.name);
         if (current && !same_apps(current->apps, entry.apps))
             return conflict("external_change", "An application profile was changed externally; its backup has been retained.");

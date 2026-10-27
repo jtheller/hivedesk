@@ -156,7 +156,8 @@ internal sealed class SettingsWindow : Window
         catch (Exception) { Show("Save your other changes before changing GPU performance.", InfoBarSeverity.Warning); return; }
         EndRecording(); changingGpuPolicy = true; gpuPerformance.IsEnabled = false;
         name.IsEnabled = startup.IsEnabled = tray.IsEnabled = debug.IsEnabled = shortcut.IsEnabled = save.IsEnabled = false;
-        Show("Changing GPU performance policy...", InfoBarSeverity.Informational);
+        var previousGpuPolicy = gpuPolicyState;
+        Show("Changing GPU policy. Windows may request administrator permission...", InfoBarSeverity.Informational);
         try
         {
             var result = await gpuPolicy.Set(enabled, updateCancellation.Token);
@@ -167,7 +168,7 @@ internal sealed class SettingsWindow : Window
                 // Driver save can succeed before journal/readback fails. Even a
                 // structured rejection therefore needs independent reconciliation.
                 await ReadGpuPolicy();
-                if (!closed) ShowGpuPolicyFailure(result.Message);
+                if (!closed) ShowGpuPolicyFailure(result.Message, previousGpuPolicy);
                 return;
             }
             if (result.State != (enabled ? GpuPolicyState.Enabled : GpuPolicyState.Disabled))
@@ -183,7 +184,7 @@ internal sealed class SettingsWindow : Window
                 // A timeout may happen after a committed write. Re-read actual
                 // driver state rather than claim that a failed request rolled back.
                 await ReadGpuPolicy();
-                if (!closed) ShowGpuPolicyFailure(error.Message);
+                if (!closed) ShowGpuPolicyFailure(error.Message, previousGpuPolicy);
             }
         }
         finally
@@ -196,11 +197,12 @@ internal sealed class SettingsWindow : Window
             }
         }
     }
-    private void ShowGpuPolicyFailure(string message)
+    private void ShowGpuPolicyFailure(string message, GpuPolicyResult? previous)
     {
         bool readable = gpuPolicyState?.State is GpuPolicyState.Enabled or GpuPolicyState.Disabled;
-        Show(message + (readable ? " Restart HiveDesk to apply any saved change." : ""), InfoBarSeverity.Error);
-        if (readable) feedback.ActionButton = retryGpuRestart;
+        bool savedChange = readable && (gpuPolicyState!.RestartRequired || previous?.State != gpuPolicyState.State);
+        Show(message + (savedChange ? " Restart HiveDesk to apply the saved change." : ""), InfoBarSeverity.Error);
+        if (savedChange) feedback.ActionButton = retryGpuRestart;
     }
     private async Task RetryGpuRestart()
     {
@@ -302,6 +304,12 @@ internal sealed class SettingsWindow : Window
             await ChangeGpuPolicy(false); if (gpuWrites != 1) throw new Exception("Duplicate GPU policy change started");
             gpuPending.SetResult(new(1, GpuReply("disabled"), "denied")); await changing;
             if (changingGpuPolicy || !gpuPerformance.IsEnabled || gpuPerformance.IsChecked != false || feedback.Severity != InfoBarSeverity.Error || restarts != 0) throw new Exception("Rejected GPU change was not rolled back to actual state");
+            if (feedback.ActionButton != null || feedback.Message.Contains("Restart HiveDesk")) throw new Exception("Rejected unchanged GPU save incorrectly offered restart");
+            gpuPolicy = new GpuPolicyBridge(false, (command, _) => Task.FromResult(command == GpuPolicyCommand.Status
+                ? new GpuPolicyProcessResult(0, GpuReply("disabled"), "")
+                : new GpuPolicyProcessResult(2, GpuReply("unavailable", code: "elevation_cancelled"), "")));
+            await ChangeGpuPolicy(true);
+            if (gpuPerformance.IsChecked != false || feedback.ActionButton != null || restarts != 0 || feedback.Message.Contains("Restart HiveDesk")) throw new Exception("Cancelled permission request changed state or offered restart");
             gpuPolicy = new GpuPolicyBridge(false, (_, _) => Task.FromResult(new GpuPolicyProcessResult(0, GpuReply("enabled", true), "")));
             name.Text = "Unsaved name"; await ChangeGpuPolicy(true);
             if (gpuPerformance.IsChecked != false || feedback.Severity != InfoBarSeverity.Warning || restarts != 0) throw new Exception("GPU change discarded unsaved preferences");

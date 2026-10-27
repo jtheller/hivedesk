@@ -22,7 +22,7 @@ internal sealed class GpuPolicyBridge(bool preview,
     private async Task<GpuPolicyResult> Invoke(GpuPolicyCommand command, CancellationToken cancellation)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        deadline.CancelAfter(timeout ?? TimeSpan.FromSeconds(30));
+        deadline.CancelAfter(timeout ?? TimeSpan.FromSeconds(command == GpuPolicyCommand.Status ? 30 : 180));
         try
         {
             // Preview must never reach a real helper, including through injection.

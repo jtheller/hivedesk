@@ -1,5 +1,28 @@
 # Alpha validation
 
+## Alpha 35 GPU policy save permissions
+
+- NVIDIA access denied (-175) is mapped explicitly even when driver error text
+  is blank. A denied ordinary-user mutation retries once through Windows UAC;
+  status reads, other errors and already elevated denials never prompt again.
+  The failed transaction releases its mutex before the elevated child starts.
+- The child accepts only enable/restore for sibling HiveDesk executables and
+  requires the same Windows account. Backup filesystem operations impersonate
+  that account's filtered token; backup content cannot expand application scope.
+  Successful child exit is followed by an independent ordinary-user readback.
+- UI failure recovery offers restart only for a verified state transition or
+  pending restart. Cancellation and unchanged denied saves preserve the actual
+  checkbox without suggesting that a restart will fix the permission failure.
+- Release compilation and 29/29 native checks passed. Permission regressions
+  exercise exact retry/action routing, cancellation, no recursive escalation,
+  same-account rejection, exception-time mutex release and backup scope checks.
+  Managed bridge checks and private-desktop light/dark WinUI checks passed,
+  including cancelled approval and unchanged-save feedback.
+- No UAC approval or real driver mutation was performed during this validation.
+  The reported -175 machine still needs a real approve/save/restore comparison;
+  administrator approval cannot guarantee a damaged/restricted driver database
+  will accept the write. Existing local policy was inspected without changing it.
+
 ## Alpha 34 cursor composition
 
 - DXGI pointer ownership is read only when LastMouseUpdateTime is nonzero.
