@@ -8,7 +8,8 @@
 
 // Bounded, explicit remote video-start diagnostic. No input, clipboard writes,
 // viewer window or saved images. Reports transport and host pipeline evidence.
-int remote_start_check(const char* address) {
+int remote_start_check(const char* address,const std::string& part) {
+    const bool snapshot_only=part=="--snapshot-only",video_only=part=="--video-only";
     const auto config=hive::load_config();hive::Transport client;std::mutex mutex;
     unsigned frames=0,health_count=0,diagnostic_count=0,snapshots=0;
     hive::SourceDiagnostics source{};uint32_t width=0,height=0;std::string version;
@@ -27,15 +28,16 @@ int remote_start_check(const char* address) {
         !client.connect(address,config.port,peer,error)){std::printf("FAIL connect: %s\n",error.c_str());return 1;}
     struct Stop{hive::Transport& client;std::string peer;~Stop(){client.stop_stream(peer);client.stop();}} stop{client,peer};
     const uint64_t session=GetTickCount64();
-    client.request_snapshot(peer,1);
-    if(!client.request_stream(peer,{0,0,60000,session})){std::puts("FAIL stream request");return 1;}
-    for(unsigned second=0;second<12;++second){
+    if(!video_only)client.request_snapshot(peer,1);
+    if(!snapshot_only&&!client.request_stream(peer,{0,0,60000,session})){std::puts("FAIL stream request");return 1;}
+    for(unsigned second=0;second<(snapshot_only?12u:30u);++second){
         std::this_thread::sleep_for(std::chrono::seconds(1));
         std::lock_guard lock(mutex);
         std::printf("t=%u version=%s connected=%d frames=%u size=%ux%u health=%u diagnostics=%u encoded=%.3f fps encode=%u us discarded=%llu snapshots=%u\n",
             second+1,version.c_str(),client.connection_token(peer)!=0,frames,width,height,health_count,diagnostic_count,
             source.encoded_millihz/1000.0,source.encode_us,static_cast<unsigned long long>(source.source_discarded),snapshots);
         std::fflush(stdout);
+        std::printf("tcp:%s\n",client.tcp_diagnostics(peer).c_str());
     }
-    std::lock_guard lock(mutex);return frames?0:1;
+    std::lock_guard lock(mutex);return (snapshot_only?snapshots:frames)?0:1;
 }

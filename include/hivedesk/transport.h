@@ -89,6 +89,9 @@ public:
     // Local, bounded video sender timings. Empty/unavailable after disconnect;
     // lifetime counters reset when the underlying video connection changes.
     VideoSendDiagnostics video_send_diagnostics(const std::string& peer) const;
+    // Read-only socket counters for explicit startup diagnostics; no payloads.
+    std::string tcp_diagnostics(const std::string& peer) const;
+    uint64_t received_video_bytes(const std::string& peer) const;
     static std::string generate_group_key();
     static bool self_test(std::string& result);
     static bool discovery_self_test(std::string& result);

@@ -7,12 +7,18 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
-int remote_start_check(const char* address);
+int remote_start_check(const char* address,const std::string& part);
 int main(int argc,char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const std::string mode=argc>1?argv[1]:"--all";
-        if(mode=="--remote"){if(argc!=3){std::cerr<<"Use --remote <IPv4 address>\n";return 2;}return remote_start_check(argv[2]);}
+        if(mode=="--remote"){
+            const std::string part=argc==4?argv[3]:"all";
+            if((argc!=3&&argc!=4)||(part!="all"&&part!="--snapshot-only"&&part!="--video-only")){
+                std::cerr<<"Use --remote <IPv4 address> [--snapshot-only|--video-only]\n";return 2;
+            }
+            return remote_start_check(argv[2],part);
+        }
         bool ok=true; std::string report;
         if(mode=="--lan"){ok=hive::Transport::discovery_self_test(report);std::cout<<report<<'\n';return ok?0:1;}
         if(mode=="--transport"||mode=="--all") { const bool passed=hive::Transport::self_test(report); std::cout<<report<<'\n'; ok=ok&&passed; }

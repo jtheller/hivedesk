@@ -518,10 +518,13 @@ private:
         telemetry_.select(MonitorSide::View,peer,stream.session,hive::narrow(label));
         if(!transport_.request_stream(peer,stream)) {go_local(active_.exchange(nullptr),false);status("Could not request desktop stream; retrying.");return;}
         if(active_dedicated_input_&&!transport_.begin_input(peer,stream.session)) {go_local(active_.exchange(nullptr),false);status("Could not initialize dedicated input; retrying.");return;}
-        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);
+        auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);
+        auto received_bytes=transport_.received_video_bytes(peer);
         bool ready=false;std::string failure;
         while(epoch==generation_&&!closing_&&std::chrono::steady_clock::now()<deadline) {
             if(transport_.connection_token(peer)!=active_connection_){failure="Connection changed while starting video; retrying.";break;}
+            const auto progress=transport_.received_video_bytes(peer);
+            if(progress>received_bytes){received_bytes=progress;deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);}
             const auto state=viewer_.stats();
             if(state.find("Media error:")==0) {failure=state;break;}
             // The waiting cover already makes the viewer visible. Keep it

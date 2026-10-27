@@ -14,6 +14,7 @@
 #include "hivedesk/network_key.h"
 #include "rate_wire.h"
 #include "video_send_window.h"
+#include "video_write_progress.h"
 #include "input_send_window.h"
 #include <algorithm>
 #include <array>
@@ -44,7 +45,6 @@ constexpr size_t kMaxConnections = 128;
 // Unsent freshness is tuning; the seconds-long write watchdog is session failure
 // policy. TCP cannot skip an already submitted packet halfway through.
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
-constexpr auto kVideoWriteBudget = SessionStallTimeout;
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
     InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25 };
@@ -172,8 +172,8 @@ bool send_all(SOCKET s, const uint8_t* p, size_t n) {
     while (n) { int sent = ::send(s, reinterpret_cast<const char*>(p), int((std::min)(n, size_t(16*1024))), 0); if (sent <= 0) return false; p += sent; n -= sent; }
     return true;
 }
-bool recv_all(SOCKET s, uint8_t* p, size_t n) {
-    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (received <= 0) return false; p += received; n -= received; }
+bool recv_all(SOCKET s, uint8_t* p, size_t n,std::atomic<uint64_t>* progress=nullptr) {
+    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (received <= 0) return false; p += received; n -= received; if(progress)progress->fetch_add(received,std::memory_order_relaxed); }
     return true;
 }
 bool send_blob(SOCKET s, const Bytes& b) { Bytes head; u32(head, uint32_t(b.size())); return send_all(s, head.data(), head.size()) && send_all(s, b.data(), b.size()); }
@@ -235,6 +235,7 @@ struct Transport::Impl {
         WSAEVENT send_complete = WSA_INVALID_EVENT; bool video_socket_configured = false;
         HANDLE video_wake = CreateEventW(nullptr,FALSE,FALSE,nullptr);
         std::atomic<unsigned> video_inflight{0};
+        std::atomic<uint64_t> received_bytes{0};
         VideoSendWindow video_send;
         InputSendWindow input_send;
         uint64_t input_receive_session=0,input_receive_sequence=0;
@@ -312,7 +313,6 @@ struct Transport::Impl {
             std::array<uint8_t,16> tag{};
             WSAOVERLAPPED operation{};
             SOCKET socket=INVALID_SOCKET;
-            Clock::time_point deadline;
             VideoSendWindow::Attempt attempt;
             VideoWrite(){operation.hEvent=WSACreateEvent();}
             ~VideoWrite(){if(operation.hEvent!=WSA_INVALID_EVENT)WSACloseEvent(operation.hEvent);}
@@ -320,7 +320,6 @@ struct Transport::Impl {
         bool submit_video(VideoWrite& write,const Bytes& payload,Clock::time_point queued_at) {
             write.attempt.queued_at=transport_us(queued_at);
             write.attempt.dequeued_at=transport_us();
-            write.deadline=Clock::now()+kVideoWriteBudget;
             if(write.operation.hEvent==WSA_INVALID_EVENT||tx_seq==UINT64_MAX)return false;
             u32(write.head,uint32_t(payload.size()));u64(write.head,++tx_seq);
             const auto begin=transport_us();
@@ -337,7 +336,6 @@ struct Transport::Impl {
                 if(setsockopt(write.socket,SOL_SOCKET,SO_SNDBUF,reinterpret_cast<const char*>(&zero),sizeof(zero)))return false;
                 video_socket_configured=true;
             }
-            if(Clock::now()>=write.deadline)return false;
             write.attempt.submitted_at=transport_us();
             const int result=WSASend(write.socket,buffers.data(),DWORD(buffers.size()),nullptr,0,&write.operation,nullptr);
             write.attempt.submitted=result==0||WSAGetLastError()==WSA_IO_PENDING;
@@ -361,6 +359,7 @@ struct Transport::Impl {
                     conn.video_inflight=0;
                 }
             } drain{*this,pending};
+            VideoWriteProgress progress;
             if(!video_wake)return;
             while(!closed&&owner->running){
                 // Completion events may arrive out of order. Retire in posting
@@ -371,14 +370,24 @@ struct Transport::Impl {
                         std::lock_guard lock(socket_mutex);
                         completed=!closed&&socket.load()==write.socket&&
                             WSAGetOverlappedResult(write.socket,&write.operation,&sent,FALSE,&flags)&&
-                            sent==write.attempt.wire_bytes&&Clock::now()<=write.deadline;
+                            sent==write.attempt.wire_bytes;
                     }
                     write.attempt.finished_at=transport_us();write.attempt.completed=completed;
                     video_send.record(write.attempt);pending.pop_front();video_inflight=unsigned(pending.size());
                     if(!completed)return; // Partial/error completion invalidates the whole byte stream.
+                    progress.reset(transport_us());
                 }
-                if(!pending.empty()&&Clock::now()>=pending.front()->deadline){
-                    owner->status("Video send stalled for 2 s; reconnecting for a fresh desktop.");return;
+                if(!pending.empty()){
+                    const auto now=transport_us();
+                    if(progress.due(now)){
+                        TCP_INFO_v0 info{};DWORD version=0,bytes=0;bool available=false;
+                        {const std::lock_guard lock(socket_mutex);const auto s=socket.load();
+                            available=s!=INVALID_SOCKET&&!WSAIoctl(s,SIO_TCP_INFO,&version,sizeof(version),&info,sizeof(info),&bytes,nullptr,nullptr);}
+                        if(available)progress.observe(now,info.BytesOut,info.BytesRetrans);else progress.unavailable();
+                    }
+                    if(progress.expired(now)){
+                        owner->status("Video send made no new TCP payload progress for 2 s; reconnecting for a fresh desktop.");return;
+                    }
                 }
                 if(pending.size()<2){
                     std::optional<Bytes> payload;Clock::time_point queued_at{};bool taken=false;
@@ -392,6 +401,7 @@ struct Transport::Impl {
                         if(!payload)continue;
                         // Allocate the owner before posting: no container growth
                         // or moving OVERLAPPED storage after WSASend accepted it.
+                        if(pending.empty())progress.reset(transport_us());
                         pending.push_back(std::make_unique<VideoWrite>());
                         if(!submit_video(*pending.back(),*payload,queued_at))return;
                         video_inflight=unsigned(pending.size());
@@ -401,8 +411,8 @@ struct Transport::Impl {
                 HANDLE events[]{video_wake,pending.empty()?nullptr:pending.front()->operation.hEvent};
                 DWORD timeout=INFINITE;
                 if(!pending.empty()){
-                    const auto remaining=pending.front()->deadline-Clock::now();
-                    timeout=remaining>Clock::duration::zero()?DWORD(std::chrono::ceil<std::chrono::milliseconds>(remaining).count()):0;
+                    const auto now=transport_us(),wake=progress.wake_at();
+                    timeout=wake>now?DWORD((wake-now+999)/1000):0;
                 }
                 const DWORD waited=WaitForMultipleObjects(pending.empty()?1:2,events,FALSE,timeout);
                 if(waited==WAIT_FAILED)return;
@@ -460,11 +470,12 @@ struct Transport::Impl {
             SOCKET s = socket.load(); return send_all(s,head.data(),head.size()) && send_all(s,cipher.data(),cipher.size()) && send_all(s,tag.data(),tag.size());
         }
         bool read_packet(Bytes& b) {
-            SOCKET s = socket.load(); Bytes head(12); if (!recv_all(s,head.data(),head.size())) return false;
+            SOCKET s = socket.load();auto* progress=channel==1?&received_bytes:nullptr;
+            Bytes head(12); if (!recv_all(s,head.data(),head.size(),progress)) return false;
             Reader r{head}; uint32_t n = r.dword(); uint64_t seq = r.qword();
             if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:MaxNativeSnapshotBytes + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
             Bytes encrypted(n); std::array<uint8_t,16> tag{};
-            if (!recv_all(s,encrypted.data(),encrypted.size()) || !recv_all(s,tag.data(),tag.size()) || !rx.crypt(false,head,encrypted,b,tag)) return false;
+            if (!recv_all(s,encrypted.data(),encrypted.size(),progress) || !recv_all(s,tag.data(),tag.size(),progress) || !rx.crypt(false,head,encrypted,b,tag)) return false;
             rx_seq = seq; return true;
         }
         void write_loop() {
@@ -971,6 +982,24 @@ VideoSendDiagnostics Transport::video_send_diagnostics(const std::string& peer)c
     const auto c=impl_->find(peer,true);if(!c)return {};
     auto result=c->video_send.snapshot(transport_us());result.connection=c->token;result.inflight=c->video_inflight.load();return result;
 }
+std::string Transport::tcp_diagnostics(const std::string& peer)const{
+    std::string text;
+    const std::array channels{impl_->find(peer),impl_->find(peer,true),impl_->find_input(peer)};
+    for(size_t channel=0;channel<channels.size();++channel){
+        const auto& c=channels[channel];if(!c)continue;
+        const std::lock_guard lock(c->socket_mutex);const auto socket=c->socket.load();
+        TCP_INFO_v0 info{};DWORD version=0,bytes=0;
+        if(socket==INVALID_SOCKET||WSAIoctl(socket,SIO_TCP_INFO,&version,sizeof(version),&info,sizeof(info),&bytes,nullptr,nullptr))continue;
+        text+=" ch"+std::to_string(channel)+" rx="+std::to_string(info.BytesIn)+" tx="+std::to_string(info.BytesOut)+
+            " flight="+std::to_string(info.BytesInFlight)+" rtt="+std::to_string(info.RttUs)+
+            " rwnd="+std::to_string(info.RcvWnd)+" swnd="+std::to_string(info.SndWnd)+
+            " retrans="+std::to_string(info.BytesRetrans)+" rto="+std::to_string(info.TimeoutEpisodes);
+    }
+    return text;
+}
+uint64_t Transport::received_video_bytes(const std::string& peer)const{
+    const auto c=impl_->find(peer,true);return c?c->received_bytes.load(std::memory_order_relaxed):0;
+}
 bool Transport::send_feedback(const std::string& peer,const StreamFeedback& f) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||!valid_feedback(f))return false;
     Bytes b{Feedback};u64(b,f.session);u64(b,f.capture_time_us);u32(b,f.arrival_age_us);u32(b,f.service_us);u32(b,f.queue_us);b.push_back(f.recover?1:0);
@@ -1095,6 +1124,21 @@ bool Transport::discovery_self_test(std::string& result){
 }
 bool Transport::self_test(std::string& result) {
     {
+        VideoWriteProgress progress;progress.reset(0);
+        if(progress.due(499999)||!progress.due(500000)||progress.expired(1999999)){
+            result="Video progress initial sampling/deadline failed";return false;
+        }
+        progress.observe(500000,1000,0);
+        progress.observe(1500000,2000,0);
+        if(progress.expired(3000000)){result="New video payload did not refresh its stall deadline";return false;}
+        progress.observe(3000000,3000,1000);
+        if(!progress.expired(3500000)){result="Retransmission-only traffic extended the video deadline";return false;}
+        progress.reset(4000000);progress.unavailable();
+        if(progress.due(6000000)||!progress.expired(6000000)){
+            result="Unavailable TCP statistics disabled the stall watchdog";return false;
+        }
+    }
+    {
         // A healthy slow transfer can outlast SO_SNDTIMEO in total. Only a
         // lack of write progress should fail it, and a stopped reader must
         // still terminate the send. Exercise real TCP without desktop input.
@@ -1145,6 +1189,41 @@ bool Transport::self_test(std::string& result) {
         const auto stalled=Clock::now();
         if(send_all(writer.s,payload.data(),payload.size())||Clock::now()-stalled>std::chrono::seconds(4)){
             result="Stalled TCP control write did not stop within its timeout";return false;
+        }
+        // Repeat the slow drain through the production encrypted overlapped
+        // video writer. A full packet takes more than two seconds, but its TCP
+        // payload keeps advancing. The old whole-packet deadline fails here.
+        closesocket(writer.s);writer.s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+        closesocket(reader.s);reader.s=INVALID_SOCKET;
+        if(::connect(writer.s,reinterpret_cast<sockaddr*>(&address),sizeof(address))){result="Slow video connect failed";return false;}
+        reader.s=accept(listener.s,nullptr,nullptr);
+        if(reader.s==INVALID_SOCKET||setsockopt(reader.s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout))){
+            result="Slow video receiver setup failed";return false;
+        }
+        Transport endpoint;auto& owner=*endpoint.impl_;
+        auto channel=std::make_shared<Impl::Conn>(&owner,writer.s);writer.s=INVALID_SOCKET;
+        Key key{};if(!channel->tx.init(key)){result="Slow video cipher setup failed";return false;}
+        channel->channel=1;channel->ready=true;owner.running=true;
+        std::thread writing([&]{channel->write_video_loop();});
+        bool queued=channel->enqueue(payload,true);
+        Bytes wire(payload.size()+28);size_t offset=0;const auto video_began=Clock::now();
+        while(queued&&offset<wire.size()){
+            Sleep(10);const auto count=recv(reader.s,reinterpret_cast<char*>(wire.data()+offset),int((std::min)(wire.size()-offset,size_t(16*1024))),0);
+            if(count<=0)break;offset+=count;
+        }
+        const auto video_duration=Clock::now()-video_began;
+        const auto finish=Clock::now()+std::chrono::seconds(1);
+        while(offset==wire.size()&&!channel->video_send.snapshot(transport_us()).completed_packets&&Clock::now()<finish)Sleep(1);
+        const auto stats=channel->video_send.snapshot(transport_us());
+        channel->close();writing.join();owner.running=false;
+        if(!queued||offset!=wire.size()||video_duration<SessionStallTimeout||stats.completed_packets!=1||stats.failed_packets){
+            result="Slow progressing overlapped video was canceled or did not complete: bytes="+std::to_string(offset)+
+                " elapsed_ms="+std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(video_duration).count());return false;
+        }
+        Cipher decoder;Bytes head(wire.begin(),wire.begin()+12),encrypted(wire.begin()+12,wire.end()-16),plain;
+        std::array<uint8_t,16> tag{};std::copy(wire.end()-16,wire.end(),tag.begin());
+        if(!decoder.init(key)||!decoder.crypt(false,head,encrypted,plain,tag)||plain!=payload){
+            result="Slow overlapped video lost authenticated bytes";return false;
         }
     }
     {
