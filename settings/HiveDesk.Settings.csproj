@@ -15,8 +15,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>..\resources\HiveDesk.ico</ApplicationIcon>
-    <Version>0.1.0-alpha.32</Version>
-    <FileVersion>0.1.0.32</FileVersion>
+    <Version>0.1.0-alpha.33</Version>
+    <FileVersion>0.1.0.33</FileVersion>
     <Product>HiveDesk</Product>
     <Description>HiveDesk settings</Description>
     <AssemblyName>HiveDesk.Settings</AssemblyName>

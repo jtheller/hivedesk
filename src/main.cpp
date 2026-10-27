@@ -10,6 +10,7 @@
 #include "hivedesk/reconnect.h"
 #include "hivedesk/session_control.h"
 #include "hivedesk/update.h"
+#include "hivedesk/gpu_policy_restart.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <algorithm>
@@ -29,7 +30,10 @@ namespace {
 using MonitorSide=hive::Telemetry::Side;
 class App {
 public:
-    explicit App(hive::AppConfig config): config_(std::move(config)) {telemetry_.enabled(config_.desktop.debug_overlay);}
+    explicit App(hive::AppConfig config): config_(std::move(config)) {
+        telemetry_.enabled(config_.desktop.debug_overlay);
+        video_restart_pending_=hive::gpu_policy_restart::pending_request(video_restart_marker_);
+    }
     ~App() { shutdown(); }
     int run(HINSTANCE instance,bool open_settings=false) {
         hive::ShellCallbacks callbacks;
@@ -114,12 +118,26 @@ public:
             catch(const std::exception& e){try{hive::set_startup(config_.desktop.startup);}catch(...){}status(e.what());return false;}
             config_=std::move(next);telemetry_.enabled(desktop.debug_overlay);transport_.rename(hive::narrow(name));return true;
         };
+        callbacks.restart_video=[this] {
+            {
+                const std::lock_guard lock(queue_mutex_);
+                if(closing_||updating_||!hive::gpu_policy_restart::save_request(video_restart_marker_))return false;
+                queue_.push_back([this]{
+                    video_restart_pending_=true;
+                    status("GPU policy saved. Video processes will restart when all remote sessions and Settings are closed.");
+                });
+            }
+            wake_.notify_one();return true;
+        };
         std::string error;
         if(!shell_.create(instance,{config_.name,config_.group_key,config_.stream,config_.desktop},std::move(callbacks),error))throw std::runtime_error(error);
+        const bool initially_show_settings=(config_.first_run||open_settings)&&!video_restart_pending_;
         kick_worker_=std::thread([this]{kick_work();});
         worker_=std::thread([this]{work();});
         enqueue([this]{start_network();});
-        if(config_.first_run||open_settings)shell_.show_settings();
+        // A persisted request must finish its idle restart before reopening
+        // Settings; otherwise the Settings admission barrier would block it.
+        if(initially_show_settings)shell_.show_settings();
         const int result=shell_.run();
         shutdown();
         return result;
@@ -136,9 +154,9 @@ private:
     }
     void status(const std::string& text) { hive::log(text); if(!closing_)shell_.set_status(hive::widen(text)); }
     void connection_error(const std::string& text) { status(text); if(!closing_)shell_.show_error(hive::widen(text)); }
-    void enqueue(std::function<void()> job) {
-        {const std::lock_guard lock(queue_mutex_);if(closing_)return;queue_.push_back(std::move(job));}
-        wake_.notify_one();
+    bool enqueue(std::function<void()> job) {
+        {const std::lock_guard lock(queue_mutex_);if(closing_||updating_)return false;queue_.push_back(std::move(job));}
+        wake_.notify_one();return true;
     }
     void work() {
         for(;;) {
@@ -175,16 +193,34 @@ private:
     void update_tick() {
         if(updating_||closing_||GetTickCount64()-last_update_tick_<1000)return;
         last_update_tick_=GetTickCount64();
-        if(!hive::update::is_installed_agent()||!hive::update::pending())return;
+        const bool installed=hive::update::is_installed_agent();
+        const bool update_pending=installed&&hive::update::pending();
+        if(!update_pending&&!video_restart_pending_)return;
         {
             // Serialize the final idle decision with inbound Start and local
             // selection admission. The command worker also owns reconnect intent.
             const std::scoped_lock lock(host_mutex_,view_intent_mutex_);
             const std::lock_guard queue_lock(queue_mutex_);
             if(!hive::update::idle_for_update(bool(active_.load()),bool(hosting_.load()),reconnect_.current(generation_),!queue_.empty()))return;
+            if(!update_pending){
+                if(!shell_.prepare_video_restart())return;
+                try {
+                    HANDLE broker=installed?hive::gpu_policy_restart::open_broker_event():nullptr;
+                    struct Close {HANDLE value;~Close(){if(value)CloseHandle(value);}}close{broker};
+                    if(installed&&!broker)throw std::runtime_error("Video restart waiting for the desktop broker.");
+                    hive::gpu_policy_restart::Relaunch relaunch;
+                    if(broker&&!hive::gpu_policy_restart::signal_broker(broker))throw std::runtime_error("Could not request idle broker restart.");
+                    if(!hive::gpu_policy_restart::clear_request(video_restart_marker_))throw std::runtime_error("Could not complete pending video restart; HiveDesk is still running.");
+                    if(!relaunch.commit()){
+                        hive::gpu_policy_restart::save_request(video_restart_marker_);
+                        throw std::runtime_error("Could not launch replacement HiveDesk; current process is still running.");
+                    }
+                }catch(...){shell_.cancel_video_restart();throw;}
+            }else hive::gpu_policy_restart::clear_request(video_restart_marker_);
             updating_=true;
         }
-        hive::log("Automatic update: idle; stopping discovery and exiting for installation.");
+        hive::log(update_pending?"Automatic update: idle; stopping discovery and exiting for installation.":
+            "GPU policy: idle; restarting video processes and reopening Settings.");
         transport_.stop();shell_.quit();
     }
     void start_network() {
@@ -541,6 +577,8 @@ private:
     std::shared_ptr<hive::HostControl> kick_pending_; // Protected by kick_mutex_.
     std::atomic<bool> closing_=false,view_ready_=false,updating_=false;
     ULONGLONG last_update_tick_=0;
+    const std::filesystem::path video_restart_marker_=hive::data_directory()/L"video-restart.pending";
+    bool video_restart_pending_=false; // Command worker only.
     bool input_ready_=false; // Protected by host_mutex_; belongs only to hosting_.
     bool input_error_reported_=false;
     std::atomic<bool> clipboard_pending_=false;ULONGLONG last_clipboard_retry_=0;
@@ -562,12 +600,20 @@ private:
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false;
+    HANDLE previous=nullptr;bool valid_arguments=true;
+    if(arguments){for(int i=1;i<count;++i){
+        if(wcscmp(arguments[i],L"--background")==0)background=true;
+        else if(wcscmp(arguments[i],L"--quiet")==0)quiet=true;
+        else if(wcscmp(arguments[i],L"--host-check")==0)host_check=true;
+        else if(wcscmp(arguments[i],L"--restart-after")==0){if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
+    }LocalFree(arguments);}open_settings=!background&&!quiet;
+    if(!valid_arguments)return ERROR_INVALID_PARAMETER;
+    if(previous&&!hive::gpu_policy_restart::wait_for_previous(previous))return ERROR_INVALID_HANDLE;
     hive::update::StartupGuard update_startup;if(!update_startup.allowed())return 0;
     HANDLE singleton=CreateMutexW(nullptr,FALSE,L"Local\\HiveDesk.Desktop.Agent");
     if(!singleton)return 1;
     const DWORD singleton_status=GetLastError();
-    int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false;
-    if(arguments){for(int i=1;i<count;++i)if(wcscmp(arguments[i],L"--background")==0)background=true;else if(wcscmp(arguments[i],L"--quiet")==0)quiet=true;else if(wcscmp(arguments[i],L"--host-check")==0)host_check=true;LocalFree(arguments);}open_settings=!background&&!quiet;
     if(host_check){CloseHandle(singleton);return hive::host_check();}
     if(singleton_status==ERROR_ALREADY_EXISTS){if(open_settings){const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr);DWORD process=0;GetWindowThreadProcessId(owner,&process);AllowSetForegroundWindow(process);PostMessageW(owner,WM_APP+45,0,0);}CloseHandle(singleton);return 0;}
     update_startup.release();

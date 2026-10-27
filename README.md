@@ -97,6 +97,12 @@ impersonator. No universal shared password is embedded in the application.
   Relative mode keeps the local cursor hidden. Returning locally restores the arrow.
   Both endpoints use the current keyless protocol.
 - Settings contain computer name, login startup, tray visibility, the Show Hive shortcut and an optional Debug overlay.
+  Alpha.33 adds a diagnostic **Prefer maximum GPU performance** checkbox for this
+  computer's HiveDesk host/viewer NVIDIA application profiles. It reads the driver
+  state, preserves the previous policy and restores it when unchecked. A changed
+  policy queues a video-process restart once remote sessions are idle; Settings
+  closes and reopens after restart. Save other form changes before toggling it.
+  This preference does not guarantee a fixed GPU clock or P-state.
   The heading shows the installed version, including its alpha revision.
   The window has a fixed size (DPI-scaled), supports minimize and disables resize/maximize.
   They use real WinUI 3 controls, system light/dark theme and accent, with
@@ -111,7 +117,7 @@ impersonator. No universal shared password is embedded in the application.
   The shortcut does not run on the Windows lock/UAC secure desktop.
 - Streaming is automatic: the target is the lower of the two
   primary displays' refresh rates, including fractional rates. Physical display
-  modes are only read, never changed. Performance controls are removed from Settings.
+  modes are only read, never changed. FPS, bitrate and codec tuning remain automatic.
 - Alpha.23 uses automatic low-latency CBR for HEVC 4:4:4. Software chooses the
   target from resolution/refresh, then adjusts it using fresh receiver delivery,
   send pressure and observed frame size/QP. No bitrate control is exposed.

@@ -1,4 +1,4 @@
-#define AppVersion "0.1.0-alpha.32"
+#define AppVersion "0.1.0-alpha.33"
 #define RepoRoot SourcePath + ".."
 [Setup]
 AppId={{DFA5DE34-4EA9-4ECC-B99A-8F79EE9357C8}
@@ -6,7 +6,7 @@ AppName=HiveDesk
 AppVersion={#AppVersion}
 AppPublisher=HiveDesk
 AppComments=Personal LAN desktop switching
-VersionInfoVersion=0.1.0.32
+VersionInfoVersion=0.1.0.33
 VersionInfoDescription=HiveDesk Setup
 VersionInfoProductName=HiveDesk
 SetupIconFile={#RepoRoot}\resources\HiveDesk.ico
@@ -30,6 +30,7 @@ UninstallDisplayIcon={app}\HiveDesk.exe
 Source: "{#RepoRoot}\build\HiveDesk.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskService.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskUpdater.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\build\HiveDeskGpuPolicy.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskHost.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskCheck.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\settings\*"; DestDir: "{app}\settings"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -37,6 +38,7 @@ Source: "{#RepoRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\third_party\NOTICE.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#RepoRoot}\third_party\NVIDIA-HEADERS-LICENSES.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "{#RepoRoot}\third_party\nvapi\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "NVIDIA-NVAPI-LICENSE.txt"; Flags: ignoreversion
 Source: "{#RepoRoot}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

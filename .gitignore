@@ -5,6 +5,8 @@
 /settings/obj/
 /tests/settings_update/bin/
 /tests/settings_update/obj/
+/tests/settings_gpu_policy/bin/
+/tests/settings_gpu_policy/obj/
 /.local/
 *.user
 *.pdb

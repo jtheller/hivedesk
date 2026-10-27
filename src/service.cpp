@@ -7,6 +7,7 @@
 #include <tlhelp32.h>
 #include <vector>
 #include "hivedesk/update.h"
+#include "hivedesk/gpu_policy_restart.h"
 
 namespace {
 constexpr wchar_t name[]=L"HiveDeskAgent";
@@ -22,6 +23,7 @@ void report(DWORD state,DWORD error=NO_ERROR) {
 }
 HANDLE host_process=nullptr,updater_process=nullptr;DWORD host_session=0;
 void start_host() {
+    if(host_process&&WaitForSingleObject(host_process,0)==WAIT_OBJECT_0){CloseHandle(host_process);host_process=nullptr;}
     DWORD session=WTSGetActiveConsoleSessionId();if(session==0xffffffff)return;
     if(host_process&&host_session==session&&WaitForSingleObject(host_process,0)==WAIT_TIMEOUT)return;
     if(host_process){if(WaitForSingleObject(host_process,0)==WAIT_TIMEOUT)TerminateProcess(host_process,0);CloseHandle(host_process);host_process=nullptr;}
@@ -57,8 +59,23 @@ void WINAPI service_main(DWORD,LPWSTR*) {
     stop_event=CreateEventW(nullptr,TRUE,FALSE,nullptr);session_event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!stop_event||!session_event){report(SERVICE_STOPPED,GetLastError());return;}
     report(SERVICE_RUNNING);start_host();hive::update::launch_worker(updater_process);
-    HANDLE events[]={stop_event,session_event};
-    for(;;){const auto wait=WaitForMultipleObjects(2,events,FALSE,60000);if(wait==WAIT_OBJECT_0||wait==WAIT_FAILED)break;start_host();hive::update::launch_worker(updater_process);}
+    for(;;){
+        // A policy restart exits only the idle broker. Observe its process
+        // handle so the replacement does not wait for the 60-second watchdog.
+        HANDLE events[]={stop_event,session_event,host_process};
+        const auto wait=WaitForMultipleObjects(host_process?3:2,events,FALSE,60000);
+        if(wait==WAIT_OBJECT_0||wait==WAIT_FAILED)break;
+        if(host_process&&wait==WAIT_OBJECT_0+2){
+            DWORD exit_code=0;GetExitCodeProcess(host_process,&exit_code);
+            if(exit_code!=hive::gpu_policy_restart::BrokerRestartExitCode){
+                // Failed initialization must not create an unbounded spawn
+                // loop. Session/stop controls remain responsive during delay.
+                const auto retry=WaitForMultipleObjects(2,events,FALSE,1000);
+                if(retry==WAIT_OBJECT_0||retry==WAIT_FAILED)break;
+            }
+        }
+        start_host();hive::update::launch_worker(updater_process);
+    }
     // The updater must survive this service being stopped by its own installer.
     if(updater_process)CloseHandle(updater_process);
     CloseHandle(session_event);CloseHandle(stop_event);if(host_process)CloseHandle(host_process);report(SERVICE_STOPPED);

@@ -13,6 +13,14 @@ are loaded through the system NVIDIA CUDA driver API and JIT-compiled for the
 installed GPU. No CUDA runtime, NVRTC, Toolkit library or driver DLL is bundled.
 The build does not require a CUDA Toolkit installation.
 
+# NVIDIA driver profile declarations
+
+The optional application GPU power-policy helper uses NVIDIA's MIT-licensed
+NVAPI DRS declarations. The pinned source and declaration extraction are listed
+in third_party/nvapi/README.md; the distributed license is
+licenses/NVIDIA-NVAPI-LICENSE.txt. NVAPI is loaded from the installed NVIDIA
+driver; no NVIDIA DLL is bundled.
+
 # Settings runtime dependencies
 
 Settings uses Microsoft Windows App SDK WinUI, .NET 10 and Windows SDK

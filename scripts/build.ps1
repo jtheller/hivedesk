@@ -47,9 +47,11 @@ if (-not $SkipTests) {
     if ($LASTEXITCODE) { throw 'Verification failed.' }
     & $dotnet run --project (Join-Path $projectRoot 'tests\settings_update\HiveDesk.Settings.UpdateCheck.csproj') -c Release --artifacts-path (Join-Path $projectRoot 'build\settings-update-tests')
     if ($LASTEXITCODE) { throw 'Settings update bridge verification failed.' }
+    & $dotnet run --project (Join-Path $projectRoot 'tests\settings_gpu_policy\HiveDesk.Settings.GpuPolicyCheck.csproj') -c Release --artifacts-path (Join-Path $projectRoot 'build\settings-gpu-policy-tests')
+    if ($LASTEXITCODE) { throw 'Settings GPU policy bridge verification failed.' }
     foreach ($theme in @('light','dark')) {
         $report = Join-Path $projectRoot ('build\winui-' + $theme + '-test.txt')
-        $probe = Start-Process -FilePath (Join-Path $settingsOutput 'HiveDesk.Settings.exe') -ArgumentList @('--self-test',('--'+$theme),('--report="'+$report+'"')) -PassThru
+        $probe = Start-Process -FilePath (Join-Path $settingsOutput 'HiveDesk.Settings.exe') -ArgumentList @('--self-test',('--'+$theme),('--report="'+$report+'"')) -WindowStyle Hidden -PassThru
         if (-not $probe.WaitForExit(20000)) { throw 'WinUI settings verification timed out.' }
         if ($probe.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $report) -or -not ((Get-Content -LiteralPath $report -Raw).StartsWith('PASS'))) { throw ('WinUI '+$theme+' verification failed.') }
         Get-Content -LiteralPath $report

@@ -30,6 +30,7 @@ struct ShellCallbacks {
     std::function<void()> stream_tick;
     std::function<void()> debug_tick;
     std::function<bool(const std::wstring&,const DesktopPreferences&)> save_preferences;
+    std::function<bool()> restart_video;
 };
 class Shell {
 public:
@@ -57,6 +58,9 @@ public:
     void update_viewer_diagnostics(const std::string& peer,const ViewerDiagnostics&);
     void update_input_diagnostics(const std::string& peer,const InputDiagnostics&);
     bool debug_enabled() const;
+    // Atomically exclude a new Settings window from the final restart decision.
+    bool prepare_video_restart();
+    void cancel_video_restart();
 private: struct Impl; Impl* impl_ = nullptr;
 };
 // Primary screen injection. Track only injected held keys/buttons, release on explicit handoff.

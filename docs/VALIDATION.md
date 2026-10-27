@@ -1,5 +1,29 @@
 # Alpha validation
 
+## Alpha 33 GPU power-policy comparison
+
+- Added an immediate WinUI checkbox for local HiveDesk host/viewer NVIDIA
+  application profiles. The original explicit or inherited policy is journaled
+  before writes; external conflicts are refused. No global power settings,
+  display modes or encode/decode algorithms are changed.
+- Native CTest passed 27/27 checks. Transaction tests cover inherited/explicit
+  restoration, interrupted writes, post-commit journal errors, repeated actions,
+  unrelated settings and external profile/value changes. Restart tests use
+  isolated subprocesses to verify predecessor exit ordering, restricted handle
+  inheritance, idle admission, Settings races, event owner/ACL validation and
+  persistent pending requests.
+- A real NVIDIA DRS integration probe passed on the local RTX 5060 driver using
+  unique nonexistent temporary executable paths. It verified maximum-performance
+  readback, exact restoration of explicit/inherited preferences and removal of
+  all temporary profiles. Actual HiveDesk application profiles were unchanged.
+- Managed GPU/update bridge tests and real WinUI light/dark checks passed. The
+  UI ran on a private non-input desktop; tests cover checkbox placement, duplicate
+  submissions, actual-state reconciliation, unsaved preferences, restart retry
+  and recovery finalization. No desktop input was injected.
+- VI/DEVG clock behavior and stutter improvement remain to be compared on the two
+  physical machines. A preference is not a guarantee of fixed clocks/P-state;
+  early R500 driver compatibility was not re-tested on hardware in this round.
+
 ## Alpha 32 manual update check
 
 - Settings adds one action beside the version without changing its fixed size.

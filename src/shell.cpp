@@ -6,6 +6,7 @@
 #include "hivedesk/desktop_aux.h"
 #include "hivedesk/adaptive.h"
 #include "hivedesk/auto_rate.h"
+#include "hivedesk/gpu_policy_restart.h"
 #include "input_capture.h"
 #include <windowsx.h>
 #include <shellapi.h>
@@ -59,6 +60,7 @@ bool number(const std::wstring& s,uint32_t& out) {
 struct Shell::Impl {
     HINSTANCE instance{};HICON app_icon{},app_small_icon{}; HWND owner{},viewer{},panel{},settings{},prior_focus{};
     HANDLE settings_process{};HWND health_badge{};
+    gpu_policy_restart::SettingsAdmission settings_restart;
     StreamHealth stream_health{};SlowIndicator slow_indicator;ULONGLONG last_stream_tick=0;
     SourceDiagnostics source_diagnostics{};ViewerDiagnostics viewer_diagnostics{};ULONGLONG source_stats_time=0,health_time=0;
     struct PendingSource {std::string peer;SourceDiagnostics value;uint64_t generation;ULONGLONG received;};
@@ -318,7 +320,7 @@ struct Shell::Impl {
             else ++it;
         }
         if(settings_process){
-            if(WaitForSingleObject(settings_process,0)==WAIT_OBJECT_0){CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;if(recording_hotkey){recording_hotkey=false;hotkey_registered=RegisterHotKey(owner,hotkey_id,config.desktop.hotkey_modifiers|MOD_NOREPEAT,config.desktop.hotkey_key)!=FALSE;}}
+            if(WaitForSingleObject(settings_process,0)==WAIT_OBJECT_0){CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;settings_restart.close();if(recording_hotkey){recording_hotkey=false;hotkey_registered=RegisterHotKey(owner,hotkey_id,config.desktop.hotkey_modifiers|MOD_NOREPEAT,config.desktop.hotkey_key)!=FALSE;}}
             else if(!settings)settings=external_settings_window();
         }
         publish_input();
@@ -434,7 +436,7 @@ struct Shell::Impl {
         STARTUPINFOW startup{};startup.cb=sizeof(startup);PROCESS_INFORMATION process{};
         std::wstring command=L"\""+exe.wstring()+L"\"";
         if(!CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,exe.parent_path().c_str(),&startup,&process)){
-            MessageBoxW(owner,L"Could not open Settings. Reinstall HiveDesk to restore the settings files.",L"HiveDesk",MB_OK|MB_ICONERROR);return true;}
+            settings_restart.close();MessageBoxW(owner,L"Could not open Settings. Reinstall HiveDesk to restore the settings files.",L"HiveDesk",MB_OK|MB_ICONERROR);return true;}
         CloseHandle(process.hThread);settings_process=process.hProcess;return true;
     }
     LRESULT settings_command(WPARAM sender,const COPYDATASTRUCT* packet) {
@@ -443,6 +445,7 @@ struct Shell::Impl {
         const auto* chars=static_cast<const wchar_t*>(packet->lpData);const size_t count=packet->cbData/sizeof(wchar_t);if(chars[count-1]!=0)return 0;
         std::vector<std::wstring> fields;size_t start=0;for(size_t i=0;i<count;++i)if(!chars[i]){fields.emplace_back(chars+start,i-start);start=i+1;}
         if(fields.empty())return 0;
+        if(fields[0]==L"restart-video"&&fields.size()==1)return callbacks.restart_video&&callbacks.restart_video()?1:0;
         if(fields[0]==L"preferences"&&(fields.size()==6||fields.size()==7)){
             DesktopPreferences desktop=config.desktop;uint32_t startup=0,tray_icon=0,debug=0;
             if(!number(fields[2],startup)||startup>1||!number(fields[3],tray_icon)||tray_icon>1||!number(fields[4],desktop.hotkey_modifiers)||!number(fields[5],desktop.hotkey_key))return 0;
@@ -466,10 +469,12 @@ struct Shell::Impl {
         config.device_name=name;config.desktop=desktop;publish_input();tray();if(health_badge){ShowWindow(health_badge,SW_HIDE);InvalidateRect(health_badge,nullptr,FALSE);}InvalidateRect(panel,nullptr,FALSE);return true;
     }
     void settings_ui() {
+        if(!settings_restart.open())return;
         local(true);if(launch_settings())return;
         if(settings&&IsWindow(settings)){ShowWindow(settings,SW_SHOWNORMAL);SetForegroundWindow(settings);return;}
         int w=px(530),h=px(450);
         settings=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Settings",L"HiveDesk settings",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,(GetSystemMetrics(SM_CXSCREEN)-w)/2,(GetSystemMetrics(SM_CYSCREEN)-h)/2,w,h,nullptr,nullptr,instance,this);
+        if(!settings){settings_restart.close();return;}
         child(L"STATIC",L"Computer name",0,0,24,24,450,22);
         child(L"EDIT",config.device_name.c_str(),ES_AUTOHSCROLL|WS_TABSTOP,Name,24,52,450,30);SendDlgItemMessageW(settings,Name,EM_SETLIMITTEXT,128,0);
         HWND startup=child(L"BUTTON",L"Start when I sign in",BS_AUTOCHECKBOX|WS_TABSTOP,Startup,24,108,450,28);SendMessageW(startup,BM_SETCHECK,config.desktop.startup?BST_CHECKED:BST_UNCHECKED,0);
@@ -557,7 +562,7 @@ struct Shell::Impl {
         if(window==s->settings) {
             switch(message) {
             case WM_CLOSE:DestroyWindow(window);return 0;
-            case WM_DESTROY:s->settings=nullptr;s->publish_input();return 0;
+            case WM_DESTROY:s->settings=nullptr;s->settings_restart.close();s->publish_input();return 0;
             case WM_ERASEBKGND:{RECT r{};GetClientRect(window,&r);FillRect(reinterpret_cast<HDC>(w),&r,s->background_brush);return 1;}
             case WM_CTLCOLORSTATIC:case WM_CTLCOLORBTN:SetTextColor(reinterpret_cast<HDC>(w),Text);SetBkColor(reinterpret_cast<HDC>(w),Background);return reinterpret_cast<LRESULT>(s->background_brush);
             case WM_CTLCOLOREDIT:SetTextColor(reinterpret_cast<HDC>(w),Text);SetBkColor(reinterpret_cast<HDC>(w),Card);return reinterpret_cast<LRESULT>(s->edit_brush);
@@ -652,6 +657,8 @@ void Shell::show_error(const std::wstring& message){impl_->dispatch([s=impl_,mes
 void Shell::apply_clipboard(const std::wstring& value){impl_->apply_sync(value);}
 std::wstring Shell::cached_clipboard()const{std::lock_guard lock(impl_->cache_mutex);return impl_->clipboard_cache;}
 void Shell::show_settings(){impl_->dispatch([s=impl_]{s->settings_ui();});}
+bool Shell::prepare_video_restart(){return impl_->settings_restart.prepare();}
+void Shell::cancel_video_restart(){impl_->settings_restart.cancel();}
 void Shell::update_thumbnail(const std::string& peer,Thumbnail thumbnail) {
     if(thumbnail.bgra.size()!=size_t(SnapshotWidth)*SnapshotHeight*4)return;
     impl_->dispatch([s=impl_,peer,thumbnail=std::move(thumbnail)] {

@@ -6,6 +6,7 @@
 #include "hivedesk/config.h"
 #include "hivedesk/shell.h"
 #include "hivedesk/desktop_session.h"
+#include "hivedesk/gpu_policy_restart.h"
 #include <sddl.h>
 #include <wtsapi32.h>
 #include <atomic>
@@ -169,26 +170,43 @@ int wmain(int argc,wchar_t** argv){
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     DWORD session=0;ProcessIdToSessionId(GetCurrentProcessId(),&session);if(!session)return ERROR_CTX_WINSTATION_NOT_FOUND;
     try {
-        const auto sddl=L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GRGW;;;"+user_sid(session)+L")";
+        const auto console_sid=user_sid(session);
+        HANDLE restart=hive::gpu_policy_restart::create_broker_event(console_sid);
+        if(!restart)return ERROR_ACCESS_DENIED;
+        struct CloseEvent {HANDLE value;~CloseEvent(){CloseHandle(value);}}close_restart{restart};
+        const auto sddl=L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GRGW;;;"+console_sid+L")";
         PSECURITY_DESCRIPTOR descriptor=nullptr;if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,&descriptor,nullptr))return int(GetLastError());
         SECURITY_ATTRIBUTES security{sizeof(security),descriptor,FALSE};
+        bool restart_requested=false;
         while(!parent_gone){
+            // Consume requests strictly between sessions, never from the
+            // capture/input threads or while a controller owns this pipe.
+            if(WaitForSingleObject(restart,0)==WAIT_OBJECT_0){restart_requested=true;break;}
             HANDLE pipe=CreateNamedPipeW(broker::pipe_name(session).c_str(),PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE,PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,256*1024,64*1024,0,&security);
             if(pipe==INVALID_HANDLE_VALUE){LocalFree(descriptor);return int(GetLastError());}
             active_pipe=pipe;
-            OVERLAPPED connect{};connect.hEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);bool connected=false;
+            OVERLAPPED connect{};connect.hEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);bool connected=false,restarting=false;
             if(connect.hEvent&&!parent_gone){
                 connected=ConnectNamedPipe(pipe,&connect)!=FALSE;
                 if(!connected){const auto error=GetLastError();connected=error==ERROR_PIPE_CONNECTED;
-                    if(error==ERROR_IO_PENDING){while(WaitForSingleObject(connect.hEvent,100)==WAIT_TIMEOUT&&!parent_gone){}if(parent_gone)CancelIoEx(pipe,&connect);DWORD bytes=0;connected=GetOverlappedResult(pipe,&connect,&bytes,TRUE)!=FALSE;}
+                    if(error==ERROR_IO_PENDING){
+                        HANDLE events[]={restart,connect.hEvent};
+                        DWORD ready=WAIT_TIMEOUT;
+                        while(!parent_gone&&(ready=WaitForMultipleObjects(2,events,FALSE,100))==WAIT_TIMEOUT){}
+                        restarting=ready==WAIT_OBJECT_0;
+                        if(parent_gone||restarting||ready==WAIT_FAILED)CancelIoEx(pipe,&connect);
+                        DWORD bytes=0;connected=GetOverlappedResult(pipe,&connect,&bytes,TRUE)!=FALSE;
+                    }
                 }
             }
             if(connect.hEvent)CloseHandle(connect.hEvent);
-            if(!parent_gone&&connected&&trusted_client(pipe,session)){
+            if(!restarting)restarting=WaitForSingleObject(restart,0)==WAIT_OBJECT_0;
+            if(!parent_gone&&!restarting&&connected&&trusted_client(pipe,session)){
                 Session connection{pipe,session,&security};connection.run();
             }
             active_pipe=INVALID_HANDLE_VALUE;DisconnectNamedPipe(pipe);CloseHandle(pipe);
+            if(restarting){restart_requested=true;break;}
         }
-        LocalFree(descriptor);return 0;
+        LocalFree(descriptor);return restart_requested?int(hive::gpu_policy_restart::BrokerRestartExitCode):0;
     }catch(...){return 1;}
 }
