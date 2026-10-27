@@ -122,7 +122,7 @@ int probe(){
     };
     SendMessageW(owner,WM_HOTKEY,81,0);
     BOOL animations=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
-    if(animations)require(ULONG_PTR(GetPropW(panel,L"HiveDesk.CardAnimationMs"))==240&&ULONG_PTR(GetPropW(panel,L"HiveDesk.AnimatedCards"))==4,"Hotkey cards did not use the bounded stagger animation");
+    if(animations)require(ULONG_PTR(GetPropW(panel,L"HiveDesk.CardAnimationMs"))==300&&ULONG_PTR(GetPropW(panel,L"HiveDesk.AnimatedCards"))==4,"Hotkey cards did not use the bounded stagger animation");
     const auto before_drag=selected;
     drag(3,px(100),center(1)-tile/2); // C before A.
     require(selected==before_drag&&saved_order==std::vector<std::string>({"c","a","b"}),"Reordering selected a computer or saved the wrong order");
@@ -144,11 +144,21 @@ int probe(){
     const auto floating=shell.viewer_surface();waiting=find(L"HiveDesk.Waiting");
     require(floating&&floating->peer=="b"&&floating->window!=old->window&&shown(waiting),"Drag out failed to open the chosen machine on a fresh surface");
     const auto style=GetWindowLongW(floating->window,GWL_STYLE);
-    require((style&WS_THICKFRAME)&&(style&WS_CAPTION)&&!(style&WS_MAXIMIZEBOX),"Floating viewer is not a resizable framed window");
+    require((style&WS_THICKFRAME)&&(style&WS_CAPTION)&&(style&WS_MAXIMIZEBOX),"Floating viewer is not a resizable/maximizable framed window");
     RECT client{},outer{};GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
     require(std::abs(double(client.right)/client.bottom-1.6)<.01,"Window did not use the native snapshot aspect");
     RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
     require(client.right>=(work_area.right-work_area.left)*.6&&client.bottom>=(work_area.bottom-work_area.top)*.6,"Floating viewer opened as a tiny window");
+    SendMessageW(floating->window,WM_SYSCOMMAND,SC_MAXIMIZE,0);pump(20);
+    GetClientRect(floating->window,&client);
+    require(IsZoomed(floating->window)&&client.right>=(work_area.right-work_area.left)*.95&&client.bottom>=(work_area.bottom-work_area.top)*.90,"Maximize was blocked or constrained to the source aspect");
+    const auto maximized=client;shell.set_remote_size(1280,1024);pump(20);GetClientRect(floating->window,&client);
+    require(IsZoomed(floating->window)&&EqualRect(&client,&maximized),"Source resolution change resized a maximized window");
+    SendMessageW(floating->window,WM_SYSCOMMAND,SC_RESTORE,0);pump(20);GetClientRect(floating->window,&client);
+    require(!IsZoomed(floating->window)&&std::abs(double(client.right)/client.bottom-1.25)<.01,"Restore lost the updated source aspect ratio");
+    ShowWindow(floating->window,SW_MAXIMIZE);pump(20);
+    require(IsZoomed(floating->window),"Direct native maximize failed");
+    ShowWindow(floating->window,SW_RESTORE);pump(20);
     shell.set_remote_size(1080,1920);GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
     require(std::abs(double(client.right)/client.bottom-.5625)<.01,"First frame did not correct the provisional window aspect");
     const LONG fx=outer.right-outer.left-client.right,fy=outer.bottom-outer.top-client.bottom;

@@ -60,7 +60,7 @@ public:
         if(commit)check(device_->Commit());
     }
     // All layers share the same bitmap. Only DWM transforms/opacity animate;
-    // snapshot arrivals can update it without restarting the 240 ms timeline.
+    // snapshot arrivals can update it without restarting the 300 ms timeline.
     void reveal_cards(const std::vector<RECT>& cards,COLORREF background,int dragged=-1) {
         if((dragged<0&&!animations())||cards.empty())return;
         finish_cards(false);check(preview_->SetContent(nullptr));check(list_->SetContent(nullptr));
@@ -69,8 +69,8 @@ public:
             Ptr<IDCompositionVisual> v;check(device_->CreateVisual(&v));check(v->SetContent(surface_.Get()));
             const D2D_RECT_F clip{float(bounds.left),float(bounds.top),float(bounds.right),float(bounds.bottom)};check(v->SetClip(clip));
             if(index>=0&&dragged<0){
-                const float delay=cards.size()>1?.06f*index/float(cards.size()-1):0;
-                const float duration=.24f-delay;
+                const float delay=cards.size()>1?.12f*index/float(cards.size()-1):0;
+                const float duration=.30f-delay;
                 auto movement=tween(-float(width_),0,duration,delay);check(v->SetOffsetX(movement.Get()));
                 Ptr<IDCompositionEffectGroup> effect;check(device_->CreateEffectGroup(&effect));
                 auto opacity=tween(0,1,duration,delay);check(effect->SetOpacity(opacity.Get()));check(v->SetEffect(effect.Get()));
@@ -99,7 +99,7 @@ public:
         check(visual_->AddVisual(back.Get(),FALSE,nullptr));card_layers_.push_back(std::move(back));
         for(size_t i=0;i<cards.size();++i)layer(cards[i],int(i));
         cards_started_=dragged<0?GetTickCount64():0;check(device_->Commit());
-        SetPropW(window_,L"HiveDesk.CardAnimationMs",reinterpret_cast<HANDLE>(240));
+        SetPropW(window_,L"HiveDesk.CardAnimationMs",reinterpret_cast<HANDLE>(300));
         SetPropW(window_,L"HiveDesk.AnimatedCards",reinterpret_cast<HANDLE>(cards.size()));
     }
     void drag_slot(int from,int slot,int first,int stride) {
@@ -166,7 +166,7 @@ public:
         SetPropW(window,L"HiveDesk.Composited",reinterpret_cast<HANDLE>(1));
     }
     void present(const void* bgra,UINT width,UINT height,bool commit=true) {
-        if(!card_layers_.empty()&&(width!=width_||height!=height_||(cards_started_&&GetTickCount64()-cards_started_>=240)))finish_cards(false);
+        if(!card_layers_.empty()&&(width!=width_||height!=height_||(cards_started_&&GetTickCount64()-cards_started_>=300)))finish_cards(false);
         if(width!=width_||height!=height_) {
             surface_.Reset();check(device_->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED,&surface_));
             check(preview_->SetContent(surface_.Get()));check(list_->SetContent(surface_.Get()));width_=width;height_=height;

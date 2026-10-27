@@ -77,7 +77,7 @@ struct Shell::Impl {
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
     ShellConfig config; ShellCallbacks callbacks; std::vector<Peer> peers;
     std::string active_id,previous_id,pending_id;
-    bool windowed=false,sizing_viewer=false,dragging=false,viewer_layout_pending=false;HWND drag_focus{};
+    bool windowed=false,sizing_viewer=false,dragging=false,viewer_layout_pending=false,viewer_maximized=false,viewer_restore_pending=false;HWND drag_focus{};
     int pressed_card=-1,drop_slot=-1;POINT drag_origin{};std::string dragged_peer;ULONGLONG last_drag_scroll=0;
     HWND drag_ghost{};POINT drag_anchor{};std::vector<uint32_t> panel_pixels;int pixels_width=0,pixels_height=0;
     double window_ratio=16.0/9;
@@ -137,8 +137,12 @@ struct Shell::Impl {
         config.device_order=std::move(order);peers=std::move(next);InvalidateRect(panel,nullptr,FALSE);
     }
     void size_to_source(){
-        if(!windowed||!remote_width||!remote_height)return;
-        window_ratio=double(remote_width)/remote_height;RECT r{};GetWindowRect(viewer,&r);
+        if(!windowed)return;
+        if(remote_width&&remote_height)window_ratio=double(remote_width)/remote_height;
+        // Native maximize owns the work-area bounds. The renderer letterboxes
+        // the source; keep the new ratio for the later restored window.
+        if(IsZoomed(viewer)||IsIconic(viewer))return;
+        RECT r{};GetWindowRect(viewer,&r);
         RECT frame{};AdjustWindowRectExForDpi(&frame,DWORD(GetWindowLongW(viewer,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(viewer,GWL_EXSTYLE)),GetDpiForWindow(viewer));
         constrain_viewer(r,WMSZ_BOTTOMRIGHT,frame.right-frame.left,frame.bottom-frame.top,window_ratio,px(240));
         RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
@@ -152,6 +156,7 @@ struct Shell::Impl {
     void sync_viewer_ui(){
         viewer_layout_pending=false;
         if(!viewer)return;
+        if(viewer_restore_pending){viewer_restore_pending=false;size_to_source();}
         if(waiting_visible&&!IsIconic(viewer)){
             const auto r=viewer_client();SetWindowPos(waiting,HWND_TOP,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_SHOWWINDOW);
             const auto width=ULONG_PTR(r.right-r.left),height=ULONG_PTR(r.bottom-r.top);
@@ -231,7 +236,7 @@ struct Shell::Impl {
         // A reused flip-model HWND can expose its last DWM image before the
         // asynchronous waiting-cover commit. Never show that HWND again for a
         // new selection, even if its render worker is still finishing a frame.
-        const DWORD style=windowed?(WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX):WS_POPUP;
+        const DWORD style=windowed?WS_OVERLAPPEDWINDOW:WS_POPUP;
         RECT bounds{0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};
         if(windowed){
             RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
@@ -263,7 +268,7 @@ struct Shell::Impl {
         waiting=next_waiting;waiting_composition=std::move(next_composition);
         // Move the remaining owned popup before retiring its owner.
         SetWindowLongPtrW(health_badge,GWLP_HWNDPARENT,reinterpret_cast<LONG_PTR>(next));
-        viewer=next;
+        viewer=next;viewer_maximized=viewer_restore_pending=false;
         if(auto previous=viewer_surface.exchange(std::move(surface)))retired_viewers.push_back(std::move(previous));
         collect_viewers();return true;
     }
@@ -877,18 +882,21 @@ struct Shell::Impl {
                 RECT r{0,0,s->px(240),LONG(std::lround(s->px(240)/s->window_ratio))};AdjustWindowRectExForDpi(&r,DWORD(GetWindowLongW(window,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(window,GWL_EXSTYLE)),GetDpiForWindow(window));
                 auto* info=reinterpret_cast<MINMAXINFO*>(l);info->ptMinTrackSize={r.right-r.left,r.bottom-r.top};return 0;
             }break;
-            case WM_WINDOWPOSCHANGING:if(s->windowed&&!s->sizing_viewer&&!IsIconic(window)){
+            case WM_WINDOWPOSCHANGING:if(s->windowed&&!s->sizing_viewer&&!IsIconic(window)&&!IsZoomed(window)){
                 auto* position=reinterpret_cast<WINDOWPOS*>(l);
                 if(!(position->flags&SWP_NOSIZE)&&position->cx>=s->px(240)&&position->cy>GetSystemMetrics(SM_CYMINIMIZED)){
                     RECT frame{};AdjustWindowRectExForDpi(&frame,DWORD(GetWindowLongW(window,GWL_STYLE)),FALSE,DWORD(GetWindowLongW(window,GWL_EXSTYLE)),GetDpiForWindow(window));
                     position->cy=LONG(std::lround(std::max(1L,position->cx-(frame.right-frame.left))/s->window_ratio))+frame.bottom-frame.top;
                 }
             }break;
-            case WM_SYSCOMMAND:if(s->windowed&&(w&0xfff0)==SC_MAXIMIZE)return 0;break;
             // DXGI sends these synchronously while holding graphics locks.
             // Never enter DComp/BeginDraw from that nested message: the DXGI
             // worker cannot release its lock until this handler returns.
-            case WM_MOVE:case WM_SIZE:s->request_viewer_layout();break;
+            case WM_SIZE:
+                if(w==SIZE_MAXIMIZED)s->viewer_maximized=true;
+                else if(w==SIZE_RESTORED&&s->viewer_maximized){s->viewer_maximized=false;s->viewer_restore_pending=true;}
+                s->request_viewer_layout();break;
+            case WM_MOVE:s->request_viewer_layout();break;
             case WM_CLOSE:s->local(true);return 0;case WM_ERASEBKGND:return 1;case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(window,&ps);EndPaint(window,&ps);return 0;}}
         }
         return DefWindowProcW(window,message,w,l);

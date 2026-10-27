@@ -10,6 +10,10 @@ Existing alpha installations can upgrade through the same signed, idle-only OTA.
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+0.3.2 adds maximize/restore to floating viewers and increases hotkey card
+entrances to 300 ms with up to 120 ms of stagger. See the
+[current scope and outstanding work](docs/STATUS.zh-CN.md).
+
 Alpha.36 moves **Relative mouse** into Settings as a saved checkbox, adds
 **Restart HiveDesk** to the tray menu, and shows viewer/host versions at the top
 of the debug overlay. Different versions are amber; older peers that do not
@@ -84,7 +88,8 @@ impersonator. No universal shared password is embedded in the application.
   machine-name corner badges and live Windows accent color. DirectComposition
   starts on the first corner sample (16 ms timer, no hover dwell) and
   runs the 240 ms fade-in, 240 ms additional-list fade and 200 ms fade-out on
-  DWM's clock. Bounds stay fixed, with no slide or animated height wipe. Re-entry
+  DWM's clock. Background bounds stay fixed; hotkey cards additionally slide/fade
+  in with staggered starts, all finishing by 300 ms. Re-entry
   reverses from the current opacity. Escape and desktop selection dismiss immediately.
 - US keyboard scan codes, remote-side IME, Unicode text clipboard handoff.
 - Alpha.25 moves physical keyboard/mouse capture and dispatch onto dedicated
