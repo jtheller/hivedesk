@@ -43,10 +43,15 @@ int main(int argc,char** argv){
         hive::experience_enabled(true);hive::MediaViewer viewer;auto open=std::async(std::launch::async,[&]{std::string error;if(!viewer.open(video,error,{},true))throw std::runtime_error(error);});
         while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
         auto frame=hive::media_generated_test_frame();
+        frame.capture_time_us=frame.source_ready_us=0;
         viewer.submit(frame);for(unsigned i=0;i<100&&!viewer.has_frame();++i)pump(10);
         if(!viewer.has_frame()||viewer.has_presented_frame())throw std::runtime_error("Warm preparation touched presentation or failed to decode");
-        viewer.activate();
-        for(unsigned i=0;i<100&&!viewer.has_presented_frame();++i){frame.sequence=i;frame.capture_time_us=frame.source_ready_us=0;viewer.submit(frame);pump(25);}
+        // A real Hive selection promotes an image prepared while the panel
+        // was open. It can be older than the presentation freshness budget.
+        // The next live frame arrives only after the remote host is activated.
+        pump(300);
+        viewer.activate();pump(100);
+        for(unsigned i=0;i<100&&!viewer.has_presented_frame();++i){++frame.sequence;viewer.submit(frame);pump(25);}
         const bool presented=viewer.has_presented_frame();std::printf("Real covered viewer: decoded=%d presented=%d status=%s\n",viewer.has_frame(),presented,viewer.stats().c_str());
         auto close=std::async(std::launch::async,[&]{viewer.close();});while(close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);close.get();
         if(!presented)throw std::runtime_error("No real first Present under cover");

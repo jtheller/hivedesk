@@ -859,6 +859,7 @@ private:
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain> swap_;
     HANDLE display_ready_=nullptr;
+    bool display_credit_=false; // Presenter thread; consumed only by a successful Present.
     bool paced_present_=false;
     ComPtr<ID3D11RenderTargetView> target_;
     Picture synchronous_picture_;
@@ -953,34 +954,31 @@ public:
         // mapped and a retry never repeats conversion or queues another frame.
         pending_present_=result==DXGI_ERROR_WAS_STILL_DRAWING||result==DXGI_STATUS_OCCLUDED;
         if(!pending_present_)hr(result,"Present decoded desktop");
+        if(result==S_OK)display_credit_=false;
         if(result==S_OK&&pending_cursor_.valid&&cursor_presented_)cursor_presented_(pending_cursor_);
         return result==S_OK;
     }
     bool present_when_ready(const std::function<bool()>& eligible,uint32_t* present_cost=nullptr){
         if(present_cost)*present_cost=0;
         while(pending_present_){
-            if(eligible&&!eligible()){pending_present_=false;return false;}
-            // A fresh prepared picture is announced before this call. Hidden
-            // startup windows must not wait for visibility to unlock startup.
-            if(display_ready_&&IsWindowVisible(window_)){
-                const auto wait=WaitForSingleObject(display_ready_,2);
-                if(wait==WAIT_TIMEOUT)continue;
-                if(wait!=WAIT_OBJECT_0)throw std::runtime_error("Wait for viewer display availability");
-            }
+            if(!wait_available([&]{return eligible&&!eligible();})){pending_present_=false;return false;}
             uint32_t cost=0;const bool presented=retry_present(eligible,&cost);
             if(present_cost)*present_cost=cost;
             if(presented||!pending_present_)return presented;
-            // A signaled waitable object can race another compositor consumer.
-            // Retain this final prepared image even if no new packet arrives.
             Sleep(1);
         }
         return false;
     }
     bool wait_available(const std::function<bool()>& cancelled){
         while(!cancelled()){
-            if(!display_ready_||!IsWindowVisible(window_))return true;
+            // The latency wait consumes an admission signal, not a
+            // periodic vsync tick. Dropping a stale/invalidated ready picture
+            // or retrying a busy Present must retain the acquired admission.
+            // Otherwise no Present replenishes it and a live decoder can wait
+            // forever with zero displayed frames after warm activation.
+            if(display_credit_||!display_ready_||!IsWindowVisible(window_))return true;
             const auto wait=WaitForSingleObject(display_ready_,2);
-            if(wait==WAIT_OBJECT_0)return true;
+            if(wait==WAIT_OBJECT_0){display_credit_=true;return true;}
             if(wait!=WAIT_TIMEOUT)throw std::runtime_error("Wait for viewer display availability");
         }
         return false;
