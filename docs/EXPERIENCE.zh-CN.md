@@ -37,6 +37,6 @@ Hive 当前可见、在线且支持预热的所有远端立即进入预热集合
 
 双方需升级到 0.4.0 才能使用预热；旧版本保留正常冷连接。首次点击发生在预热完成前时，仍可能等待，不能承诺零延迟。真实画面预热也不是实时直播。
 
-安装后仅在没有活动连接时，可显式运行 `HiveDeskCheck.exe --warm` 检查 SYSTEM broker 的首帧、暂停、提升确认和新 IDR。它不安装输入钩子、不发送任何键鼠事件；不属于默认检查。
+安装后仅在没有活动连接时，可显式运行 `HiveDeskCheck.exe --warm` 通过本机正在运行的主程序，检查网络预热请求、SYSTEM broker 首帧、暂停续租和取消。broker 仍只信任主程序，诊断工具不能绕过身份校验直接接管它。它不安装输入钩子、不发送键鼠、剪贴板或普通 Start；不属于默认检查。`--warm-remote <IPv4>` 可对指定的新版本目标做同样的只读预热检查。已占用的目标可以拒绝，不会被探针接管。
 
 参考：[DXGI GetFrameStatistics](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-getframestatistics)。
