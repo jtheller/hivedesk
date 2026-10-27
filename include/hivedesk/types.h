@@ -28,6 +28,7 @@ constexpr uint32_t FeatureEncodeTiming = 8;
 constexpr uint32_t FeatureHostKick = 16;
 constexpr uint32_t FeatureAutoRate = 64;
 constexpr uint32_t FeatureDedicatedInput = 128;
+constexpr uint32_t FeatureFrameTiming = 256;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 struct Snapshot { uint64_t request = 0; std::vector<uint8_t> jpeg; };
@@ -109,7 +110,19 @@ struct EncodedFrame {
     uint64_t capture_time_us = 0;
     bool keyframe = false;
     uint64_t session = 0;
+    // Source steady clock, recorded once when encoded output is complete.
+    // Zero means the legacy capture-to-arrival freshness policy. This must not
+    // be restamped by the broker or transport after waiting in their queues.
+    uint64_t source_ready_us = 0;
 };
+// Allow bounded, intrinsic GPU work without confusing it with queued playback.
+// A one-second source job remains an absolute upper bound, never permission to
+// add a second of downstream buffering. Legacy packets have no such provenance.
+constexpr uint64_t MaxSourceWorkUs = 1000000;
+inline bool valid_frame_timing(const EncodedFrame& frame) {
+    return !frame.source_ready_us || (frame.capture_time_us && frame.source_ready_us >= frame.capture_time_us &&
+        frame.source_ready_us-frame.capture_time_us <= MaxSourceWorkUs);
+}
 enum class InputKind : uint32_t { Key = 1, Absolute = 2, Relative = 3, Button = 4, Wheel = 5, ReleaseAll = 6 };
 // Key: a=scan code, b=1 if keyup, c=1 if extended.
 // Absolute: a,b normalized 0..65535 across PRIMARY screen; Relative: signed dx,dy.

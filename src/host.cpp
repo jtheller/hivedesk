@@ -1,5 +1,6 @@
 #include "broker_wire.h"
 #include "broker_input.h"
+#include "broker_status.h"
 #include "rate_wire.h"
 #include "hivedesk/media.h"
 #include "hivedesk/config.h"
@@ -37,6 +38,7 @@ struct Session {
     std::atomic<bool> stopping{false},credit{true};bool active=false;StreamSettings settings{};std::wstring captured_desktop;
     HANDLE input_pipe=INVALID_HANDLE_VALUE;std::thread input_reader;
     std::atomic<bool> input_stopping{false};std::atomic<uint64_t> input_session{0};
+    broker::StatusMailbox status_mailbox;std::thread status_writer;
     Session(HANDLE connection,DWORD session,SECURITY_ATTRIBUTES* security):pipe(connection){
         input_pipe=CreateNamedPipeW(broker::input_pipe_name(session).c_str(),PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,4096,4096,0,security);
@@ -87,7 +89,13 @@ struct Session {
             DisconnectNamedPipe(input_pipe);
         });
     }
-    ~Session(){stop_input();}
+    ~Session(){stop_status();stop_input();media.stop();}
+    void stop_status(){
+        // Cancel before joining: the status writer can be waiting for either
+        // the pipe itself or a video write that owns the shared write mutex.
+        stopping=true;status_mailbox.stop();CancelIoEx(pipe,nullptr);
+        if(status_writer.joinable())status_writer.join();
+    }
     void stop_input(){
         input_session=0;input_stopping=true;
         if(input_pipe!=INVALID_HANDLE_VALUE)CancelIoEx(input_pipe,nullptr);
@@ -99,11 +107,17 @@ struct Session {
     bool start_media(std::string& error){
         captured_desktop=input_desktop_name();credit=true;
         return media.start(settings,[this](EncodedFrame frame){
-            broker::Bytes b;broker::u32(b,frame.width);broker::u32(b,frame.height);broker::u64(b,frame.sequence);broker::u64(b,frame.capture_time_us);broker::u64(b,frame.session);broker::u32(b,frame.keyframe?1:0);b.insert(b.end(),frame.data.begin(),frame.data.end());
+            broker::Bytes b;broker::u32(b,frame.width);broker::u32(b,frame.height);broker::u64(b,frame.sequence);broker::u64(b,frame.capture_time_us);broker::u64(b,frame.session);broker::u32(b,frame.keyframe?1:0);broker::u64(b,frame.source_ready_us);b.insert(b.end(),frame.data.begin(),frame.data.end());
             credit=false;if(!send(broker::Frame,b))throw std::runtime_error("Local viewer pipe closed");
-        },error,[this]{return !stopping&&credit.load();},[this](const StreamHealth& h){broker::Bytes b;broker::u64(b,h.session);broker::u32(b,h.target_millihz);broker::u32(b,h.rate_millihz);broker::u32(b,h.pressure);send(broker::Health,b);},[this](const SourceDiagnostics& d){broker::Bytes b;broker::u64(b,d.session);broker::u32(b,d.encoded_millihz);broker::u32(b,d.encode_us);broker::u32(b,d.capture_wait_us);broker::u32(b,d.send_wait_us_per_second);broker::u32(b,d.feedback_age_us);broker::u32(b,d.network_extra_us);broker::u32(b,d.color_us);broker::u32(b,d.nvenc_us);broker::u32(b,d.encode_age_us);if(d.rate_details)rate_wire::write_diagnostics(d,[&](uint32_t n){broker::u32(b,n);},[&](uint64_t n){broker::u64(b,n);});send(broker::Diagnostics,b);});
+        },error,[this]{return !stopping&&credit.load();},[this](const StreamHealth& h){broker::Bytes b;broker::u64(b,h.session);broker::u32(b,h.target_millihz);broker::u32(b,h.rate_millihz);broker::u32(b,h.pressure);status_mailbox.publish(broker::Health,std::move(b));},[this](const SourceDiagnostics& d){broker::Bytes b;broker::u64(b,d.session);broker::u32(b,d.encoded_millihz);broker::u32(b,d.encode_us);broker::u32(b,d.capture_wait_us);broker::u32(b,d.send_wait_us_per_second);broker::u32(b,d.feedback_age_us);broker::u32(b,d.network_extra_us);broker::u32(b,d.color_us);broker::u32(b,d.nvenc_us);broker::u32(b,d.encode_age_us);if(d.rate_details)rate_wire::write_diagnostics(d,[&](uint32_t n){broker::u32(b,n);},[&](uint64_t n){broker::u64(b,n);});status_mailbox.publish(broker::Diagnostics,std::move(b));});
     }
     void run(){
+        status_writer=std::thread([this]{
+            bool delivered=false;
+            try{delivered=status_mailbox.run([this](broker::Kind kind,const broker::Bytes& bytes){return send(kind,bytes);});}
+            catch(...){status_mailbox.stop();}
+            if(!delivered){stopping=true;CancelIoEx(pipe,nullptr);}
+        });
         std::thread monitor([this]{
             std::string previous_error;
             while(!stopping){
@@ -120,7 +134,7 @@ struct Session {
             }
         });
         broker::Kind kind;broker::Bytes b;
-        while(!parent_gone&&broker::receive(pipe,kind,b,&parent_gone)){
+        while(!parent_gone&&!stopping&&broker::receive(pipe,kind,b,&stopping)){
             broker::Reader r{b};bool valid=true;
             if(kind==broker::Start){
                 std::lock_guard lock(media_mutex);if(active)break;
@@ -141,7 +155,7 @@ struct Session {
             }else valid=false;
             if(!valid)break;
         }
-        stopping=true;stop_input();CancelIoEx(pipe,nullptr);monitor.join();media.stop();
+        stop_status();stop_input();monitor.join();media.stop();
     }
 };
 }

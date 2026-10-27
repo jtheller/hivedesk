@@ -32,13 +32,12 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
             // Protected by wait_mutex. Completing GPU work never waits for the
             // pipe/socket: delivery is a third, independently bounded stage.
             SourceFrameQueue completed;
-            uint32_t encode_us=0,color_us=0,nvenc_us=0,capacity_us=0;
-            uint64_t last_sample=0,previous_completion=0,encoded_frames=0,send_wait=0;
+            EncoderCapacity encoder_capacity;
+            uint64_t encoded_frames=0,send_wait=0;
             uint64_t encoded_bytes=0,window_qp_sum=0,window_qp_samples=0;
             uint64_t rate_frames=0,rate_bytes=0,rate_qp_sum=0,rate_qp_samples=0,sent_frames=0,total_send_wait=0;
             DiagnosticWindow<5> diagnostic_window;diagnostic_window.sample(now_us(),{});
             uint32_t live_encode=0,live_color=0,live_nvenc=0;uint64_t live_sample=0;
-            bool previous_keyframe=true;
             std::exception_ptr failure;
             auto fail=[&](std::exception_ptr problem){
                 {std::lock_guard lock(impl_->wait_mutex);if(!failure)failure=problem;impl_->stop=true;}
@@ -55,21 +54,9 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                             std::lock_guard lock(impl_->wait_mutex);
                             const auto now=result.completed_us;
                             live_encode=result.total_us;live_color=result.color_us;live_nvenc=result.nvenc_us;live_sample=now;
-                            if(!result.frame.keyframe||completed.needs_keyframe()){
-                                if(!last_sample||now-last_sample>1000000)encode_us=capacity_us=0;
-                                auto ema=[](uint32_t old,uint32_t value){return old?(old*7+value)/8:value;};
-                                color_us=encode_us?ema(color_us,result.color_us):result.color_us;
-                                nvenc_us=encode_us?ema(nvenc_us,result.nvenc_us):result.nvenc_us;
-                                encode_us=ema(encode_us,result.total_us);
-                                // Frame residence includes overlap with the previous
-                                // job. Capacity uses service spacing only while the
-                                // encoder was continuously supplied, never network
-                                // delivery or the intentional frame pacing interval.
-                                const bool busy=previous_completion&&!previous_keyframe&&result.submitted_us<=previous_completion;
-                                const auto service=busy?uint32_t(std::min<uint64_t>(1000000,now-previous_completion)):result.nvenc_us;
-                                capacity_us=ema(capacity_us,std::max(result.color_us,service));last_sample=now;
-                            }
-                            previous_completion=now;previous_keyframe=result.frame.keyframe;++encoded_frames;
+                            encoder_capacity.observe(now,result.submitted_us,result.color_us,result.frame.keyframe);
+                            encoder_capacity.end_slot_wait();
+                            ++encoded_frames;
                             encoded_bytes+=result.frame.data.size();
                             if(result.average_qp<=51){window_qp_sum+=result.average_qp;++window_qp_samples;}
                             // Intraframe recovery spikes are not a steady-state
@@ -120,7 +107,8 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                     AutoRateSample rate_sample;
                     {
                         std::lock_guard lock(impl_->wait_mutex);
-                        report=impl_->feedback;reported_at=impl_->feedback_time;report_sequence=impl_->feedback_sequence;sampled_at=last_sample;capacity=capacity_us;
+                        report=impl_->feedback;reported_at=impl_->feedback_time;report_sequence=impl_->feedback_sequence;
+                        sampled_at=encoder_capacity.sample_time(now);capacity=encoder_capacity.cost(now);
                         rate_sample.encoded_frames=rate_frames;rate_sample.encoded_bytes=rate_bytes;
                         rate_sample.qp_sum=rate_qp_sum;rate_sample.qp_samples=rate_qp_samples;
                         rate_sample.sent_frames=sent_frames;rate_sample.send_wait_us=total_send_wait;
@@ -129,7 +117,12 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         slots_ready=completed.can_reserve()&&(!recovery||completed.reserved()==0);
                     }
                     if(automatic){
-                        if(report.capture_time_us&&report.capture_time_us!=last_report_stamp&&reported_at>=report.capture_time_us+report.arrival_age_us){
+                        if(report.rate_details){
+                            // The receiver observes completed-frame transport.
+                            // With timed frames this excludes intrinsic encode
+                            // work; the old roundtrip estimate did not.
+                            network_extra=report.transit_extra_us;
+                        }else if(report.capture_time_us&&report.capture_time_us!=last_report_stamp&&reported_at>=report.capture_time_us+report.arrival_age_us){
                             const auto transit=reported_at-report.capture_time_us-report.arrival_age_us;
                             network_floor=std::min(network_floor,transit);network_extra=uint32_t(std::min<uint64_t>(UINT32_MAX,transit-network_floor));last_report_stamp=report.capture_time_us;
                         }
@@ -202,7 +195,14 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                     }
                     if(!slots_ready||!encoder.ready()){
                         std::unique_lock lock(impl_->wait_mutex);
+                        // Only GPU-slot starvation across a scheduled capture
+                        // deadline demonstrates insufficient encoder throughput.
+                        // Output/network credit and deliberate recovery drains
+                        // are different constraints, as is waiting before a tick.
+                        if(!encoder.ready()&&downstream_ready()&&!completed.needs_keyframe()&&!impl_->keyframe.load())
+                            encoder_capacity.begin_slot_wait(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(deadline.time_since_epoch()).count()));
                         impl_->changed.wait_for(lock,std::chrono::milliseconds(20),[&]{return impl_->stop||(downstream_ready()&&completed.can_reserve()&&encoder.ready()&&(!(completed.needs_keyframe()||impl_->keyframe.load())||completed.reserved()==0));});
+                        encoder_capacity.end_slot_wait();
                         continue;
                     }
                     const auto interval=automatic?std::chrono::nanoseconds(1000000000000ull/pacer.rate()):settings.fps?std::chrono::nanoseconds(1000000000ull/settings.fps):std::chrono::nanoseconds(0);

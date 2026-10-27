@@ -1,5 +1,47 @@
 # Alpha validation
 
+## Alpha 31 pipeline scheduling and freshness
+
+- Encoder capacity is observed only when GPU slots block the producer beyond
+  its scheduled capture deadline. Completed-frame latency remains diagnostic.
+  Deterministic regressions cover sparse-to-continuous 100 Hz work with 15 ms
+  residence, genuine saturation, network blocking, stale evidence and recovery.
+- Negotiated completion timestamps preserve the original capture timestamp and
+  exclude intrinsic source work from transport-backlog age. Tests cover both
+  mixed-version directions, the encrypted transport path, malformed timestamps,
+  stale TCP tails, source expiry and output-only refresh without losing valid
+  P-frame references.
+- Receiver submission, mapping/conversion and presentation have bounded
+  ownership. Two decoder jobs and three RGB surfaces are the upper bounds;
+  there is one replaceable ready picture. Display waits precede backbuffer
+  drawing, and a hidden first frame can announce readiness without waiting for
+  the shell to reveal the window. Physical scanout is not measured by Present.
+- Receiver rate feedback reports actual compressed admission backlog, including
+  a frame already removed from the queue while waiting for decoder capacity.
+  A 250 ms evidence latch survives queue flush/dequeue without being refreshed
+  by feedback polling. Decoder map/conversion p90 remains diagnostic only.
+- Status reports use a latest-only mailbox. Named-pipe tests deliberately block
+  status/video writes and check that publication stays bounded and shutdown
+  cancels I/O before joining.
+- Release native build and 25/25 CTest checks passed on 2026-10-26. The GPU async
+  check verifies parser/map overlap, two-job admission/cancellation, ordered
+  colors, format-change drain, three-texture rotation and resize, static retry,
+  error propagation and hidden live-view readiness/close. A separate concurrent
+  ownership check covers 50,000 publications and atomic presenter replacement.
+  Freshness regressions also prevent an older output from re-arming recovery
+  after a newer picture has become ready.
+- Additional actual GPU checks passed for native-async and forced-sync NVENC,
+  immutable source-completion timestamps, HEVC444 render readback and resizing.
+  The background host probes passed 12 credit-gated frames and 250 ms blocked
+  delivery recovery: obsolete outputs were discarded and the resumed IDR had
+  4.2 ms capture age. These are local integration observations, not LAN latency
+  or general-content frame-rate measurements. No visible stimuli or desktop
+  input were generated, and the installed app/service was not manually restarted.
+- The user confirmed alpha.30 remote lock-screen PIN entry/login and OTA work.
+  This release's two-PC cadence, long-running behavior and physical display
+  timing still require use on VI and DEVG; synthetic/headless checks cannot
+  establish those results. No physical display mode is changed.
+
 ## Alpha 27 public release delivery and idle OTA
 
 - Public repository and releases use `jtheller/hivedesk`. Local packaging now

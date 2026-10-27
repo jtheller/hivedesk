@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <array>
 
 // Load only the stable driver API from Windows' NVIDIA driver. In particular,
 // this file must never link cudart, NVRTC or import a versioned CUDA toolkit DLL.
@@ -14,6 +15,13 @@ struct HiveGpu {
     size_t allocated = 0;
     CUgraphicsResource graphics = nullptr;
     void* texture = nullptr;
+    struct RegisteredTexture {void* texture=nullptr;CUgraphicsResource graphics=nullptr;uint64_t used=0;};
+    // A live viewer rotates three RGB handoff surfaces. Keep their expensive
+    // D3D/CUDA registrations persistent, with a bounded LRU for size changes.
+    // Only the conversion worker accesses this cache, after its previous
+    // conversion has unmapped and completed on our stream.
+    std::array<RegisteredTexture,3> registrations{};
+    uint64_t registration_use=0;
     CUmodule module = nullptr;
     CUfunction encode = nullptr, decode = nullptr;
     CUstream stream = nullptr;
@@ -53,7 +61,7 @@ struct HiveGpu {
         // Failed conversions may still have queued work. Finish our own work
         // before unregistering textures or freeing scratch memory.
         if(stream)synchronize(stream);
-        if(graphics)unregister_texture(graphics);
+        for(auto& entry:registrations)if(entry.graphics)unregister_texture(entry.graphics);
         if(rgba)free(rgba);
         if(module)unload_module(module);
         if(stream)destroy_stream(stream);
@@ -82,11 +90,19 @@ struct HiveGpu {
         allocated=bytes;return true;
     }
     bool register_resource(void* value) noexcept {
-        if(value==texture&&graphics)return true;
-        if(graphics&&!check(unregister_texture(graphics),"Unregister D3D11 texture"))return false;
-        graphics=nullptr;texture=nullptr;
-        if(!check(register_texture(&graphics,value,0),"Register D3D11 texture with CUDA driver"))return false;
-        texture=value;return true;
+        for(auto& entry:registrations)if(entry.texture==value&&entry.graphics){
+            entry.used=++registration_use;texture=value;graphics=entry.graphics;return true;
+        }
+        auto* victim=&registrations[0];
+        for(auto& entry:registrations){if(!entry.graphics){victim=&entry;break;}if(entry.used<victim->used)victim=&entry;}
+        if(victim->graphics){
+            if(!check(unregister_texture(victim->graphics),"Unregister replaced D3D11 texture"))return false;
+            if(graphics==victim->graphics){graphics=nullptr;texture=nullptr;}
+            *victim={};
+        }
+        CUgraphicsResource registered=nullptr;
+        if(!check(register_texture(&registered,value,0),"Register D3D11 texture with CUDA driver"))return false;
+        *victim={value,registered,++registration_use};texture=value;graphics=registered;return true;
     }
     bool convert(bool encoding,uint64_t yuv,size_t pitch,uint32_t width,uint32_t height,CUstream work_stream) noexcept {
         if(pitch<width){std::snprintf(error,sizeof(error),"Invalid YUV444 pitch");return false;}

@@ -8,8 +8,8 @@
 
 namespace hive {
 
-// Decoder capacity belongs to current work, not an old expensive picture left
-// in a count-only ring while a desktop is idle.
+// Recent mapping/conversion latency for diagnostics. Blocking map residence is
+// not a throughput ceiling; expire old samples while the desktop is idle.
 class ViewerServiceWindow {
     struct Sample {uint64_t at;uint32_t cost;};
     std::deque<Sample> samples_;
@@ -91,6 +91,7 @@ public:
     static constexpr size_t MaxPending = 4;
     static constexpr uint64_t MaxAgeUs = 50000;
     static constexpr uint64_t RecoveryTimeoutUs = 2000000;
+    static constexpr uint64_t BacklogEvidenceUs = 250000;
     struct Pending {
         EncodedFrame frame;
         uint64_t arrival = 0, epoch = 0;
@@ -99,49 +100,88 @@ private:
     std::deque<Pending> frames_;
     ViewerTransitClock transit_;
     bool bound_ = false, waiting_keyframe_ = true, recover_ = false, sequenced_ = false;
-    uint64_t session_ = 0, epoch_ = 1, last_sequence_ = 0, last_capture_ = 0, discarded_ = 0;
+    bool ready_timing_ = false, presentation_refresh_ = false;
+    uint64_t session_ = 0, epoch_ = 1, last_sequence_ = 0, last_capture_ = 0, last_ready_ = 0, discarded_ = 0;
+    uint64_t output_ready_epoch_ = 0, output_ready_sequence_ = 0;
     bool recovery_pending_ = false;
     uint64_t recovery_since_ = 0;
     uint64_t sequence_gaps_=0,age_expired_=0,queue_overflows_=0,transit_extra_=0;
+    uint64_t backlog_at_=0,backlog_us_=0;
     enum class RecoveryReason {Gap,Age,Overflow};
+    uint64_t transport_origin(const EncodedFrame& frame) const {
+        return ready_timing_ ? frame.source_ready_us : frame.capture_time_us;
+    }
     uint64_t age(const Pending& pending, uint64_t now) const {
         const auto local = now >= pending.arrival ? now-pending.arrival : 0;
-        return std::max(local,transit_.extra_age(pending.frame.capture_time_us,now));
+        return std::max(local,transit_.extra_age(transport_origin(pending.frame),now));
     }
     void begin_recovery(uint64_t now) {
         if(!recovery_pending_){recovery_pending_=true;recovery_since_=now;}
     }
+    void remember_ready(const Pending& pending) {
+        if(output_ready_epoch_!=pending.epoch||pending.frame.sequence>output_ready_sequence_){
+            output_ready_epoch_=pending.epoch;output_ready_sequence_=pending.frame.sequence;
+        }
+    }
+    void remember_backlog(uint64_t now,uint64_t waiting) {
+        // Only compressed pictures actually waiting here are capacity evidence.
+        // Source work, network transit and already-decoded presentation age are
+        // different constraints and must not create a decoder throughput cap.
+        if(waiting>20000){
+            if(!backlog_at_||now<backlog_at_||now-backlog_at_>=BacklogEvidenceUs)backlog_us_=waiting;
+            else backlog_us_=std::max(backlog_us_,waiting);
+            backlog_at_=now;
+        }
+    }
+    void remember_backlog(uint64_t now){remember_backlog(now,queue_age(now));}
     void invalidate(uint64_t now,RecoveryReason reason) {
+        remember_backlog(now);
         if(reason==RecoveryReason::Gap)++sequence_gaps_;
         else if(reason==RecoveryReason::Age)++age_expired_;
         else ++queue_overflows_;
         discarded_ += frames_.size(); frames_.clear(); ++epoch_;
-        waiting_keyframe_ = true; recover_ = true;begin_recovery(now);
+        output_ready_epoch_=output_ready_sequence_=0;
+        waiting_keyframe_ = true; recover_ = true; presentation_refresh_ = false; begin_recovery(now);
     }
 public:
     void reset() {
-        frames_.clear(); transit_ = {}; bound_ = sequenced_ = false;
-        waiting_keyframe_ = true; recover_ = false;
+        frames_.clear(); transit_ = {}; bound_ = sequenced_ = ready_timing_ = false;
+        waiting_keyframe_ = true; recover_ = presentation_refresh_ = false;
         recovery_pending_ = false; recovery_since_ = 0;
-        session_ = last_sequence_ = last_capture_ = discarded_ = 0; ++epoch_;
+        session_ = last_sequence_ = last_capture_ = last_ready_ = discarded_ = 0; ++epoch_;
+        output_ready_epoch_=output_ready_sequence_=0;
         sequence_gaps_=age_expired_=queue_overflows_=transit_extra_=0;
+        backlog_at_=backlog_us_=0;
     }
     bool accepts_session(uint64_t session) const { return !bound_ || session == session_; }
     bool push(EncodedFrame frame, uint64_t now) {
         if (!accepts_session(frame.session)) { ++discarded_; return false; }
-        if (!bound_) { bound_ = true; session_ = frame.session; }
+        if (!bound_) { bound_ = true; session_ = frame.session; ready_timing_ = frame.source_ready_us != 0; }
         // TCP preserves order, but reject duplicates/old packets defensively.
         // A missing encoded reference requires IDR; merely skipping presentation
         // does not, because every reference was still decoded in order.
         if (sequenced_ && frame.sequence <= last_sequence_) { ++discarded_; return false; }
+        // A stream chooses its clock basis once. Do not let missing/changing
+        // provenance (or a malformed future completion) re-anchor a stale tail.
+        // Legacy sessions keep the original capture-based policy throughout.
+        if (!valid_frame_timing(frame) || (ready_timing_ && !frame.source_ready_us) ||
+            (last_ready_ && frame.source_ready_us && frame.source_ready_us < last_ready_)) {
+            invalidate(now,RecoveryReason::Age); ++discarded_; return false;
+        }
         if (sequenced_ && frame.sequence-last_sequence_ != 1 && !frame.keyframe) invalidate(now,RecoveryReason::Gap);
         if (last_capture_ && frame.capture_time_us && frame.capture_time_us < last_capture_) {
             invalidate(now,RecoveryReason::Gap); ++discarded_; return false;
         }
         sequenced_ = true; last_sequence_ = frame.sequence;
         if (frame.capture_time_us) last_capture_ = frame.capture_time_us;
-        transit_.observe(frame.capture_time_us,now);
-        transit_extra_=transit_.extra_age(frame.capture_time_us,now);
+        if (frame.source_ready_us) last_ready_ = frame.source_ready_us;
+        // Encoder residence is measured on the source and bounded separately.
+        // Only completed-output transport + local residence consume the 50 ms
+        // queue budget. A slow valid encode therefore cannot masquerade as an
+        // old TCP burst; no timestamps or transit floor are reset on recovery.
+        const auto origin=transport_origin(frame);
+        transit_.observe(origin,now);
+        transit_extra_=transit_.extra_age(origin,now);
         Pending pending{std::move(frame),now,epoch_};
         if (age(pending,now) > MaxAgeUs) {
             invalidate(now,RecoveryReason::Age); ++discarded_; return false;
@@ -151,20 +191,46 @@ public:
         if (pending.frame.keyframe) {
             // An IDR supersedes any queued reference chain. Invalidate a decode
             // already in flight too, so its late output cannot flash afterward.
-            discarded_ += frames_.size(); frames_.clear(); ++epoch_;
-            waiting_keyframe_ = recover_ = false;
+            remember_backlog(now);discarded_ += frames_.size(); frames_.clear(); ++epoch_;
+            output_ready_epoch_=output_ready_sequence_=0;
+            waiting_keyframe_ = recover_ = presentation_refresh_ = false;
         }
         if (waiting_keyframe_) { recover_ = true; begin_recovery(now); ++discarded_; return false; }
         pending.epoch = epoch_; frames_.push_back(std::move(pending)); return true;
     }
     std::optional<Pending> pop(uint64_t now) {
         if (frames_.empty()) return {};
+        remember_backlog(now);
         if (age(frames_.front(),now) > MaxAgeUs) { invalidate(now,RecoveryReason::Age); return {}; }
         auto pending = std::move(frames_.front()); frames_.pop_front(); return pending;
     }
     bool fresh(const Pending& pending, uint64_t now) {
         if (pending.epoch != epoch_ || waiting_keyframe_) return false;
         if (age(pending,now) > MaxAgeUs) { invalidate(now,RecoveryReason::Age); return false; }
+        return true;
+    }
+    bool admit(const Pending& pending,uint64_t now) {
+        if(pending.epoch!=epoch_||waiting_keyframe_)return false;
+        // A popped compressed picture can still wait for the decoder's two
+        // credits. Count that real local backlog before strict admission, even
+        // if the container is now empty; decoded output never calls this path.
+        remember_backlog(now,now>=pending.arrival?now-pending.arrival:0);
+        return fresh(pending,now);
+    }
+    bool output_fresh(const Pending& pending, uint64_t now) {
+        if (pending.epoch != epoch_ || waiting_keyframe_) return false;
+        if (age(pending,now) > MaxAgeUs) {
+            // Mapping and presentation run independently. A late old Present
+            // retry cannot re-arm recovery after the mapper has already made a
+            // newer picture ready. That newer output still enforces its own age.
+            if(output_ready_epoch_==pending.epoch&&output_ready_sequence_>pending.frame.sequence)return false;
+            // This picture already reached the decoder, so its references are
+            // intact even if conversion/presentation finished too late. Keep
+            // subsequent compressed pictures and their epoch. A static desktop
+            // still needs a fresh IDR request, with the same recovery deadline.
+            if(!presentation_refresh_)++age_expired_;
+            presentation_refresh_=recover_=true;begin_recovery(now);return false;
+        }
         return true;
     }
     bool presentable(const Pending& pending, uint64_t now) {
@@ -175,7 +241,15 @@ public:
     }
     bool mark_ready(const Pending& pending,uint64_t now) {
         if(!fresh(pending,now))return false;
-        recovery_pending_=false;recovery_since_=0;return true;
+        remember_ready(pending);
+        presentation_refresh_=recover_=recovery_pending_=false;recovery_since_=0;return true;
+    }
+    bool mark_output_ready(const Pending& pending,uint64_t now) {
+        if(!output_fresh(pending,now))return false;
+        remember_ready(pending);
+        // The next fresh P picture is sufficient: no compressed reference was
+        // lost merely because a previous decoded picture missed presentation.
+        presentation_refresh_=recover_=recovery_pending_=false;recovery_since_=0;return true;
     }
     bool recovery_pending() const{return recovery_pending_;}
     bool recovery_expired(uint64_t now) const {
@@ -191,6 +265,13 @@ public:
     uint32_t transit_extra_us() const{return uint32_t(std::min<uint64_t>(UINT32_MAX,transit_extra_));}
     uint64_t queue_age(uint64_t now) const {
         return frames_.empty() || now < frames_.front().arrival ? 0 : now-frames_.front().arrival;
+    }
+    uint64_t feedback_queue_age(uint64_t now) const {
+        // Feedback runs less often than dequeue/recovery. Preserve a real
+        // backlog briefly across those operations, without refreshing it when
+        // polled or keeping an idle stream constrained by a stale observation.
+        const auto recent=backlog_at_&&now>=backlog_at_&&now-backlog_at_<BacklogEvidenceUs?backlog_us_:0;
+        return std::max(queue_age(now),recent);
     }
 };
 }

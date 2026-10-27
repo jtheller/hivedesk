@@ -42,5 +42,19 @@ int main(){try{
     require(reserved.reserve_completion(),"Failed submit could not reserve output");reserved.cancel_completion();
     require(!reserved.reserved()&&reserved.reserve_completion()&&reserved.push_reserved(frame(5,2150000,true),2150010),"Canceled submit prevented fresh IDR recovery");
     latest=reserved.take(2150020);require(latest&&latest->sequence==5&&reserved.empty()&&!reserved.needs_keyframe(),"Reserved recovery replayed an obsolete tail");
+    hive::SourceFrameQueue timed;
+    auto complete=frame(0,3000000,true);complete.source_ready_us=3140000;
+    // The immutable completion timestamp, not a caller-supplied processing
+    // duration, establishes how much of this frame's age was actual work.
+    require(timed.push(complete,3140001),"Source completion provenance lost intrinsic slow work allowance");
+    latest=timed.take(3140002);require(latest&&latest->source_ready_us==3140000,"Source delivery restamped completion provenance");
+    complete.sequence=1;complete.capture_time_us=3200000;complete.source_ready_us=3340000;
+    require(!timed.push(complete,3360001,1000000)&&timed.needs_keyframe(),"Caller work estimate hid a completed frame's downstream backlog");
+    complete.sequence=2;complete.capture_time_us=3400000;complete.source_ready_us=3400000+hive::MaxSourceWorkUs+1;
+    require(!timed.push(complete,complete.source_ready_us),"Unbounded intrinsic source work entered delivery queue");
+    complete.sequence=3;complete.source_ready_us=complete.capture_time_us-1;
+    require(!timed.push(complete,3400001),"Source completion preceding capture accepted");
+    complete.sequence=4;complete.source_ready_us=3401000;
+    require(!timed.push(complete,3400999),"Future completion entered local delivery queue");
     std::puts("PASS source output queue: two-frame bound, reserved GPU completions including transit, ordered P bursts without overflow/IDR, canceled submit, age expiry and fresh-IDR recovery without catch-up playback.");return 0;
 }catch(const std::exception& e){std::printf("FAIL source output queue: %s\n",e.what());return 1;}}

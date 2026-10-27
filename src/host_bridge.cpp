@@ -51,8 +51,8 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
                 else if(kind==broker::Diagnostics){SourceDiagnostics d;d.session=r.u64();d.encoded_millihz=r.u32();d.encode_us=r.u32();d.capture_wait_us=r.u32();d.send_wait_us_per_second=r.u32();d.feedback_age_us=r.u32();d.network_extra_us=r.u32();d.color_us=r.u32();d.nvenc_us=r.u32();d.encode_age_us=r.u32();d.encode_details=true;if(!r.end()&&!rate_wire::read_diagnostics(d,[&]{return r.u32();},[&]{return r.u64();}))break;if(!r.end()||!valid_diagnostics(d))break;if(diagnostics)diagnostics(d);}
                 else if(kind==broker::Notice){if(bytes.size()>1024)break;log("Desktop service: "+std::string(bytes.begin(),bytes.end()));}
                 else if(kind==broker::Frame){
-                    EncodedFrame frame;frame.width=r.u32();frame.height=r.u32();frame.sequence=r.u64();frame.capture_time_us=r.u64();frame.session=r.u64();const auto key=r.u32();frame.keyframe=key!=0;
-                    if(!r.good||!frame.width||!frame.height||frame.width>8192||frame.height>8192||key>1||r.at==bytes.size())break;
+                    EncodedFrame frame;frame.width=r.u32();frame.height=r.u32();frame.sequence=r.u64();frame.capture_time_us=r.u64();frame.session=r.u64();const auto key=r.u32();frame.keyframe=key!=0;frame.source_ready_us=r.u64();
+                    if(!r.good||!frame.width||!frame.height||frame.width>8192||frame.height>8192||key>1||r.at==bytes.size()||!valid_frame_timing(frame))break;
                     frame.data.assign(bytes.begin()+r.at,bytes.end());output(std::move(frame));
                     if(!impl_->downstream.wait(impl_->stopped,ready))break;
                     if(!impl_->send(broker::Ready))break;

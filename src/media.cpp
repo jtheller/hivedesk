@@ -10,6 +10,7 @@
 #include "capture_updates.h"
 #include "capture_sequence.h"
 #include "viewer_queue.h"
+#include "latest_picture.h"
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -406,6 +407,7 @@ public:
             slot.locked = false; slot.submitted = false;
             nv(api_.nvEncUnmapInputResource(session_, slot.mapped), "NVENC unmap input"); slot.mapped = nullptr;
             completion.completed_us = now_us();
+            completion.frame.source_ready_us = completion.completed_us;
             completion.submitted_us = slot.submitted_us;
             completion.color_us = elapsed(slot.converted_us, slot.started_us);
             completion.nvenc_us = elapsed(completion.completed_us, slot.converted_us);
@@ -525,6 +527,16 @@ private:
 };
 
 class Decoder {
+public:
+    using Output=std::function<void(uint64_t,size_t,uint32_t,uint32_t,HiveGpu*)>;
+    struct AsyncOutput {
+        Output prepare;
+        // Runs after Unmap to publish independent RGB pixels. The display
+        // worker owns availability waits outside decode service timing.
+        std::function<void(uint32_t,uint32_t)> complete;
+        std::function<bool()> admit;
+    };
+private:
     Cuda cuda_;
     std::unique_ptr<HiveGpu, decltype(&hive_gpu_destroy)> gpu_{hive_gpu_create(), hive_gpu_destroy};
     Library library_{L"nvcuvid.dll"};
@@ -543,6 +555,69 @@ class Decoder {
     uint32_t map_us_ = 0;
     std::function<void(uint64_t, size_t, uint32_t, uint32_t, HiveGpu*)> output_;
     std::string callback_error_;
+    struct Job {CUVIDPARSERDISPINFO picture{};uint32_t width=0,height=0;AsyncOutput output;};
+    bool asynchronous_=false;
+    std::function<bool()> cancelled_;
+    std::mutex jobs_mutex_;
+    std::condition_variable jobs_changed_;
+    std::deque<Job> jobs_;
+    std::vector<int> held_indices_;
+    std::thread mapping_worker_;
+    bool stopping_=false;
+    unsigned outstanding_=0;
+    std::exception_ptr failure_;
+    // Parser callbacks are synchronous and owned by the one submission thread.
+    AsyncOutput* submitting_=nullptr;
+    bool submitted_=false;
+    CUvideotimestamp submitting_timestamp_=0;
+    bool cancelled() const{return cancelled_&&cancelled_();}
+    template<class Ready> bool wait_jobs(std::unique_lock<std::mutex>& lock,Ready ready){
+        while(!stopping_&&!cancelled()&&!ready())jobs_changed_.wait_for(lock,std::chrono::milliseconds(2));
+        if(failure_)std::rethrow_exception(failure_);
+        return !stopping_&&!cancelled();
+    }
+    void release_index(int index){
+        {std::lock_guard lock(jobs_mutex_);const auto found=std::find(held_indices_.begin(),held_indices_.end(),index);if(found!=held_indices_.end())held_indices_.erase(found);}
+        jobs_changed_.notify_all();
+    }
+    void map_picture(const CUVIDPARSERDISPINFO& picture,uint32_t width,uint32_t height,const Output& output,uint32_t& map_cost,uint32_t& service_cost){
+        CUVIDPROCPARAMS process{};process.progressive_frame=picture.progressive_frame;
+        process.top_field_first=picture.top_field_first;process.unpaired_field=1;
+        unsigned long long device=0;unsigned int pitch=0;const auto began=now_us();
+        cu(map_(decoder_,picture.picture_index,&device,&pitch,&process),"Map decoded YUV444");
+        map_cost=uint32_t(std::min<uint64_t>(10000000,now_us()-began));
+        try{if(output)output(device,pitch,width,height,gpu_.get());}
+        catch(...){unmap_(decoder_,device);throw;}
+        cu(unmap_(decoder_,device),"Unmap decoded YUV444");
+        service_cost=uint32_t(std::min<uint64_t>(1000000,now_us()-began));
+    }
+    void mapping_loop() noexcept{
+        try{
+            cuda_.current();
+            for(;;){
+                Job job;
+                {
+                    std::unique_lock lock(jobs_mutex_);
+                    if(!wait_jobs(lock,[&]{return !jobs_.empty();}))break;
+                    job=std::move(jobs_.front());jobs_.pop_front();
+                }
+                uint32_t map_cost=0,service_cost=0;
+                map_picture(job.picture,job.width,job.height,job.output.prepare,map_cost,service_cost);
+                // Reuse of this decode index is safe after Unmap, even if the
+                // prepared RGB texture is still waiting for a display slot.
+                release_index(job.picture.picture_index);
+                if(job.output.complete)job.output.complete(map_cost,service_cost);
+                {std::lock_guard lock(jobs_mutex_);--outstanding_;}
+                jobs_changed_.notify_all();
+            }
+        }catch(...){std::lock_guard lock(jobs_mutex_);failure_=std::current_exception();stopping_=true;}
+        {
+            std::lock_guard lock(jobs_mutex_);stopping_=true;
+            jobs_.clear();held_indices_.clear();outstanding_=0;
+        }
+        jobs_changed_.notify_all();
+        cuda_.set_current(nullptr);
+    }
     template<class F> int guarded(F&& callback) noexcept {
         try { return callback(); } catch (const std::exception& error) { callback_error_ = error.what(); return 0; }
         catch (...) { callback_error_ = "Unknown NVDEC callback error"; return 0; }
@@ -563,9 +638,16 @@ class Decoder {
             throw std::runtime_error("Invalid decoded picture dimensions.");
         if (decoder_ && width_ == width && height_ == height && coded_width_ == format.coded_width && coded_height_ == format.coded_height)
             return static_cast<int>(surfaces_);
+        if(asynchronous_){
+            std::unique_lock lock(jobs_mutex_);
+            // One reservation belongs to the packet invoking this callback.
+            // Finish older map/render jobs before replacing their decoder.
+            if(!wait_jobs(lock,[&]{return outstanding_==1;}))throw std::runtime_error("NVDEC sequence change cancelled");
+        }
         if (decoder_) { cu(destroy_decoder_(decoder_), "Destroy previous NVDEC decoder"); decoder_ = nullptr; }
         width_ = width; height_ = height; coded_width_ = format.coded_width; coded_height_ = format.coded_height;
         surfaces_ = std::max(2u, static_cast<unsigned int>(format.min_num_decode_surfaces));
+        if(asynchronous_)surfaces_+=2; // Held outputs must not consume the parser's minimum DPB.
         CUVIDDECODECREATEINFO create{};
         create.CodecType = cudaVideoCodec_HEVC; create.ChromaFormat = cudaVideoChromaFormat_444;
         create.OutputFormat = cudaVideoSurfaceFormat_YUV444; create.bitDepthMinus8 = 0;
@@ -582,28 +664,39 @@ class Decoder {
     }
     static int CUDAAPI decode(void* self, CUVIDPICPARAMS* picture) {
         auto& decoder = *static_cast<Decoder*>(self);
-        return decoder.guarded([&] { cu(decoder.decode_(decoder.decoder_, picture), "NVDEC decode picture"); return 1; });
+        return decoder.guarded([&] {
+            if(decoder.asynchronous_){
+                std::unique_lock lock(decoder.jobs_mutex_);
+                if(!decoder.wait_jobs(lock,[&]{return std::find(decoder.held_indices_.begin(),decoder.held_indices_.end(),picture->CurrPicIdx)==decoder.held_indices_.end();}))
+                    throw std::runtime_error("NVDEC picture reuse cancelled");
+            }
+            cu(decoder.decode_(decoder.decoder_, picture), "NVDEC decode picture"); return 1;
+        });
     }
     static int CUDAAPI display(void* self, CUVIDPARSERDISPINFO* picture) {
         auto& decoder = *static_cast<Decoder*>(self);
         return decoder.guarded([&] {
             if (!picture) return 1;
-            CUVIDPROCPARAMS process{}; process.progressive_frame = picture->progressive_frame;
-            process.top_field_first = picture->top_field_first; process.unpaired_field = 1;
-            unsigned long long device = 0; unsigned int pitch = 0;
-            const auto map_begin=now_us();
-            cu(decoder.map_(decoder.decoder_, picture->picture_index, &device, &pitch, &process), "Map decoded YUV444");
-            decoder.map_us_=uint32_t(std::min<uint64_t>(10000000,now_us()-map_begin));
-            try {
-                decoder.output_(device, pitch, decoder.width_, decoder.height_, decoder.gpu_.get());
-            } catch (...) { decoder.unmap_(decoder.decoder_, device); throw; }
-            cu(decoder.unmap_(decoder.decoder_, device), "Unmap decoded YUV444");
+            if(decoder.asynchronous_){
+                if(!decoder.submitting_||decoder.submitted_||picture->timestamp!=decoder.submitting_timestamp_)
+                    throw std::runtime_error("Unexpected reordered NVDEC output in low-latency stream");
+                {
+                    std::lock_guard lock(decoder.jobs_mutex_);
+                    if(decoder.stopping_)throw std::runtime_error("NVDEC output cancelled");
+                    decoder.held_indices_.push_back(picture->picture_index);
+                    decoder.jobs_.push_back(Job{*picture,decoder.width_,decoder.height_,std::move(*decoder.submitting_)});
+                    decoder.submitted_=true;
+                }
+                decoder.jobs_changed_.notify_all();return 1;
+            }
+            uint32_t service_cost=0;
+            decoder.map_picture(*picture,decoder.width_,decoder.height_,decoder.output_,decoder.map_us_,service_cost);
             return 1;
         });
     }
 public:
-    explicit Decoder(std::function<void(uint64_t, size_t, uint32_t, uint32_t, HiveGpu*)> output, IDXGIAdapter* adapter = nullptr)
-        : cuda_(adapter), output_(std::move(output)) {
+    explicit Decoder(Output output, IDXGIAdapter* adapter = nullptr,bool asynchronous=false,std::function<bool()> cancelled={})
+        : cuda_(adapter), output_(std::move(output)),asynchronous_(asynchronous),cancelled_(std::move(cancelled)) {
         CUVIDDECODECAPS caps{}; caps.eCodecType = cudaVideoCodec_HEVC; caps.eChromaFormat = cudaVideoChromaFormat_444;
         cu(caps_(&caps), "NVDEC HEVC444 capabilities");
         if (!caps.bIsSupported || !(caps.nOutputFormatMask & (1u << cudaVideoSurfaceFormat_YUV444)))
@@ -613,13 +706,49 @@ public:
         parser.pUserData = this; parser.pfnSequenceCallback = &Decoder::sequence;
         parser.pfnDecodePicture = &Decoder::decode; parser.pfnDisplayPicture = &Decoder::display;
         cu(create_parser_(&parser_, &parser), "Create HEVC parser");
+        try{if(asynchronous_)mapping_worker_=std::thread([this]{mapping_loop();});}
+        catch(...){destroy_parser_(parser_);parser_=nullptr;throw;}
     }
     ~Decoder() {
+        stop_async();
         cuda_.set_current(cuda_.context);
         if (parser_) destroy_parser_(parser_);
         if (decoder_) destroy_decoder_(decoder_);
     }
     uint32_t map_us() const{return map_us_;}
+    void request_stop(){
+        {std::lock_guard lock(jobs_mutex_);stopping_=true;}
+        jobs_changed_.notify_all();
+    }
+    void stop_async(){request_stop();if(mapping_worker_.joinable())mapping_worker_.join();}
+    bool drain_async(){std::unique_lock lock(jobs_mutex_);return wait_jobs(lock,[&]{return outstanding_==0;});}
+    unsigned outstanding(){std::lock_guard lock(jobs_mutex_);return outstanding_;}
+    void check_async(){std::lock_guard lock(jobs_mutex_);if(failure_)std::rethrow_exception(failure_);}
+    bool feed_async(const EncodedFrame& frame,AsyncOutput output){
+        if(!asynchronous_)throw std::runtime_error("Asynchronous feed requires an asynchronous decoder");
+        {
+            std::unique_lock lock(jobs_mutex_);
+            if(!wait_jobs(lock,[&]{return outstanding_<2;}))return false;
+            ++outstanding_;
+        }
+        submitting_=&output;submitted_=false;submitting_timestamp_=static_cast<CUvideotimestamp>(frame.sequence);
+        try{
+            // Capacity waiting is not permission to decode an expired compressed
+            // reference. Recheck the caller's strict queue/epoch admission now.
+            if(output.admit&&!output.admit()){
+                submitting_=nullptr;
+                {std::lock_guard lock(jobs_mutex_);if(outstanding_)--outstanding_;}
+                jobs_changed_.notify_all();return true;
+            }
+            feed(frame);
+            if(!submitted_)throw std::runtime_error("Missing immediate NVDEC display callback");
+            submitting_=nullptr;return true;
+        }catch(...){
+            submitting_=nullptr;
+            {std::lock_guard lock(jobs_mutex_);if(!submitted_&&outstanding_)--outstanding_;}
+            jobs_changed_.notify_all();throw;
+        }
+    }
     void feed(const EncodedFrame& frame) {
         cuda_.current(); callback_error_.clear();map_us_=0;
         if (frame.data.empty() || frame.data.size() > 64 * 1024 * 1024) throw std::runtime_error("Invalid encoded frame size.");
@@ -708,18 +837,26 @@ public:
 };
 
 class Renderer {
+public:
+    struct Picture {
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> resource;
+        uint32_t width=0,height=0,convert_us=0;
+    };
+private:
     HWND window_;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain> swap_;
+    HANDLE display_ready_=nullptr;
+    bool paced_present_=false;
     ComPtr<ID3D11RenderTargetView> target_;
-    ComPtr<ID3D11Texture2D> texture_;
-    ComPtr<ID3D11ShaderResourceView> resource_;
+    Picture synchronous_picture_;
     ComPtr<ID3D11VertexShader> vertex_;
     ComPtr<ID3D11PixelShader> pixel_;
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<IDXGIAdapter> adapter_;
-    uint32_t window_width_ = 0, window_height_ = 0, image_width_ = 0, image_height_ = 0;
+    uint32_t window_width_ = 0, window_height_ = 0;
     bool pending_present_ = false;
     uint32_t convert_us_=0,draw_us_=0;
     std::function<HRESULT()> present_for_test_;
@@ -728,13 +865,29 @@ class Renderer {
         hr(device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &target_), "Create render target");
     }
 public:
-    explicit Renderer(HWND window) : window_(window) {
+    explicit Renderer(HWND window,bool paced=false) : window_(window),paced_present_(paced) {
         if (!IsWindow(window)) throw std::runtime_error("Invalid viewer window.");
+        // Match capture's primary-output ownership. A default D3D adapter can
+        // differ on hybrid/multiple-GPU machines; NVDEC follows this device.
+        ComPtr<IDXGIFactory1> adapters;hr(CreateDXGIFactory1(IID_PPV_ARGS(&adapters)),"Create viewer adapter factory");
+        const HMONITOR primary=MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY);
+        for(UINT a=0;!adapter_;++a){
+            ComPtr<IDXGIAdapter1> candidate;
+            if(adapters->EnumAdapters1(a,&candidate)==DXGI_ERROR_NOT_FOUND)break;
+            for(UINT o=0;;++o){
+                ComPtr<IDXGIOutput> output;
+                if(candidate->EnumOutputs(o,&output)==DXGI_ERROR_NOT_FOUND)break;
+                DXGI_OUTPUT_DESC description{};hr(output->GetDesc(&description),"Get viewer primary output");
+                if(description.AttachedToDesktop&&description.Monitor==primary){adapter_=candidate;break;}
+            }
+        }
+        if(!adapter_)throw std::runtime_error("Viewer primary monitor adapter is unavailable");
         DXGI_SWAP_CHAIN_DESC swap{}; swap.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         swap.SampleDesc.Count = 1; swap.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         swap.BufferCount = 2; swap.OutputWindow = window; swap.Windowed = TRUE;
         swap.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        hr(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        if(paced_present_)swap.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        hr(D3D11CreateDeviceAndSwapChain(adapter_.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
              nullptr, 0, D3D11_SDK_VERSION, &swap, &swap_, &device_, nullptr, &context_), "Create viewer D3D11 device");
         DXGI_SWAP_CHAIN_DESC actual{}; hr(swap_->GetDesc(&actual), "Get swapchain description");
         window_width_ = actual.BufferDesc.Width; window_height_ = actual.BufferDesc.Height; target();
@@ -755,10 +908,16 @@ public:
         ComPtr<IDXGIDevice> dxgi_device; hr(device_.As(&dxgi_device), "Get viewer DXGI device");
         ComPtr<IDXGIDevice1> latency_device; hr(device_.As(&latency_device), "Get low-latency DXGI device");
         hr(latency_device->SetMaximumFrameLatency(1), "Limit present queue to one frame");
-        hr(dxgi_device->GetAdapter(&adapter_), "Get viewer adapter");
         ComPtr<IDXGIFactory> factory; hr(adapter_->GetParent(IID_PPV_ARGS(&factory)), "Get viewer factory");
         hr(factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER), "Disable DXGI Alt-Enter");
+        if(paced_present_){
+            ComPtr<IDXGISwapChain2> chain;hr(swap_.As(&chain),"Get waitable viewer swapchain");
+            hr(chain->SetMaximumFrameLatency(1),"Limit waitable present queue to one frame");
+            display_ready_=chain->GetFrameLatencyWaitableObject();
+            if(!display_ready_)throw std::runtime_error("Viewer frame-latency waitable object unavailable");
+        }
     }
+    ~Renderer(){if(display_ready_)CloseHandle(display_ready_);}
     IDXGIAdapter* adapter() const { return adapter_.Get(); }
     uint32_t convert_us() const{return convert_us_;}
     uint32_t draw_us() const{return draw_us_;}
@@ -770,13 +929,42 @@ public:
         if(!pending_present_)return false;
         if(eligible&&!eligible()){pending_present_=false;return false;}
         const auto began=now_us();
-        const auto result=present_for_test_?present_for_test_():swap_->Present(0,DXGI_PRESENT_DO_NOT_WAIT);
+        const auto result=present_for_test_?present_for_test_():swap_->Present(paced_present_?1:0,DXGI_PRESENT_DO_NOT_WAIT);
         if(present_cost)*present_cost=uint32_t(std::min<uint64_t>(10000000,now_us()-began));
         // Keep only the latest prepared backbuffer. No NVDEC surface remains
         // mapped and a retry never repeats conversion or queues another frame.
-        pending_present_=result==DXGI_ERROR_WAS_STILL_DRAWING;
+        pending_present_=result==DXGI_ERROR_WAS_STILL_DRAWING||result==DXGI_STATUS_OCCLUDED;
         if(!pending_present_)hr(result,"Present decoded desktop");
         return result==S_OK;
+    }
+    bool present_when_ready(const std::function<bool()>& eligible,uint32_t* present_cost=nullptr){
+        if(present_cost)*present_cost=0;
+        while(pending_present_){
+            if(eligible&&!eligible()){pending_present_=false;return false;}
+            // A fresh prepared picture is announced before this call. Hidden
+            // startup windows must not wait for visibility to unlock startup.
+            if(display_ready_&&IsWindowVisible(window_)){
+                const auto wait=WaitForSingleObject(display_ready_,2);
+                if(wait==WAIT_TIMEOUT)continue;
+                if(wait!=WAIT_OBJECT_0)throw std::runtime_error("Wait for viewer display availability");
+            }
+            uint32_t cost=0;const bool presented=retry_present(eligible,&cost);
+            if(present_cost)*present_cost=cost;
+            if(presented||!pending_present_)return presented;
+            // A signaled waitable object can race another compositor consumer.
+            // Retain this final prepared image even if no new packet arrives.
+            Sleep(1);
+        }
+        return false;
+    }
+    bool wait_available(const std::function<bool()>& cancelled){
+        while(!cancelled()){
+            if(!display_ready_||!IsWindowVisible(window_))return true;
+            const auto wait=WaitForSingleObject(display_ready_,2);
+            if(wait==WAIT_OBJECT_0)return true;
+            if(wait!=WAIT_TIMEOUT)throw std::runtime_error("Wait for viewer display availability");
+        }
+        return false;
     }
     ComPtr<ID3D11Texture2D> upload_for_test(const Image& image) {
         D3D11_TEXTURE2D_DESC desc{}; desc.Width = image.width; desc.Height = image.height;
@@ -785,50 +973,57 @@ public:
         D3D11_SUBRESOURCE_DATA data{}; data.pSysMem = image.bgra.data(); data.SysMemPitch = image.width * 4;
         ComPtr<ID3D11Texture2D> texture; hr(device_->CreateTexture2D(&desc, &data, &texture), "Upload benchmark texture"); return texture;
     }
-    void draw(uint64_t yuv, size_t pitch, uint32_t image_width, uint32_t image_height, HiveGpu* gpu, Image* proof = nullptr,
-        uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,std::function<bool()> eligible={}) {
-        const auto render_begin=now_us();pending_present_=false;convert_us_=draw_us_=0;if(presented)*presented=false;
-        RECT client{}; if (!GetClientRect(window_, &client)) return;
-        const auto width = static_cast<uint32_t>(client.right), height = static_cast<uint32_t>(client.bottom);
-        if (!width || !height) return;
-        if (width != window_width_ || height != window_height_) {
-            context_->OMSetRenderTargets(0, nullptr, nullptr); target_.Reset();
-            hr(swap_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0), "Resize viewer swapchain");
-            window_width_ = width; window_height_ = height; target();
+    void convert(Picture& picture,uint64_t yuv,size_t pitch,uint32_t width,uint32_t height,HiveGpu* gpu){
+        if(picture.width!=width||picture.height!=height){
+            D3D11_TEXTURE2D_DESC texture{};texture.Width=width;texture.Height=height;
+            texture.MipLevels=1;texture.ArraySize=1;texture.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+            texture.SampleDesc.Count=1;texture.Usage=D3D11_USAGE_DEFAULT;texture.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+            Picture replacement;replacement.width=width;replacement.height=height;
+            hr(device_->CreateTexture2D(&texture,nullptr,&replacement.texture),"Create viewer picture texture");
+            hr(device_->CreateShaderResourceView(replacement.texture.Get(),nullptr,&replacement.resource),"Create viewer picture SRV");
+            picture=std::move(replacement);
         }
-        ID3D11ShaderResourceView* empty = nullptr; context_->PSSetShaderResources(0, 1, &empty);
-        if (image_width != image_width_ || image_height != image_height_) {
-            resource_.Reset(); texture_.Reset();
-            D3D11_TEXTURE2D_DESC texture{}; texture.Width = image_width; texture.Height = image_height;
-            texture.MipLevels = 1; texture.ArraySize = 1; texture.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            texture.SampleDesc.Count = 1; texture.Usage = D3D11_USAGE_DEFAULT; texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            hr(device_->CreateTexture2D(&texture, nullptr, &texture_), "Create viewer picture texture");
-            hr(device_->CreateShaderResourceView(texture_.Get(), nullptr, &resource_), "Create viewer picture SRV");
-            image_width_ = image_width; image_height_ = image_height;
-        }
-        const auto convert_begin=now_us();
-        if (!hive_gpu_decode_texture(gpu, yuv, pitch, image_width, image_height, texture_.Get())) throw std::runtime_error(hive_gpu_error(gpu));
-        const auto convert_elapsed=now_us()-convert_begin;
-        convert_us_=uint32_t(std::min<uint64_t>(10000000,convert_elapsed));
-        const float black[] = {0, 0, 0, 1}; context_->ClearRenderTargetView(target_.Get(), black);
-        auto* target = target_.Get(); context_->OMSetRenderTargets(1, &target, nullptr);
-        const double scale = std::min(double(width) / image_width, double(height) / image_height);
-        D3D11_VIEWPORT viewport{}; viewport.Width = static_cast<float>(image_width * scale); viewport.Height = static_cast<float>(image_height * scale);
-        viewport.TopLeftX = (width - viewport.Width) * .5f; viewport.TopLeftY = (height - viewport.Height) * .5f; viewport.MaxDepth = 1;
-        context_->RSSetViewports(1, &viewport); context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context_->VSSetShader(vertex_.Get(), nullptr, 0); context_->PSSetShader(pixel_.Get(), nullptr, 0);
-        auto* resource = resource_.Get(); auto* sampler = sampler_.Get();
-        context_->PSSetShaderResources(0, 1, &resource); context_->PSSetSamplers(0, 1, &sampler); context_->Draw(3, 0);
-        if (proof) {
-            ComPtr<ID3D11Texture2D> backbuffer; hr(swap_->GetBuffer(0, IID_PPV_ARGS(&backbuffer)), "Get diagnostic backbuffer");
-            *proof = read_texture(device_.Get(), context_.Get(), backbuffer.Get());
-        }
-        const auto present_begin=now_us();
-        draw_us_=uint32_t(std::min<uint64_t>(10000000,present_begin-render_begin-convert_elapsed));
-        if(render_cost)*render_cost=uint32_t(std::min<uint64_t>(10000000,present_begin-render_begin));
-        pending_present_=true;const bool result=retry_present(eligible,present_cost);
-        if(presented)*presented=result;
+        const auto begin=now_us();
+        if(!hive_gpu_decode_texture(gpu,yuv,pitch,width,height,picture.texture.Get()))throw std::runtime_error(hive_gpu_error(gpu));
+        picture.convert_us=uint32_t(std::min<uint64_t>(10000000,now_us()-begin));
     }
+    void draw_prepared(const Picture& picture,Image* proof=nullptr,uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,
+        std::function<bool()> eligible={},bool defer_present=false){
+        const auto render_begin=now_us();pending_present_=false;convert_us_=picture.convert_us;draw_us_=0;
+        if(presented)*presented=false;if(render_cost)*render_cost=0;if(present_cost)*present_cost=0;
+        RECT client{};if(!GetClientRect(window_,&client))return;
+        const auto width=static_cast<uint32_t>(client.right),height=static_cast<uint32_t>(client.bottom);
+        if(!width||!height)return;
+        if(width!=window_width_||height!=window_height_){
+            context_->OMSetRenderTargets(0,nullptr,nullptr);target_.Reset();
+            hr(swap_->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,paced_present_?DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT:0),"Resize viewer swapchain");
+            window_width_=width;window_height_=height;target();
+        }
+        const float black[]={0,0,0,1};context_->ClearRenderTargetView(target_.Get(),black);
+        auto* target=target_.Get();context_->OMSetRenderTargets(1,&target,nullptr);
+        const double scale=std::min(double(width)/picture.width,double(height)/picture.height);
+        D3D11_VIEWPORT viewport{};viewport.Width=static_cast<float>(picture.width*scale);viewport.Height=static_cast<float>(picture.height*scale);
+        viewport.TopLeftX=(width-viewport.Width)*.5f;viewport.TopLeftY=(height-viewport.Height)*.5f;viewport.MaxDepth=1;
+        context_->RSSetViewports(1,&viewport);context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vertex_.Get(),nullptr,0);context_->PSSetShader(pixel_.Get(),nullptr,0);
+        auto* resource=picture.resource.Get();auto* sampler=sampler_.Get();
+        context_->PSSetShaderResources(0,1,&resource);context_->PSSetSamplers(0,1,&sampler);context_->Draw(3,0);
+        // Mapper only reuses a released slot. Unbind after its final draw so
+        // future CUDA maps cannot race an unintended later graphics reference.
+        ID3D11ShaderResourceView* empty=nullptr;context_->PSSetShaderResources(0,1,&empty);
+        if(proof){ComPtr<ID3D11Texture2D> backbuffer;hr(swap_->GetBuffer(0,IID_PPV_ARGS(&backbuffer)),"Get diagnostic backbuffer");*proof=read_texture(device_.Get(),context_.Get(),backbuffer.Get());}
+        draw_us_=uint32_t(std::min<uint64_t>(10000000,now_us()-render_begin));
+        if(render_cost)*render_cost=uint32_t(std::min<uint64_t>(10000000,uint64_t(draw_us_)+convert_us_));
+        pending_present_=true;
+        if(defer_present)return;
+        const bool result=retry_present(eligible,present_cost);if(presented)*presented=result;
+    }
+    void draw(uint64_t yuv,size_t pitch,uint32_t image_width,uint32_t image_height,HiveGpu* gpu,Image* proof=nullptr,
+        uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,std::function<bool()> eligible={},bool defer_present=false){
+        convert(synchronous_picture_,yuv,pitch,image_width,image_height,gpu);
+        draw_prepared(synchronous_picture_,proof,render_cost,present_cost,presented,std::move(eligible),defer_present);
+    }
+
 };
 } // namespace
 
@@ -876,97 +1071,145 @@ bool MediaViewer::open(HWND window, std::string& error) {
     // DXGI creation may synchronously send window messages. Create it on the
     // caller/UI thread, then hand the device/context to the render worker.
     std::unique_ptr<Renderer> renderer;
-    try { renderer = std::make_unique<Renderer>(window); }
+    try { renderer = std::make_unique<Renderer>(window,true); }
     catch (const std::exception& problem) { error = problem.what(); return false; }
     { std::lock_guard guard(impl_->mutex); impl_->stopping = false; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
         impl_->live_window={};impl_->live_totals={};impl_->live_window.sample(now_us(),{});
         impl_->feedback={};impl_->last_arrival=0;impl_->service_samples.clear();impl_->present_samples.clear();impl_->diagnostics={};impl_->sample_since=now_us();impl_->receive_sample_at=0;impl_->received_count=impl_->decoded_count=impl_->presented_count=impl_->received_bytes=0;}
     std::promise<std::string> initialized; auto ready = initialized.get_future();
     impl_->worker = std::thread([this, renderer = std::move(renderer), initialized = std::move(initialized)]() mutable {
-        bool announced = false;
-        try {
-            uint64_t displayed = 0; auto start = Clock::now();
-            uint64_t callback_us=0;
-            std::optional<ViewerQueue::Pending> active;
-            auto eligible=[&](bool newest=false) {
+        bool announced=false;
+        try{
+            std::atomic<bool> pipeline_stop=false;
+            LatestPicture pictures;
+            struct ReadyPicture {Renderer::Picture pixels;std::shared_ptr<ViewerQueue::Pending> pending;};
+            std::array<ReadyPicture,3> ready_pictures;
+            const auto cancelled=[this,&pipeline_stop]{if(pipeline_stop)return true;std::lock_guard guard(impl_->mutex);return impl_->stopping;};
+            const auto eligible=[this,&pipeline_stop](const std::shared_ptr<ViewerQueue::Pending>& pending){
+                if(pipeline_stop)return false;
                 std::lock_guard guard(impl_->mutex);
-                const bool result=!impl_->stopping&&active&&(newest?
-                    impl_->frames.presentable(*active,now_us()):impl_->frames.fresh(*active,now_us()));
-                impl_->sync_queue();return result&&!impl_->stopping;
+                const bool fresh=!impl_->stopping&&impl_->frames.output_fresh(*pending,now_us());
+                impl_->sync_queue();return fresh&&!impl_->stopping;
             };
-            Decoder decoder([&](uint64_t yuv, size_t pitch, uint32_t width, uint32_t height, HiveGpu* gpu) {
-                // Still decode reference pictures in order, but do not spend
-                // conversion/presentation work on an obsolete picture. The
-                // epoch also rejects a decode completing after a queue reset.
-                if(!eligible(true)){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;return;}
-                const auto draw_begin=now_us();uint32_t render_us=0,present_us=0;bool presented=false;
-                // A newer compressed packet arriving during conversion is not
-                // ready to display. Show these already prepared fresh pixels;
-                // repeatedly cancelling them can starve visible progress.
-                renderer->draw(yuv, pitch, width, height, gpu,nullptr,&render_us,&present_us,&presented,[&]{return eligible();});callback_us+=now_us()-draw_begin;
-                // The shell intentionally keeps the HWND hidden until a fresh
-                // frame is ready. OCCLUDED / a busy swapchain must not prevent
-                // that startup handshake; actual presentation is counted below.
-                if(!presented&&!eligible()){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;return;}
-                ++displayed;
-                const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
-                std::ostringstream text; text << width << 'x' << height << " HEVC 4:4:4 | NVDEC | "
-                    << std::fixed << std::setprecision(1) << displayed / std::max(.001, seconds) << " fps | GPU color + D3D11 interop";
-                std::lock_guard guard(impl_->mutex);
-                const bool fresh=active&&impl_->frames.mark_ready(*active,now_us());impl_->sync_queue();
-                if(impl_->stopping)return;
-                if(!presented&&!fresh){++impl_->diagnostics.skipped;return;}
-                impl_->status = text.str(); impl_->displayed = true;
-                impl_->diagnostics.render_us=render_us;impl_->diagnostics.present_us=present_us;
-                impl_->diagnostics.convert_us=renderer->convert_us();impl_->diagnostics.draw_us=renderer->draw_us();
-                if(presented){++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}else if(!renderer->present_pending())++impl_->diagnostics.skipped;
-            }, renderer->adapter());
-            initialized.set_value({}); announced = true;
-            while (true) {
-                bool retry=false;
+            Decoder decoder({},renderer->adapter(),true,cancelled);
+            std::thread presenter;
+            struct Workers {
+                std::atomic<bool>& stop;LatestPicture& pictures;Decoder& decoder;std::thread& presenter;
+                ~Workers(){stop=true;pictures.stop();decoder.request_stop();if(presenter.joinable())presenter.join();decoder.stop_async();}
+            } workers{pipeline_stop,pictures,decoder,presenter};
+            presenter=std::thread([&]{
+                std::optional<size_t> current;
+                try{
+                    while(!cancelled()){
+                        if(!current&&!pictures.wait_ready(cancelled))break;
+                        // Wait BEFORE acquiring the latest image and before
+                        // touching the swapchain backbuffer. Mapping/NVDEC keep
+                        // progressing and replace the single ready image here.
+                        if(!renderer->wait_available(cancelled))break;
+                        const auto latest=pictures.take(current);
+                        if(latest){
+                            if(current){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
+                            current=latest;renderer->cancel_pending();
+                        }
+                        if(!current)continue;
+                        auto& picture=ready_pictures[*current];
+                        const auto can_present=[&]{return eligible(picture.pending);};
+                        if(!can_present()){
+                            renderer->cancel_pending();pictures.release(*current);current.reset();
+                            std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;continue;
+                        }
+                        uint32_t render_us=0,present_us=0;bool presented=false;
+                        if(latest)renderer->draw_prepared(picture.pixels,nullptr,&render_us,&present_us,&presented,can_present);
+                        else presented=renderer->retry_present(can_present,&present_us);
+                        {
+                            std::lock_guard guard(impl_->mutex);
+                            if(!impl_->stopping){
+                                if(latest){impl_->diagnostics.render_us=render_us;impl_->diagnostics.draw_us=renderer->draw_us();}
+                                impl_->diagnostics.present_us=present_us;
+                                if(presented){++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}
+                                else if(!renderer->present_pending())++impl_->diagnostics.skipped;
+                            }
+                        }
+                        if(!renderer->present_pending()){pictures.release(*current);current.reset();}
+                        else Sleep(1); // Busy/occluded retry retains the static final image.
+                    }
+                }catch(const std::exception& problem){
+                    std::lock_guard guard(impl_->mutex);
+                    if(!impl_->stopping){impl_->status=std::string("Media error: ")+problem.what();impl_->stopping=true;}
+                    impl_->changed.notify_all();
+                }
+                if(current)pictures.release(*current);
+            });
+            initialized.set_value({});announced=true;
+            while(!cancelled()){
+                decoder.check_async();
+                std::optional<ViewerQueue::Pending> pending;
                 {
                     std::unique_lock guard(impl_->mutex);
-                    while(!impl_->stopping&&impl_->frames.empty()){
-                        if(renderer->present_pending()){
-                            impl_->changed.wait_for(guard,std::chrono::milliseconds(2));
-                            impl_->sync_queue();
-                            if(impl_->frames.empty()){retry=true;break;}
-                        }else if(impl_->frames.recovery_pending())impl_->changed.wait_for(guard,std::chrono::milliseconds(100));
-                        else impl_->changed.wait(guard);
-                        impl_->sync_queue();
-                    }
-                    if (impl_->stopping) break;
-                    // A packet arriving after a busy Present wakes us before
-                    // the 2 ms retry. Give the prepared picture one immediate
-                    // nonblocking attempt before decoding its replacement.
-                    if(!retry&&renderer->present_pending())retry=true;
-                    if(!retry){
-                        active=impl_->frames.pop(now_us());impl_->sync_queue();
-                    }
+                    if(!impl_->stopping&&impl_->frames.empty())impl_->changed.wait_for(guard,std::chrono::milliseconds(2));
+                    impl_->sync_queue();if(impl_->stopping)break;
+                    pending=impl_->frames.pop(now_us());impl_->sync_queue();
                 }
-                if(retry){
-                    uint32_t present_us=0;const bool presented=renderer->retry_present([&]{return eligible();},&present_us);
-                    std::lock_guard guard(impl_->mutex);impl_->diagnostics.present_us=present_us;
-                    if(presented){++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());if(active)impl_->frames.mark_ready(*active,now_us());}
-                    else if(!renderer->present_pending())++impl_->diagnostics.skipped;
-                    // Still busy: retire these pixels before decoding newer
-                    // work. Never retry an older picture after its replacement.
-                    if(!impl_->frames.empty()&&renderer->cancel_pending())++impl_->diagnostics.skipped;
-                    impl_->sync_queue();continue;
-                }
-                if(!active)continue;
-                const auto began=now_us();callback_us=0;
-                // Encoder has no B frames; parser callbacks run synchronously
-                // with zero display delay, so active describes this picture.
-                decoder.feed(active->frame);
-                const auto elapsed=now_us()-began;
-                {std::lock_guard guard(impl_->mutex);++impl_->decoded_count;++impl_->live_totals[1];impl_->diagnostics.decode_us=uint32_t(std::min<uint64_t>(10000000,elapsed-std::min(elapsed,callback_us)));
-                    impl_->diagnostics.nvdec_map_us=decoder.map_us();
-                    if(!active->frame.keyframe)impl_->service_samples.add(now_us(),uint32_t(std::min<uint64_t>(1000000,elapsed)));}
+                if(!pending)continue;
+                auto context=std::make_shared<ViewerQueue::Pending>(std::move(*pending));
+                auto slot=std::make_shared<std::optional<size_t>>();
+                Decoder::AsyncOutput output;
+                output.admit=[this,context]{
+                    std::lock_guard guard(impl_->mutex);
+                    const bool fresh=!impl_->stopping&&impl_->frames.admit(*context,now_us());
+                    impl_->sync_queue();return fresh&&!impl_->stopping;
+                };
+                output.prepare=[&,context,slot](uint64_t yuv,size_t pitch,uint32_t width,uint32_t height,HiveGpu* gpu){
+                    if(!eligible(context)){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;return;}
+                    const auto reserved=pictures.reserve();
+                    if(!reserved){if(cancelled())return;throw std::runtime_error("Viewer picture ownership exhausted");}
+                    try{
+                        auto& picture=ready_pictures[*reserved];picture.pending=context;
+                        // Offscreen conversion only: the mapping worker never
+                        // touches the D3D immediate context or waits for vsync.
+                        renderer->convert(picture.pixels,yuv,pitch,width,height,gpu);*slot=reserved;
+                    }catch(...){pictures.release(*reserved);throw;}
+                };
+                output.complete=[&,context,slot](uint32_t map_us,uint32_t service_us){
+                    if(!*slot){
+                        std::lock_guard guard(impl_->mutex);
+                        if(!impl_->stopping){
+                            ++impl_->decoded_count;++impl_->live_totals[1];
+                            impl_->diagnostics.decode_us=map_us;impl_->diagnostics.nvdec_map_us=map_us;
+                            if(!context->frame.keyframe)impl_->service_samples.add(now_us(),service_us);
+                        }
+                        return;
+                    }
+                    const auto index=**slot;const auto& image=ready_pictures[index].pixels;
+                    bool prepared=false;
+                    {
+                        std::lock_guard guard(impl_->mutex);
+                        if(!impl_->stopping&&!pipeline_stop){
+                            ++impl_->decoded_count;++impl_->live_totals[1];
+                            impl_->diagnostics.decode_us=map_us;impl_->diagnostics.nvdec_map_us=map_us;
+                            impl_->diagnostics.convert_us=image.convert_us;
+                            if(!context->frame.keyframe)impl_->service_samples.add(now_us(),service_us);
+                            prepared=impl_->frames.mark_output_ready(*context,now_us());impl_->sync_queue();
+                            if(prepared&&!impl_->stopping){
+                                impl_->status=std::to_string(image.width)+'x'+std::to_string(image.height)+" HEVC 4:4:4 | NVDEC async | latest ready + display pacing";
+                                // Reveal the hidden viewer on prepared pixels;
+                                // actual presentation is counted only at S_OK.
+                                impl_->displayed=true;
+                            }else prepared=false;
+                        }
+                    }
+                    if(!prepared){pictures.release(index);return;}
+                    const auto published=pictures.publish(index);
+                    if(published.replaced){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
+                };
+                if(!decoder.feed_async(context->frame,std::move(output)))break;
             }
-        } catch (const std::exception& problem) {
-            if (!announced) initialized.set_value(problem.what());
-            std::lock_guard guard(impl_->mutex); impl_->status = std::string("Media error: ") + problem.what(); impl_->stopping = true;
+            decoder.check_async();
+        }catch(const std::exception& problem){
+            if(!announced)initialized.set_value(problem.what());
+            std::lock_guard guard(impl_->mutex);
+            if(!impl_->stopping){impl_->status=std::string("Media error: ")+problem.what();impl_->stopping=true;}
+            impl_->changed.notify_all();
         }
     });
     error = ready.get(); if (!error.empty()) { close(); return false; } return true;
@@ -993,8 +1236,9 @@ StreamFeedback MediaViewer::feedback() const {
     ++impl_->feedback.feedback_sequence;auto report=impl_->feedback;const auto now=now_us();
     impl_->sample(now);
     if(impl_->last_arrival)report.arrival_age_us=uint32_t(std::min<uint64_t>(UINT32_MAX,now-impl_->last_arrival));
-    report.queue_us=uint32_t(std::min<uint64_t>(UINT32_MAX,impl_->frames.queue_age(now)));
-    report.service_us=impl_->service_samples.p90(now);report.service_sample_age_us=impl_->service_samples.sample_age(now);
+    report.queue_us=uint32_t(std::min<uint64_t>(UINT32_MAX,impl_->frames.feedback_queue_age(now)));
+    // Mapping latency is not pipelined capacity. Actual compressed backlog drives throttling.
+    report.service_us=0;report.service_sample_age_us=impl_->service_samples.sample_age(now);
     report.rate_details=true;report.received_kbps=impl_->diagnostics.receive_kbps;report.received_millihz=impl_->diagnostics.received_millihz;
     report.receive_sample_age_us=impl_->receive_sample_at?uint32_t(std::min<uint64_t>(UINT32_MAX,now-impl_->receive_sample_at)):UINT32_MAX;
     report.transit_extra_us=impl_->frames.transit_extra_us();
@@ -1518,7 +1762,8 @@ bool media_pipeline_self_test(std::string& report) {
                         if (!encoder.receive(completion)) throw std::runtime_error("Pipeline ended before all submitted frames drained.");
                         if (completion.frame.sequence != expected || completion.frame.capture_time_us != timestamps[expected] || completion.frame.data.empty())
                             throw std::runtime_error("Pipeline changed sequence, capture timestamp or bitstream ownership.");
-                        if (completion.submitted_us < timestamps[expected] || completion.completed_us < completion.submitted_us || completion.total_us < completion.color_us)
+                        if (completion.submitted_us < timestamps[expected] || completion.completed_us < completion.submitted_us || completion.total_us < completion.color_us ||
+                            completion.frame.source_ready_us!=completion.completed_us||completion.frame.source_ready_us<completion.frame.capture_time_us)
                             throw std::runtime_error("Pipeline completion timing is not monotonic.");
                         if ((expected == 0 || expected == 12) && !completion.frame.keyframe)
                             throw std::runtime_error("Pipeline did not honor requested IDR.");
@@ -1672,4 +1917,5 @@ bool media_pipeline_self_test(std::string& report) {
     } catch (const std::exception& error) {report=std::string("FAIL: ")+phase+": "+error.what();return false;}
 }
 #include "media_motion_test.inl"
+#include "media_async_test.inl"
 } // namespace hive

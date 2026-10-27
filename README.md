@@ -5,12 +5,19 @@ Windows-native personal LAN desktop switching. This is an early hardware-tested 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+Alpha.31 separates encoder throughput from frame latency, carries encoded-output
+completion timing to distinguish source work from network backlog, and makes
+source status reporting nonblocking. Receiver decode, color conversion and
+display scheduling use bounded handoffs; display selects the latest completed
+image instead of replaying a decoded-image queue. Update both computers for
+timing provenance.
+
 Alpha.30 includes the lock-screen fixes and explicitly retains the first-IDR
 requirement through capture timeouts after an encoder restart.
 
 Alpha.29 fixes the input desktop access mask and preserves video frame sequence
 numbers across lock/unlock capture restarts. Upgrade the controlled computer;
-live PIN-screen acceptance still needs a user-operated lock/unlock check.
+the user confirmed working remote PIN entry and login with alpha.30.
 
 Alpha.28 adds a live ~16ms diagnostic HUD, metric warning colors and a translucent,
 click-through background. Update both computers for fast source diagnostics.

@@ -16,6 +16,50 @@ public:
         return now-blocked_since_>20000;
     }
 };
+// Residence latency is not throughput: an asynchronous job may take 15 ms
+// while the same engine accepts another every 4 ms. Even overlapping jobs'
+// completion spacing can be imposed by our own pacing. Learn NVENC capacity
+// only when both GPU slots kept the producer waiting past its next deadline.
+// Color conversion is synchronous producer work and has no such ambiguity.
+// Caller serializes observations and wait boundaries with the host mutex.
+class EncoderCapacity {
+    static constexpr uint64_t FreshUs=1000000;
+    uint32_t color_us_=0,service_us_=0;
+    uint64_t color_at_=0,service_at_=0,previous_completion_=0,wait_deadline_=0;
+    bool previous_keyframe_=true;
+    static bool fresh(uint64_t at,uint64_t now){return at&&now>=at&&now-at<=FreshUs;}
+    static uint32_t smooth(uint32_t previous,uint32_t sample){return previous?(previous*7+sample)/8:sample;}
+public:
+    void begin_slot_wait(uint64_t deadline){wait_deadline_=deadline;}
+    void end_slot_wait(){wait_deadline_=0;}
+    void observe(uint64_t completed,uint64_t submitted,uint32_t color_us,bool keyframe){
+        // This completion returned a GPU slot even if the host's compound
+        // wait remains blocked on downstream credit. It ends the evidence
+        // interval; later paced completions need a new actual GPU-slot wait.
+        const auto wait_deadline=wait_deadline_;wait_deadline_=0;
+        color_us_=smooth(fresh(color_at_,completed)?color_us_:0,std::min(color_us,1000000u));
+        color_at_=completed;
+        if(wait_deadline&&completed>wait_deadline&&previous_completion_&&
+            completed>=previous_completion_&&!keyframe&&!previous_keyframe_&&submitted<=previous_completion_){
+            const auto service=uint32_t(std::min<uint64_t>(1000000,completed-previous_completion_));
+            service_us_=smooth(fresh(service_at_,completed)?service_us_:0,service);
+            service_at_=completed;
+        }
+        previous_completion_=completed;previous_keyframe_=keyframe;
+    }
+    uint32_t cost(uint64_t now)const{
+        // Without new saturated evidence this is an unknown bound, not a
+        // permanent ceiling. The pacer's existing bounded probes can retry.
+        return std::max(fresh(color_at_,now)?color_us_:0u,fresh(service_at_,now)?service_us_:0u);
+    }
+    uint64_t sample_time(uint64_t now)const{
+        const auto color=fresh(color_at_,now)?color_us_:0u;
+        // Cheap new color work cannot relabel one old NVENC spike as repeated
+        // evidence of sustained overload. Date the component that sets cost().
+        if(fresh(service_at_,now)&&service_us_>color)return service_at_;
+        return fresh(color_at_,now)?color_at_:0;
+    }
+};
 class AdaptivePacer {
     uint32_t target_,rate_,pressure_=0,external_limit_;
     uint64_t last_change_=0,last_pressure_=0,last_receiver_pressure_=0;
@@ -72,8 +116,8 @@ public:
             if(sustained_encode){next=std::min(next,std::max(encode_capacity,rate_*80/100));pressure_|=PressureEncode;}
             rate_=std::clamp(next,std::min(1000u,target_),target_);last_change_=now;
         }else if(encoder_limited) {
-            // Encoding is serialized and already self-limits production. A
-            // short GPU scheduling spike does not justify a lasting FPS cliff.
+            // Finite GPU slots already bound asynchronous production. A short
+            // scheduling spike does not justify a lasting frame-rate cliff.
             if(sustained_encode&&now-last_change_>=500000) {
                 rate_=std::clamp(std::max(encode_capacity,rate_*80/100),std::min(1000u,target_),target_);
                 pressure_=PressureEncode;last_change_=now;

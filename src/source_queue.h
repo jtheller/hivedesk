@@ -25,10 +25,13 @@ public:
         cancel_completion();return push(std::move(frame),now,processing_us);
     }
     bool push(EncodedFrame frame,uint64_t now,uint64_t processing_us=0) {
+        if(!valid_frame_timing(frame)||(frame.source_ready_us&&frame.source_ready_us>now)){reset_chain();++discarded_;return false;}
         // Do not turn intrinsically slow encoding into an endless IDR/drop
         // loop. A just-completed job gets at most 20 ms beyond its actual work;
         // the normal 100 ms capture-age budget still applies to fast encoding.
-        const auto budget=std::max(max_age_us,processing_us+20000);
+        const auto work=frame.source_ready_us?frame.source_ready_us-frame.capture_time_us:processing_us;
+        if(work>MaxSourceWorkUs){reset_chain();++discarded_;return false;}
+        const auto budget=std::max(max_age_us,work+20000);
         const auto origin=frame.capture_time_us?frame.capture_time_us:now;
         if(now>=origin&&now-origin>budget){reset_chain();++discarded_;return false;}
         if(frames_.size()>=capacity)reset_chain();
