@@ -15,6 +15,10 @@ int main(int argc,char** argv){try{
     require(update::parse_version("0.1.0-alpha.9",a)&&update::parse_version("0.1.0-alpha.27",b)&&b>a,"Numeric prerelease order failed");
     require(update::parse_version("0.1.0-rc.9",a)&&update::parse_version("0.1.0",b)&&b>a,"Stable release order failed");
     require(update::parse_version("0.2.0-alpha.1",b)&&b>a,"Major/minor upgrade order failed");
+    require(update::parse_version("0.1.0-alpha.39",a)&&update::parse_version("0.2.0",b)&&b>a,"Alpha-to-numbered release migration failed");
+    a=b;require(update::parse_version("0.2.1",b)&&b>a,"Patch upgrade order failed");
+    a=b;require(update::parse_version("0.3.0",b)&&b>a,"Feature upgrade order failed");
+    require(update::parse_version("0.2.0",a)&&update::parse_version("0.2.0-rc.99",b)&&b<a,"Stable release accepted a same-version preview downgrade");
     for(const auto* bad:{"","v0.1.0","0.1","0.1.0.2","0.1.0-alpha","0.1.0-alpha.01","0.1.0-alpha.1/evil","0.1.0-alpha.-1","0.1.0-alpha.99999999","01.1.0","0.1.0+dirty"})require(!update::parse_version(bad,a),"Malformed version accepted");
     auto manifest=read(root/L"update.manifest"),signature=read(root/L"update.manifest.sig");
     const auto parsed=update::verify_manifest(manifest,signature);

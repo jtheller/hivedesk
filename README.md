@@ -1,6 +1,11 @@
 # HiveDesk
 
-Windows-native personal LAN desktop switching. This is an early hardware-tested alpha.
+Windows-native personal LAN desktop switching.
+
+Starting with **0.2.0**, regular releases use `0.x.y`: fixes and refinements
+increment the patch (`0.2.1`), and feature releases increment the minor (`0.3.0`).
+Alpha/beta/rc labels are reserved for explicitly designated preview builds.
+Existing alpha installations can upgrade through the same signed, idle-only OTA.
 
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
