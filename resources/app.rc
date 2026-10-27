@@ -1,8 +1,8 @@
 #include <windows.h>
 101 ICON "HiveDesk.ico"
 1 VERSIONINFO
-FILEVERSION 0,2,3,0
-PRODUCTVERSION 0,2,3,0
+FILEVERSION 0,2,4,0
+PRODUCTVERSION 0,2,4,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -11,9 +11,9 @@ BEGIN
   BLOCK "040904B0"
   BEGIN
    VALUE "FileDescription", "HiveDesk LAN desktop switcher\0"
-   VALUE "FileVersion", "0.2.3\0"
+   VALUE "FileVersion", "0.2.4\0"
    VALUE "ProductName", "HiveDesk\0"
-   VALUE "ProductVersion", "0.2.3\0"
+   VALUE "ProductVersion", "0.2.4\0"
    VALUE "OriginalFilename", "HiveDesk.exe\0"
   END
  END

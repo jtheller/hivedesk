@@ -35,7 +35,10 @@ struct HiveGpu {
     tcuGraphicsUnregisterResource* unregister_texture{};
     tcuGraphicsMapResources* map{}; tcuGraphicsUnmapResources* unmap{};
     tcuGraphicsSubResourceGetMappedArray* array{};
-    tcuModuleLoadData* load_module{}; tcuModuleUnload* unload_module{};
+    using LoadModule = CUresult CUDAAPI(CUmodule*,const void*,unsigned int,CUjit_option*,void**);
+    LoadModule* load_module{}; tcuModuleUnload* unload_module{};
+    tcuCtxGetDevice* context_device{}; tcuDeviceGetName* device_name{};
+    tcuDeviceGetAttribute* device_attribute{};
     tcuModuleGetFunction* function{}; tcuLaunchKernel* launch{};
     tcuGetErrorString* describe{};
     template<class F> void bind(F*& pointer, const char* symbol) {
@@ -52,7 +55,8 @@ struct HiveGpu {
             bind(synchronize,"cuStreamSynchronize");
             bind(register_texture,"cuGraphicsD3D11RegisterResource");bind(unregister_texture,"cuGraphicsUnregisterResource");
             bind(map,"cuGraphicsMapResources");bind(unmap,"cuGraphicsUnmapResources");bind(array,"cuGraphicsSubResourceGetMappedArray");
-            bind(load_module,"cuModuleLoadData");bind(unload_module,"cuModuleUnload");
+            bind(load_module,"cuModuleLoadDataEx");bind(unload_module,"cuModuleUnload");
+            bind(context_device,"cuCtxGetDevice");bind(device_name,"cuDeviceGetName");bind(device_attribute,"cuDeviceGetAttribute");
             bind(function,"cuModuleGetFunction");bind(launch,"cuLaunchKernel");
             bind(describe,"cuGetErrorString");
         } catch(...) {FreeLibrary(driver);driver=nullptr;throw;}
@@ -76,7 +80,24 @@ struct HiveGpu {
         if(!width||!height||width>8192||height>8192){std::snprintf(error,sizeof(error),"Invalid color-conversion dimensions");return false;}
         if(!stream&&!check(create_stream(&stream,CU_STREAM_NON_BLOCKING),"Create color-conversion stream"))return false;
         if(!module){
-            if(!check(load_module(&module,HiveColorPtx),"Load compatible PTX 6.4 color kernels"))return false;
+            char jit[2048]{};
+            CUjit_option options[]{CU_JIT_ERROR_LOG_BUFFER,CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+            void* values[]{jit,reinterpret_cast<void*>(sizeof(jit))};
+            const auto loaded=load_module(&module,HiveColorPtx,2,options,values);
+            if(loaded!=CUDA_SUCCESS){
+                CUdevice device{};char name[128]="unknown GPU";int major=0,minor=0;
+                if(context_device(&device)==CUDA_SUCCESS){
+                    device_name(name,sizeof(name),device);
+                    device_attribute(&major,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,device);
+                    device_attribute(&minor,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,device);
+                }
+                const char* detail=nullptr;describe(loaded,&detail);
+                jit[sizeof(jit)-1]=0;name[sizeof(name)-1]=0;
+                for(char* c=jit;*c;++c)if(*c=='\r'||*c=='\n')*c=' ';
+                std::snprintf(error,sizeof(error),"Load PTX 6.4/sm_52: CUDA %d (%s); %.100s sm_%d%d; JIT: %.260s",
+                    int(loaded),detail?detail:"unknown",name,major,minor,*jit?jit:"no compiler detail");
+                return false;
+            }
             if(!check(function(&encode,module,"hive_bgra_to_yuv"),"Find BGRA to YUV444 kernel")||
                !check(function(&decode,module,"hive_yuv_to_bgra"),"Find YUV444 to BGRA kernel")){
                 unload_module(module);module=nullptr;encode=decode=nullptr;return false;

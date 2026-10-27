@@ -1,12 +1,12 @@
 #pragma once
 // Project-owned full-range BT.709, planar 8-bit YUV444 <-> BGRA kernels.
-// PTX 6.4 / sm_75 uses the Turing-era ISA: R500 drivers can JIT this, and
-// newer GPUs use the same forward-compatible PTX. No CUDA runtime/NVRTC.
+// PTX 6.4 / sm_52 keeps the scalar kernels usable on Maxwell/Pascal as
+// well as newer GPUs. R500 drivers can JIT this; no CUDA runtime/NVRTC.
 // RGB equations: Y=.2126R+.7152G+.0722B, U=(B-Y)/1.8556+128,
 // V=(R-Y)/1.5748+128. Clamp to [0,255], round positive halves upward.
 inline constexpr char HiveColorPtx[] = R"ptx(
 .version 6.4
-.target sm_75
+.target sm_52
 .address_size 64
 .visible .entry hive_bgra_to_yuv(
     .param .u64 rgba, .param .u64 yuv, .param .u64 pitch,
@@ -158,4 +158,3 @@ inline constexpr char HiveColorPtx[] = R"ptx(
     ret;
 }
 )ptx";
-

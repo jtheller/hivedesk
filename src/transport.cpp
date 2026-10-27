@@ -166,7 +166,10 @@ Bytes input_bytes(const InputPacket& packet) {
     u32(b,uint32_t(packet.event.kind));u32(b,uint32_t(packet.event.a));u32(b,uint32_t(packet.event.b));u32(b,uint32_t(packet.event.c));return b;
 }
 bool send_all(SOCKET s, const uint8_t* p, size_t n) {
-    while (n) { int sent = ::send(s, reinterpret_cast<const char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (sent <= 0) return false; p += sent; n -= sent; }
+    // A blocking send can wait for the whole supplied buffer. Bound each write
+    // so SO_SNDTIMEO detects stalled progress, not the total duration of a
+    // multi-megabyte snapshot on a high-latency link. Wire framing is unchanged.
+    while (n) { int sent = ::send(s, reinterpret_cast<const char*>(p), int((std::min)(n, size_t(16*1024))), 0); if (sent <= 0) return false; p += sent; n -= sent; }
     return true;
 }
 bool recv_all(SOCKET s, uint8_t* p, size_t n) {
@@ -1091,6 +1094,59 @@ bool Transport::discovery_self_test(std::string& result){
     result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
 }
 bool Transport::self_test(std::string& result) {
+    {
+        // A healthy slow transfer can outlast SO_SNDTIMEO in total. Only a
+        // lack of write progress should fail it, and a stopped reader must
+        // still terminate the send. Exercise real TCP without desktop input.
+        WSADATA ws{};
+        if(WSAStartup(MAKEWORD(2,2),&ws)){result="Progress test Winsock initialization failed";return false;}
+        struct WinsockScope {~WinsockScope(){WSACleanup();}} winsock_scope;
+        struct SocketScope {SOCKET s=INVALID_SOCKET;~SocketScope(){if(s!=INVALID_SOCKET)closesocket(s);}} listener,writer,reader;
+        listener.s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+        sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        int address_size=sizeof(address);
+        int receive_buffer=16*1024;
+        if(setsockopt(listener.s,SOL_SOCKET,SO_RCVBUF,reinterpret_cast<const char*>(&receive_buffer),sizeof(receive_buffer))||
+           bind(listener.s,reinterpret_cast<sockaddr*>(&address),sizeof(address))||listen(listener.s,1)||
+           getsockname(listener.s,reinterpret_cast<sockaddr*>(&address),&address_size)){
+            result="Progress test listener failed";return false;
+        }
+        writer.s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+        if(::connect(writer.s,reinterpret_cast<sockaddr*>(&address),sizeof(address))){result="Progress test connect failed";return false;}
+        reader.s=accept(listener.s,nullptr,nullptr);
+        int zero=0;DWORD timeout=1000;
+        if(reader.s==INVALID_SOCKET||
+           setsockopt(writer.s,SOL_SOCKET,SO_SNDBUF,reinterpret_cast<const char*>(&zero),sizeof(zero))||
+           setsockopt(writer.s,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout))||
+           setsockopt(reader.s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout))){
+            result="Progress test socket configuration failed";return false;
+        }
+        Bytes payload(4*1024*1024,73);bool received=true;
+        std::thread draining([&]{
+            std::array<uint8_t,16*1024> part{};size_t remaining=payload.size();
+            while(remaining){
+                Sleep(10);
+                const int count=recv(reader.s,reinterpret_cast<char*>(part.data()),int(part.size()),0);
+                if(count<=0){received=false;break;}
+                if(size_t(count)>remaining||!std::all_of(part.begin(),part.begin()+count,[](uint8_t value){return value==73;})){received=false;break;}
+                remaining-=count;
+            }
+        });
+        const auto begun=Clock::now();
+        const bool sent=send_all(writer.s,payload.data(),payload.size());
+        const auto duration=Clock::now()-begun;
+        if(!sent)shutdown(writer.s,SD_BOTH);
+        draining.join();
+        if(!sent||!received||duration<std::chrono::milliseconds(timeout)){
+            result="Progressing TCP transfer failed or did not span the per-write timeout: sent="+std::to_string(sent)+
+                " received="+std::to_string(received)+" elapsed_ms="+std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());return false;
+        }
+        payload.resize(4*1024*1024,73);
+        const auto stalled=Clock::now();
+        if(send_all(writer.s,payload.data(),payload.size())||Clock::now()-stalled>std::chrono::seconds(4)){
+            result="Stalled TCP control write did not stop within its timeout";return false;
+        }
+    }
     {
         Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);
         control.channel=0;control.peer.features=FeatureDesktopAux;
