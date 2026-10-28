@@ -48,7 +48,7 @@ public:
     HWND test_surface()const{return shell_.viewer_window();}
     void test_stop_viewer(){viewer_.load()->request_stop();}
     void test_delay_retirement(DWORD duration){retire_lane_.post([duration]{Sleep(duration);});}
-    void test_report()const{const auto v=viewer_.load();const auto active=active_.load();std::fprintf(stderr,"viewer test: active=%s ready=%d frame=%d presented=%d received=%llu state=%s input=%d\n",active?active->c_str():"none",int(view_ready_.load()),v->has_frame(),v->has_presented_frame(),(unsigned long long)received_frames_.load(),v->stats().c_str(),active&&transport_.input_ready(*active,active_session_));}
+    void test_report()const{const auto v=viewer_.load();const auto active=active_.load();const auto d=v->diagnostics();std::fprintf(stderr,"viewer test: active=%s ready=%d frame=%d presented=%d received=%llu state=%s input=%d decode_mhz=%u present_mhz=%u map_us=%u convert_us=%u depth=%u expired=%llu overflow=%llu skipped=%llu\n",active?active->c_str():"none",int(view_ready_.load()),v->has_frame(),v->has_presented_frame(),(unsigned long long)received_frames_.load(),v->stats().c_str(),active&&transport_.input_ready(*active,active_session_),d.decoded_millihz,d.presented_millihz,d.nvdec_map_us,d.convert_us,d.queue_depth,(unsigned long long)d.age_expired,(unsigned long long)d.queue_overflows,(unsigned long long)d.skipped);std::fflush(stderr);}
     std::future<bool> test_recovery_guards(){
         auto reply=std::make_shared<std::promise<bool>>();auto result=reply->get_future();
         enqueue([this,reply]{

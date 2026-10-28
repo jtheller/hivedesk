@@ -18,6 +18,7 @@ int probe(){
         cb.preview=[&p,&previews,&preview_stops,&bad_handoff](const std::string&,uint64_t session,bool enabled){std::lock_guard lock(p.mutex);if(p.warm&&p.session==session){if(enabled){++previews;if(p.handoff)bad_handoff=true;}else ++preview_stops;p.peek=enabled;p.remaining=enabled?10000:0;}};
         cb.stop_stream=[&p](const std::string&){p.remaining=0;};
         cb.cancel_warm=[&p](const std::string&,uint64_t s){if(p.session==s&&p.warm)p.remaining=0;};
+        cb.feedback=[&p](const std::string&,const hive::StreamFeedback& f){std::lock_guard lock(p.mutex);if(f.session==p.session&&f.recover&&!p.remaining)p.remaining=1;};
         cb.input_begin=[&p,&bad_handoff](const std::string&,uint64_t){if(p.warm){bad_handoff=true;return false;}return true;};
         cb.input_packet=[&p](const std::string& id,const hive::InputPacket& in){p.net.send_input_ack(id,{in.session,in.sequence,in.capture_time_us,0,0,true});};
         std::string error;require(p.net.start({"peer-"+std::to_string(i),"Generated peer "+std::to_string(i),"stress-key",uint16_t(48190+i),false,true},cb,error),error.c_str());
@@ -72,7 +73,10 @@ int probe(){
         }
         // Rapid hover swaps without closing Hive, then demand an actually
         // presented final selection. Counting Start requests alone misses hangs.
-        SendMessageW(owner,WM_APP+48,1,0);PostMessageW(owner,WM_HOTKEY,81,0);Sleep(1200);
+        // Closing the current viewer follows the real local-return path. A
+        // synthetic capture action with epoch zero is stale after selection.
+        if(const auto surface=app.test_surface())SendMessageW(surface,WM_CLOSE,0,0);
+        PostMessageW(owner,WM_HOTKEY,81,0);Sleep(1200);
         for(unsigned n=0;n<72;++n){
             SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&,n]{
                 const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;
@@ -84,8 +88,8 @@ int probe(){
             const auto point=MAKELPARAM(px(100),px(12)+tile+px(16)+tile/2);
             SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,point);SendMessageW(panel,WM_LBUTTONUP,0,point);
         })));
-        const auto await_ready=[&]{const auto until=GetTickCount64()+7000;while(!app.test_ready("peer-0")&&GetTickCount64()<until)Sleep(10);return app.test_ready("peer-0");};
-        const bool final_ready=await_ready();if(!final_ready)app.test_report();require(final_ready,"Final selection after rapid Peek never presented a desktop");
+        const auto await_ready=[&]{const auto until=GetTickCount64()+7000;while(!app.test_ready("peer-0")&&GetTickCount64()<until)Sleep(10);const bool ready=app.test_ready("peer-0");if(!ready)app.test_report();return ready;};
+        require(await_ready(),"Final selection after rapid Peek never presented a desktop");
         for(unsigned n=0;n<3;++n){
             const auto old=app.test_surface();
             app.test_delay_retirement(2000);app.test_stop_viewer();

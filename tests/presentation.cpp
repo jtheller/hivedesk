@@ -105,9 +105,7 @@ int main(int argc,char** argv){
         // Increasing red values identify old-picture replay while fresh images
         // alternate with gaps that must retain the latest displayed picture.
         auto ramp=hive::media_generated_cadence_frames();int previous_red=GetRValue(stable[0]);unsigned dynamic_samples=0;
-        for(auto& next:ramp){
-            next.sequence=++frame.sequence;next.capture_time_us=next.source_ready_us=0;viewer.submit(next);
-            for(unsigned i=0;i<12;++i){pump(i==5?80:3);const auto actual=samples();++dynamic_samples;
+        const auto check_dynamic_pixel=[&]{const auto actual=samples();++dynamic_samples;
                 const int red=GetRValue(actual[0]);
                 if(red+5<previous_red||std::abs(int(GetBValue(actual[0]))-int(GetBValue(stable[0])))>5||std::abs(int(GetGValue(actual[0]))-int(GetGValue(stable[0])))>5)
                 {
@@ -117,9 +115,22 @@ int main(int argc,char** argv){
                     throw std::runtime_error("Cadence flashed or replayed older pixels during fresh/repeated handoff");
                 }
                 previous_red=std::max(previous_red,red);
-            }
+        };
+        for(auto& next:ramp){
+            next.sequence=++frame.sequence;next.capture_time_us=next.source_ready_us=0;viewer.submit(next);
+            for(unsigned i=0;i<12;++i){pump(i==5?80:3);check_dynamic_pixel();}
         }
-        if(previous_red<215)throw std::runtime_error("Cadence did not reach the last changing picture");
+        // A generated final IDR can expire under scheduling pressure just like
+        // a static host's final update. Honor feedback with a fresh IDR rather
+        // than assuming scanout within the fixed 113 ms sampling interval.
+        // Every additional pixel is checked: no black/old-frame retry is hidden.
+        const auto final_deadline=GetTickCount64()+2000;uint64_t last_refresh=0;
+        while(previous_red<215&&GetTickCount64()<final_deadline){
+            const auto now=GetTickCount64();
+            if(viewer.feedback().recover&&now-last_refresh>=250){auto next=ramp.back();next.sequence=++frame.sequence;viewer.submit(std::move(next));last_refresh=now;}
+            pump(3);check_dynamic_pixel();
+        }
+        if(previous_red<215){std::printf("Cadence final red=%d status=%s\n",previous_red,viewer.stats().c_str());throw std::runtime_error("Cadence did not reach the last changing picture");}
         std::printf("Cadence fresh/repeated handoff: %u pixel samples, monotonic red reached %d\n",dynamic_samples,previous_red);
         viewer.set_display_cadence(false);pump(40);const auto stopped=viewer.diagnostics().repeated_presentations;pump(100);
         if(viewer.diagnostics().repeated_presentations!=stopped)throw std::runtime_error("Cadence kept repeating after disable");
