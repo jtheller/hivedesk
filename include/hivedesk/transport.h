@@ -17,6 +17,7 @@ struct TransportConfig {
     uint16_t port = 47980;
     bool discovery = true;
     bool automatic_lan = false; // Ephemeral ECDH; trusts any on-link HiveDesk peer, no shared key.
+    bool datagram_video = true; // Capability override for developer compatibility tests; no user setting.
 };
 struct TransportCallbacks {
     // All callbacks run on worker threads; caller must marshal UI work.

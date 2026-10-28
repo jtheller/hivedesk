@@ -195,8 +195,10 @@ impersonator. No universal shared password is embedded in the application.
   image, software-rendered cursor changes and requested recovery IDRs still work.
   Pacing retains its scheduled phase across normal wake-up jitter and skips
   missed ticks after a stall instead of accumulating delay or catching up.
-  Video TCP writes allow two overlapped packets and a 2 s watchdog; a stalled
-  partial write closes the connection instead of replaying old bytes later.
+  From 0.8.0, new peers negotiate encrypted, paced UDP video fragments with
+  selective retransmission and bounded reference epochs; see
+  [packet transport](docs/DATAGRAM-VIDEO.md). Unavailable UDP and older peers
+  retain TCP. The TCP fallback keeps bounded overlapped writes and its watchdog.
   The viewer rejects aged backlog before decoding and presentation, retains only
   the latest prepared picture while Present is busy, and retries that picture
   without waiting for another desktop update. Two seconds of failed freshness
@@ -275,7 +277,9 @@ shortcut, a selection, or an outside click dismisses it. The top-left gesture
 keeps its normal pointer-leave dismissal.
 
 TCP uses port 47980 for separate control/video/input connections (input requires
-alpha.25 on both endpoints); discovery uses UDP
+alpha.25 on both endpoints). From 0.8.0, the video connection also negotiates an
+ephemeral authenticated UDP lane; outbound reciprocal packets establish its
+path, with automatic TCP fallback when unavailable. Discovery uses UDP
 47979 and broadcasts on each active interface. Installer firewall rules are
 restricted to the local subnet on Private/Domain network profiles.
 

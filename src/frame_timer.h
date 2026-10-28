@@ -45,7 +45,7 @@ public:
     // Auto-reset events retain a signal sent just before wait enrollment. Do
     // not ResetEvent in wait_until: that would lose stop/keyframe notifications.
     void notify() noexcept{SetEvent(wake_);}
-    Result wait_until(Clock::time_point deadline) {
+    Result wait_until(Clock::time_point deadline,HANDLE external=nullptr) {
         const auto remaining=deadline-Clock::now();
         if(remaining<=Clock::duration::zero())return Result::Deadline;
         using Tick=std::chrono::duration<long long,std::ratio<1,10000000>>;
@@ -53,9 +53,10 @@ public:
         // A one-shot relative timer is unaffected by wall-clock corrections;
         // zero tolerable delay requests no extra timer coalescing.
         if(!SetWaitableTimerEx(timer_,&due,0,nullptr,nullptr,nullptr,0))fail("Arm frame pacing timer");
-        const HANDLE objects[]{wake_,timer_};
-        const auto result=WaitForMultipleObjects(2,objects,FALSE,INFINITE);
+        const HANDLE objects[]{wake_,timer_,external};
+        const auto result=WaitForMultipleObjects(external?3:2,objects,FALSE,INFINITE);
         if(result==WAIT_OBJECT_0){CancelWaitableTimer(timer_);return Result::Wake;}
+        if(external&&result==WAIT_OBJECT_0+2){CancelWaitableTimer(timer_);return Result::Wake;}
         if(result==WAIT_OBJECT_0+1)return Result::Deadline;
         fail("Wait for frame pacing timer");
     }

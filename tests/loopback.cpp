@@ -168,6 +168,7 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
     const auto measured=viewer.diagnostics();
     if(automatic&&(!diagnostic_reports||measured.session!=session||!measured.received_millihz||!measured.decoded_millihz||!measured.receive_kbps))fail("Missing live diagnostics");
     std::cout<<"Diagnostics: RX="<<measured.received_millihz/1000.0<<", decoded="<<measured.decoded_millihz/1000.0<<", presented="<<measured.presented_millihz/1000.0<<" fps; service p90="<<measured.service_p90_us/1000.0<<" ms; reports="<<diagnostic_reports<<"\n";
+    std::cout<<"Transport:"<<host_transport.tcp_diagnostics("loopback-client")<<'\n';
     client_transport.stop_stream(peer);
     cleanup();
     if (viewer.stats().starts_with("Media error:")) fail(viewer.stats());
@@ -183,7 +184,7 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
         if(background)std::cout<<"Background integration: periodic IDRs replace visible stimulus; these frame counts are not a throughput benchmark.\n";
     }
     std::cout << "PASS: single-machine loopback only (not a two-computer LAN latency measurement).\n"
-              << "Primary-screen NVENC HEVC 4:4:4 -> authenticated AES-GCM/TCP -> NVDEC -> hidden D3D11 renderer.\n"
+              << "Primary-screen NVENC HEVC 4:4:4 -> authenticated negotiated video transport -> NVDEC -> hidden D3D11 renderer.\n"
               << "Encoded=" << encoded.load() << ", received=" << received.load() << ", bytes=" << bytes.load()
               << ", backpressure=" << rejected.load() << ", dimensions=" << width.load() << 'x' << height.load() << '\n'
               << rendered_stats << '\n';

@@ -20,6 +20,7 @@
 #include "video_send_budget.h"
 #include "video_write_progress.h"
 #include "input_send_window.h"
+#include "datagram_video.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -51,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -213,8 +214,9 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe;
-    for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo;
+    const auto advertised=cfg.datagram_video?features:features&~FeatureDatagramVideo;
+    for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
     Reader r{b}; if (r.byte() != 'H' || r.byte() != 'I' || r.byte() != 'V' || r.byte() != 'E' || r.byte() != (automatic?2:1)) return false;
@@ -252,7 +254,10 @@ struct Transport::Impl {
         std::atomic<unsigned> video_inflight{0};
         std::atomic<uint64_t> video_owned_bytes{0};
         std::shared_ptr<std::atomic<uint64_t>> received_bytes=std::make_shared<std::atomic<uint64_t>>(0);
+        std::unique_ptr<DatagramVideo> datagram;
+        bool datagram_negotiated=false;
         uint64_t feedback_session=0,feedback_connection=0,feedback_origin_bytes=0,feedback_origin_us=0,feedback_sequence=0;
+        uint64_t feedback_expected_session=0; // Last successfully queued Start; stale reports cannot replace its baseline.
         bool video_credit=true; // queue_mutex; published after WSASend ownership.
         uint64_t packet_started_us=0,packet_completed_us=0; // reader thread only
         VideoSendWindow video_send;
@@ -264,7 +269,7 @@ struct Transport::Impl {
         void close(bool abortive = false) {
             // Publish while holding the same mutex used by queue_cv.wait(). An
             // atomic flag alone cannot prevent a notify-before-wait lost wake.
-            {std::lock_guard lock(queue_mutex);closed = true; ready = false;}
+            {std::lock_guard lock(queue_mutex);closed = true; ready = false;if(datagram)datagram->stop();}
             // Do not let a socket handle be recycled while a new WSASend or its
             // result query is using it. Pending I/O is canceled by closesocket.
             {std::lock_guard lock(socket_mutex);SOCKET s = socket.exchange(INVALID_SOCKET);
@@ -315,6 +320,9 @@ struct Transport::Impl {
                     }
                 }
                 if (control.size() >= (channel==2?128u:2048u) || control_bytes + b.size() > (channel==2?16384u:4*1024*1024u)) return false;
+                if(channel==0&&b.size()>=9&&(b[0]==AutoStart||b[0]==WarmStart)){
+                    Reader start{b};start.byte();feedback_expected_session=start.qword();
+                }
                 control_bytes += b.size(); control.push_back(std::move(b));
             }
             queue_cv.notify_one(); if(channel==1&&video_wake)SetEvent(video_wake); return true;
@@ -542,7 +550,14 @@ struct Transport::Impl {
             rx_seq = seq; return true;
         }
         void write_loop() {
-            if(channel==1){write_video_loop();owner->ended(*this);return;}
+            if(channel==1){
+                if(datagram_negotiated){
+                    Bytes offer{DatagramOffer};u16(offer,datagram?datagram->port():0);
+                    if(!write_packet(offer)){close();owner->ended(*this);return;}
+                    if(datagram)datagram->start();
+                }
+                write_video_loop();if(datagram)datagram->join();owner->ended(*this);return;
+            }
             if(channel==2)SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
             while (!closed && owner->running) {
                 Bytes b;bool input_stalled=false; {
@@ -574,7 +589,10 @@ struct Transport::Impl {
             if(channel==2)SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
             Bytes b;
             while (!closed && owner->running && read_packet(b)) {
-                try { if (!owner->dispatch(*this,b)) break; }
+                try {
+                    if(datagram&&!b.empty()&&(b[0]==Frame||b[0]==AutoFrame||b[0]==AutoFrameTimed||b[0]==FrameCursor))datagram->tcp_received();
+                    if (!owner->dispatch(*this,b)) break;
+                }
                 catch (...) { owner->status("Remote callback failed; connection closed."); break; }
             }
             close(); owner->ended(*this);
@@ -650,6 +668,20 @@ struct Transport::Impl {
         if (!signed_part(material,transcript,6,c.pair_key)||!signed_part(material,transcript,client ? 4 : 5,transmit) || !signed_part(material,transcript,client ? 5 : 4,receive) || !c.tx.init(transmit) || !c.rx.init(receive)) return false;
         SecureZeroMemory(transmit.data(),transmit.size()); SecureZeroMemory(receive.data(),receive.size());
         peer.address = c.peer.address; peer.authenticated = true; c.peer = std::move(peer); c.channel = channel;
+        c.datagram_negotiated=channel==1&&cfg.datagram_video&&(c.peer.features&FeatureDatagramVideo);
+        if(c.datagram_negotiated){
+            try{
+                DatagramVideo::Hooks hooks;
+                hooks.picture=[this,&c](Bytes bytes,uint64_t began,uint64_t completed){
+                    if(!c.closed&&!dispatch(c,bytes,began,completed,true))c.close(true);
+                };
+                hooks.credit=[&c]{if(!c.closed)c.notify_ready();};
+                hooks.keyframe=[&c]{if(!c.closed)c.request_fresh_frame();};
+                hooks.status=[this,&c](const std::string& text){status(c.peer.name+": "+text);};
+                auto datagram=std::make_unique<DatagramVideo>(c.peer.address,c.pair_key,client,c.received_bytes,std::move(hooks));
+                {std::lock_guard lock(c.queue_mutex);if(c.closed)return false;c.datagram=std::move(datagram);}
+            }catch(const std::exception& e){status(std::string("Video will use TCP: ")+e.what());}
+        }
         // Idle control connections have no timeout. shutdown() wakes blocked receives at stop().
         DWORD timeout = 0; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout)); return running;
     }
@@ -770,8 +802,12 @@ struct Transport::Impl {
         id = control->peer.id; status("Connected: " + control->peer.name); return true;
     }
 #include "path_probe.inl"
-    bool dispatch(Conn& c, const Bytes& b) {
+    bool dispatch(Conn& c, const Bytes& b,uint64_t udp_started=0,uint64_t udp_completed=0,bool udp=false) {
         Reader r{b}; uint8_t type = r.byte();
+        if(type==DatagramOffer){
+            const auto port=r.word();if(c.channel!=1||!c.datagram_negotiated||!r.end())return false;
+            return !c.datagram||c.datagram->offer(port);
+        }
         if((c.channel==3)!=(type==ClipboardData))return false;
         if(type==ClipboardData){if(b.size()<2||b.size()>ClipboardChunk+64)return false;if(callbacks.clipboard_packet)callbacks.clipboard_packet(c.peer.id,Bytes(b.begin()+1,b.end()));return true;}
         if(type==RichClipboard){ClipboardOffer offer;if(c.channel!=0||!(c.peer.features&FeatureRichClipboard)||!decode_clipboard_offer(Bytes(b.begin()+1,b.end()),offer))return false;if(callbacks.clipboard_offer)callbacks.clipboard_offer(c.peer.id,offer);else if(callbacks.clipboard)callbacks.clipboard(c.peer.id,offer.text);return true;}
@@ -917,7 +953,7 @@ struct Transport::Impl {
                 if(!valid_cursor_composition(frame.cursor_composition))return false;
             }
             if (!r.good || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384 || key > 1 || b.size()-r.at > kMaxFrame || b.size() == r.at) return false;
-            frame.receive_started_us=c.packet_started_us;frame.receive_completed_us=c.packet_completed_us;
+            frame.receive_started_us=udp?udp_started:c.packet_started_us;frame.receive_completed_us=udp?udp_completed:c.packet_completed_us;
             frame.receive_progress=c.received_bytes;
             frame.data.assign(b.begin()+r.at,b.end()); if (callbacks.frame) callbacks.frame(c.peer.id,std::move(frame)); return true;
         }
@@ -1064,6 +1100,7 @@ bool Transport::end_stream(const std::string& peer,uint64_t session) {
     if(video){std::lock_guard lock(video->queue_mutex);
         if(video->video){Reader r{video->video->payload};
             const auto kind=r.byte();if((kind==AutoFrame||kind==AutoFrameTimed||kind==FrameCursor)&&r.qword()==session&&r.good){video->video.reset();video->wait_keyframe=true;}}}
+    if(video&&video->datagram)video->datagram->cancel(session);
     if(!control||!(control->peer.features&FeatureHostKick))return input_notified;
     Bytes b{HostEnded};u64(b,session);const bool control_notified=control->enqueue(std::move(b));return input_notified||control_notified;
 }
@@ -1076,17 +1113,27 @@ bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
     u32(b,frame.width); u32(b,frame.height); u64(b,frame.sequence); u64(b,frame.capture_time_us); b.push_back(frame.keyframe ? 1 : 0);
     if(cursor||timed)u64(b,timed?frame.source_ready_us:0);
     if(cursor)b.push_back(uint8_t(frame.cursor_composition));
-    b.insert(b.end(),frame.data.begin(),frame.data.end()); return c->enqueue(std::move(b),frame.keyframe);
+    b.insert(b.end(),frame.data.begin(),frame.data.end());
+    if(c->datagram){
+        const auto route=c->datagram->route();
+        if(route==DatagramVideo::Route::Datagram)return c->datagram->send(std::move(b),frame.keyframe,frame.session);
+        if(route==DatagramVideo::Route::Negotiating||!c->datagram->accept_tcp(frame.keyframe))return false;
+    }
+    return c->enqueue(std::move(b),frame.keyframe);
 }
 bool Transport::frame_ready(const std::string& peer) const {
-    auto c=impl_->find(peer,true);if(!c)return false;const std::lock_guard lock(c->queue_mutex);return c->ready&&!c->closed&&c->video_credit&&!c->video.has_value();
+    auto c=impl_->find(peer,true);if(!c)return false;
+    if(c->datagram){const auto route=c->datagram->route();if(route!=DatagramVideo::Route::Tcp)return route==DatagramVideo::Route::Datagram&&c->datagram->ready();}
+    const std::lock_guard lock(c->queue_mutex);return c->ready&&!c->closed&&c->video_credit&&!c->video.has_value();
 }
 VideoSendDiagnostics Transport::video_send_diagnostics(const std::string& peer)const{
     const auto c=impl_->find(peer,true);if(!c)return {};
-    auto result=c->video_send.snapshot(transport_us());result.connection=c->token;result.inflight=c->video_inflight.load();result.owned_bytes=c->video_owned_bytes.load();return result;
+    auto result=c->video_send.snapshot(transport_us());result.connection=c->token;result.inflight=c->video_inflight.load();result.owned_bytes=c->video_owned_bytes.load();
+    if(c->datagram)c->datagram->diagnostics(result);return result;
 }
 std::string Transport::tcp_diagnostics(const std::string& peer)const{
     std::string text;
+    if(auto c=impl_->find(peer,true);c&&c->datagram)text+=c->datagram->diagnostics();
     const std::array channels{impl_->find(peer),impl_->find(peer,true),impl_->find_input(peer)};
     for(size_t channel=0;channel<channels.size();++channel){
         const auto& c=channels[channel];if(!c)continue;
@@ -1157,6 +1204,7 @@ bool Transport::send_feedback(const std::string& peer,const StreamFeedback& inpu
         if(auto video=impl_->find(peer,true)){
             const auto now=transport_us(),bytes=video->received_bytes->load(std::memory_order_relaxed);
             std::lock_guard lock(c->queue_mutex);
+            if(!c->feedback_expected_session||c->feedback_expected_session==f.session){
             if(c->feedback_session!=f.session||c->feedback_connection!=video->token||bytes<c->feedback_origin_bytes){
                 c->feedback_session=f.session;c->feedback_connection=video->token;
                 c->feedback_origin_bytes=bytes;c->feedback_origin_us=now;c->feedback_sequence=0;
@@ -1164,6 +1212,7 @@ bool Transport::send_feedback(const std::string& peer,const StreamFeedback& inpu
             f.rate_details=f.transport_details=true;
             f.feedback_sequence=++c->feedback_sequence;
             f.transport_bytes=bytes-c->feedback_origin_bytes;f.transport_sample_us=now-c->feedback_origin_us;
+            }
         }
     }
     Bytes b{Feedback};u64(b,f.session);u64(b,f.capture_time_us);u32(b,f.arrival_age_us);u32(b,f.service_us);u32(b,f.queue_us);b.push_back(f.recover?1:0);
@@ -1749,12 +1798,19 @@ bool Transport::self_test(std::string& result) {
         video->received_bytes->fetch_add(120000);
         if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||
            received.transport_bytes!=120000||received.feedback_sequence!=2||received.received_frames){result="Incomplete packet progress requires a complete picture";return false;}
+        StreamSettings active;active.session=report.session;active.receiver_millihz=60000;
+        if(!sender.request_stream("byte-peer",active)){result="Feedback ownership setup failed";return false;}
+        auto stale=report;stale.session=999;
+        if(!sender.send_feedback("byte-peer",stale)||!owner.dispatch(*control,control->control.back())||received.transport_details||
+            !sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||
+            received.transport_bytes!=120000||received.feedback_sequence!=3){result="Stale feedback reset the active byte baseline or report sequence";return false;}
         const auto extended=control->control.back();auto short_packet=extended;short_packet.pop_back();
         if(owner.dispatch(*control,short_packet)){result="Truncated byte feedback accepted";return false;}
         control->peer.features&=~FeatureByteFeedback;
         if(owner.dispatch(*control,extended)||!sender.send_feedback("byte-peer",report)||
            control->control.back().size()!=30||!owner.dispatch(*control,control->control.back())||received.transport_details){result="Byte feedback capability fallback failed";return false;}
         control->peer.features|=FeatureByteFeedback;report.session=701;
+        active.session=701;if(!sender.request_stream("byte-peer",active)){result="Next feedback session setup failed";return false;}
         if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||received.transport_bytes){result="New viewing session inherited old bytes";return false;}
         video->token=22;video->received_bytes->store(77);
         if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||received.transport_bytes||received.feedback_sequence!=1){result="Reconnected video inherited old progress";return false;}
@@ -2037,6 +2093,8 @@ bool Transport::self_test(std::string& result) {
         if(!left.start({"lan-a","LAN A","",0,false,true},sending,error)||!right.start({"lan-b","LAN B","",0,false,true},received,error)||
             !left.connect("127.0.0.1",right.impl_->cfg.port,id,error)){result="Keyless dual-channel handshake: "+error;return false;}
         left.rename("Renamed without disconnect");EncodedFrame picture;picture.width=2;picture.height=2;picture.keyframe=true;picture.data={1,2,3};
+        const auto packet_ready=Clock::now()+std::chrono::seconds(3);
+        while(!left.frame_ready(id)&&Clock::now()<packet_ready)Sleep(1);
         bool ok=left.send_clipboard(id,L"keyless")&&left.send_frame(id,picture);
         {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(3),[&]{return text&&frame&&renamed&&ready_notified&&version_received&&reverse_version;})&&ok;}
         Transport legacy;const auto old_key=generate_group_key();
@@ -2094,6 +2152,7 @@ bool Transport::self_test(std::string& result) {
             (cursor_count==1?(cursor.visible&&cursor.width==2&&cursor.hotspot_x==1&&cursor.mask==Bytes(8,0xff)):
              (!cursor.visible&&cursor.width==0));cv.notify_all();};
     std::string error,id; TransportConfig acfg{"test-a","Transport A",key,0,false}, bcfg{"test-b","Transport B",key,0,false};
+    acfg.datagram_video=false; // Mixed capability must retain the exact TCP timing/packet contract.
     if (!a.start(acfg,acb,error) || !b.start(bcfg,bcb,error) || !a.connect("127.0.0.1",b.impl_->cfg.port,id,error) || id != "test-b") { result = "Loopback connection failed: " + error; return false; }
     if(!a.connect("127.0.0.1",b.impl_->cfg.port,id,error)||id!="test-b"||
        !b.connect("127.0.0.1",a.impl_->cfg.port,id,error)||id!="test-a") {
@@ -2164,7 +2223,7 @@ bool Transport::self_test(std::string& result) {
             ++received;changed.notify_all();
         };
         std::string failure,peer;
-        if(!sender.start({"ordered-a","Ordered sender","",0,false,true},{},failure)||
+        if(!sender.start({"ordered-a","Ordered sender","",0,false,true,false},{},failure)||
             !receiver.start({"ordered-b","Ordered receiver","",0,false,true},callbacks,failure)||
             !sender.connect("127.0.0.1",receiver.impl_->cfg.port,peer,failure)){
             result="Overlapped ordering setup failed: "+failure;return false;
@@ -2195,7 +2254,7 @@ bool Transport::self_test(std::string& result) {
             changed.wait_for(lock,SessionStallTimeout+std::chrono::seconds(3),[&]{return release;});
         };
         std::string failure,peer;
-        if(!sender.start({"stalled-a","Stalled sender","",0,false,true},sending,failure)||
+        if(!sender.start({"stalled-a","Stalled sender","",0,false,true,false},sending,failure)||
             !receiver.start({"stalled-b","Stalled receiver","",0,false,true},receiving,failure)||
             !sender.connect("127.0.0.1",receiver.impl_->cfg.port,peer,failure)){
             result="Stalled video setup failed: "+failure;return false;
