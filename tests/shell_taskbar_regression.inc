@@ -8,7 +8,7 @@ void Shell::taskbar_interaction_self_test() {
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),
         "Refuse taskbar interaction regression on an interactive station");
     const int width=GetSystemMetrics(SM_CXSCREEN),height=GetSystemMetrics(SM_CYSCREEN);
-    WNDCLASSW c{};c.hInstance=GetModuleHandleW(nullptr);c.lpfnWndProc=DefWindowProcW;c.lpszClassName=L"HiveDesk.TaskbarInteractionFixture";RegisterClassW(&c);
+    WNDCLASSW c{};c.hInstance=GetModuleHandleW(nullptr);c.lpfnWndProc=DefWindowProcW;c.lpszClassName=L"Shell_TrayWnd";RegisterClassW(&c);
     const HWND tray=CreateWindowExW(0,c.lpszClassName,L"Generated taskbar",WS_POPUP|WS_VISIBLE,0,height-48,width,48,nullptr,nullptr,c.hInstance,nullptr);
     require(tray!=nullptr,"Create generated taskbar");
     const auto tray_above_panel=[&]{
@@ -16,9 +16,12 @@ void Shell::taskbar_interaction_self_test() {
         return false;
     };
     const auto begin=[&](bool summoned){
+        const bool fresh=!s.panel_mode||s.panel_closing;
         s.show_panel(2,summoned);s.panel_summoned=summoned;s.taskbar_focus_guard=true;
+        if(fresh)require(!s.taskbar_peek.active()&&!s.taskbar_peek.fading()&&!tray_above_panel(),
+            "Opening Hive retained the previous taskbar state instead of covering it");
         require(s.taskbar_peek.enter(s.panel,s.viewer,tray,false),"Acquire taskbar lease");s.publish_input();
-        require(tray_above_panel(),"Reopening Hive covered the taskbar's Start button");
+        require(tray_above_panel(),"Explicit corner trigger did not raise the taskbar");
     };
     const auto click=[&](POINT p,HWND target){
         const auto state=s.input_state();
@@ -50,7 +53,10 @@ void Shell::taskbar_interaction_self_test() {
         begin(summoned);
         click({20,height-20},tray); // Start overlaps the sidebar rectangle.
         begin(summoned);SendMessageW(s.owner,WM_HOTKEY,s.hotkey_id,0);SendMessageW(s.owner,WM_TIMER,2,0);
-        require(!s.taskbar_peek.active()&&!s.panel_mode,"Explicit Hive shortcut did not release taskbar mode");
+        require(s.taskbar_peek.active()&&!s.panel_mode,"Closing Hive restored taskbar state before the next opening");
+        SendMessageW(s.owner,WM_HOTKEY,s.hotkey_id,0);
+        require(!s.taskbar_peek.active()&&s.panel_mode==2&&!tray_above_panel(),"Hotkey reopening did not start clean");
+        s.hide_panel();
     }
     begin(false);
     s.update_panel_pointer({400,400},GetTickCount64());
@@ -58,6 +64,27 @@ void Shell::taskbar_interaction_self_test() {
     require(s.panel_closing&&s.taskbar_peek.active(),"Pointer-opened Hive no longer fades out on leaving its panel");
     SendMessageW(s.owner,WM_TIMER,2,0);
     require(!s.panel_mode&&s.taskbar_peek.active(),"Hover dismissal reset the taskbar lease");
+    // Mouse entry starts the same clean cycle as the hotkey. Expanding its
+    // preview is still part of that cycle, not an independent taskbar trigger.
+    s.show_panel(1);require(!s.taskbar_peek.active(),"Mouse preview retained the previous taskbar lease");
+    s.show_panel(2);require(!tray_above_panel(),"Expanding Hive did not cover the taskbar");
+    begin(true);
+    s.hide_panel(true,true);require(s.panel_closing&&s.taskbar_peek.active(),"Begin fade reversal fixture");
+    SendMessageW(s.owner,WM_HOTKEY,s.hotkey_id,0);
+    require(!s.taskbar_peek.active()&&!s.taskbar_peek.fading()&&!tray_above_panel(),"Reopening during fade retained taskbar state");
+    SendMessageW(s.owner,WM_TIMER,2,0);
+    require(s.panel_mode==2&&!s.panel_closing,"Old dismissal timer hid the newly opened Hive");
+    // Reopening with the pointer still in the bottom corner must remain clean
+    // until the next entry into that corner. Drive the actual timer path.
+    s.begin_panel_cycle({0,height-1});
+    s.update_panel_pointer({0,height-1},GetTickCount64());
+    require(!s.taskbar_peek.active()&&!s.taskbar_corner_armed,"Stationary corner pointer immediately undid the clean opening");
+    s.update_panel_pointer({100,height-1},GetTickCount64());
+    s.update_panel_pointer({0,height-1},GetTickCount64());
+    require(s.taskbar_peek.active()&&tray_above_panel(),"Fresh corner entry did not expose the taskbar");
+    s.update_panel_pointer({100,height-100},GetTickCount64());
+    require(s.taskbar_peek.active(),"Leaving the taskbar restored clean state before the next opening");
+    s.hide_panel(false,true);
     begin(true);
     s.remote=true;s.active_id="taskbar-fixture";s.input_session=71;s.publish_input();
     click({20,height-20},tray);

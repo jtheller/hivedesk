@@ -214,7 +214,7 @@ struct Shell::Impl {
     bool relative_mode=false,raw_mouse_available=false;
     PanelComposition composition;
     TaskbarPeek taskbar_peek;
-    bool taskbar_focus_guard=false;
+    bool taskbar_focus_guard=false,taskbar_corner_armed=true;
     COLORREF accent=GetSysColor(COLOR_HIGHLIGHT);
     uint32_t remote_width=0,remote_height=0;
     int panel_mode=0,panel_width=200,panel_height=0,hovered=-1,scroll=0;
@@ -532,10 +532,17 @@ struct Shell::Impl {
         if(SUCCEEDED(DwmGetColorizationColor(&value,&opaque)))accent=RGB((value>>16)&255,(value>>8)&255,value&255);
         if(panel)InvalidateRect(panel,nullptr,FALSE);
     }
+    void begin_panel_cycle(POINT pointer) {
+        // A new opening owns a fresh taskbar state. Pointer exit during the
+        // previous opening never revokes the lease, but reopening always does.
+        taskbar_peek.reset();
+        taskbar_corner_armed=!TaskbarPeek::corner(pointer,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),dpi);
+    }
     void show_panel(int mode,bool hotkey=false) {
         if(settings&&IsWindowVisible(settings))return;
         if(panel_mode==mode&&!panel_closing)return;
         const bool entering=panel_mode==0,reversing=panel_closing;const int previous_height=panel_height;
+        if(entering||reversing){POINT pointer{};GetCursorPos(&pointer);begin_panel_cycle(pointer);}
         panel_closing=false;KillTimer(owner,2);panel_mode=mode;hovered=-1;outside_since=0;
         panel_width=px(200);panel_height=mode==1?tile_height()+px(24):GetSystemMetrics(SM_CYSCREEN);
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE);
@@ -548,11 +555,15 @@ struct Shell::Impl {
         }
         catch(const std::exception&){hide_panel();return;}
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-        taskbar_peek.keep_panel_below();
         publish_input();
         confine_mouse();
         if(entering&&callbacks.panel_opened)callbacks.panel_opened();
         publish_visible();
+    }
+    void toggle_panel() {
+        if(panel_mode&&!panel_closing)hide_panel(true,taskbar_peek.active());
+        else{show_panel(2,true);panel_summoned=panel_mode!=0;}
+        publish_input();
     }
     int card_at(POINT p) const {
         if(p.x<px(12)||p.x>=panel_width-px(12)||p.y<px(12))return -1;
@@ -609,7 +620,9 @@ struct Shell::Impl {
         taskbar_peek.tick();
         if(panel_mode==2&&!panel_closing&&pressed_card<0){
             const bool trigger=TaskbarPeek::corner(p,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),dpi);
-            if(!taskbar_peek.active()&&trigger){
+            if(!trigger)taskbar_corner_armed=true;
+            if(!taskbar_peek.active()&&trigger&&taskbar_corner_armed){
+                taskbar_corner_armed=false;
                 taskbar_focus_guard=true;publish_input(true);ClipCursor(nullptr);
                 if(!taskbar_peek.enter(panel,viewer))taskbar_focus_guard=false;
                 publish_input();
@@ -827,7 +840,7 @@ struct Shell::Impl {
             if(message==s->taskbar_created&&s->taskbar_created){s->tray_present=false;s->tray();return 0;}
             switch(message) {
             case WM_HOTKEY:
-                if(int(w)==s->hotkey_id){if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;}s->publish_input();}return 0;
+                if(int(w)==s->hotkey_id)s->toggle_panel();return 0;
             case CaptureActionMessage:{
                 const auto action=CaptureAction(w);
                 if(action==CaptureAction::KickController){if(!s->shutting_down&&s->callbacks.kick_controller)s->callbacks.kick_controller();return 0;}
@@ -837,7 +850,7 @@ struct Shell::Impl {
                 case CaptureAction::Failed:s->local(true);s->status=L"Input channel stalled. Returned to this computer.";break;
                 case CaptureAction::HidePanel:s->hide_panel();break;
                 case CaptureAction::HidePanelAnimated:s->hide_panel(true,s->taskbar_peek.active());break;
-                case CaptureAction::Summon:if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;}s->publish_input();break;
+                case CaptureAction::Summon:s->toggle_panel();break;
                 default:break;
                 }return 0;
             }
