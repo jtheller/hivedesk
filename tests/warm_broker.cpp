@@ -12,7 +12,7 @@ namespace hive {
 // an existing controller cannot be displaced. No input/hooks/clipboard calls.
 int warm_broker_check(bool peek){
     std::mutex mutex;std::condition_variable changed;
-    unsigned frames=0;uint64_t first=0,second=0;bool fresh_idr=false;
+    unsigned frames=0,activation_baseline=UINT_MAX;uint64_t first=0,second=0;bool fresh_idr=false;
     HostBridge host; // Join callbacks before their state is destroyed.
     try{
         StreamSettings settings;settings.session=GetTickCount64();settings.receiver_millihz=60000;settings.warm=true;
@@ -20,7 +20,7 @@ int warm_broker_check(bool peek){
         if(!host.start(settings,[&](EncodedFrame frame){
             std::lock_guard lock(mutex);
             if(frames==0)first=frame.sequence;
-            if(frames==1){second=frame.sequence;fresh_idr=frame.keyframe;}
+            if(frames==activation_baseline){second=frame.sequence;fresh_idr=frame.keyframe;}
             ++frames;changed.notify_all();
         },error))throw std::runtime_error(error);
         auto wait=[&](unsigned count,const char* message){
@@ -37,10 +37,13 @@ int warm_broker_check(bool peek){
             std::this_thread::sleep_for(std::chrono::milliseconds(300));unsigned paused;{std::lock_guard lock(mutex);paused=frames;}
             std::this_thread::sleep_for(std::chrono::milliseconds(300));{std::lock_guard lock(mutex);if(frames!=paused)throw std::runtime_error("Preview pause kept encoding");}
             if(!host.preview(true))throw std::runtime_error("Preview resume failed");wait(paused+3,"Preview resume stalled");
+            if(!host.preview(false))throw std::runtime_error("Final preview pause failed");
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
             log("PASS installed read-only preview: continuous pictures, pause and resume; no input or clipboard calls.");
         }
+        {std::lock_guard lock(mutex);activation_baseline=frames;}
         if(!host.activate())throw std::runtime_error("SYSTEM broker activation acknowledgement failed");
-        wait(2,"Activated SYSTEM encoder produced no fresh picture");
+        wait(activation_baseline+1,"Activated SYSTEM encoder produced no fresh picture");
         host.stop();
         if(!fresh_idr||second<=first)throw std::runtime_error("Promotion lost fresh IDR or frame sequence");
         log("PASS installed warm broker: trusted app, SYSTEM first picture, paused encoder, Activate/Activated roundtrip, resumed fresh IDR and increasing sequence; no input or clipboard.");
