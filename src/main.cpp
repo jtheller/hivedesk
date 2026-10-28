@@ -27,7 +27,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace hive {int host_check();int warm_broker_check(bool peek=false);}
+namespace hive {int prelogon_main(DWORD parent);int host_check();int warm_broker_check(bool peek=false);}
 namespace {
 using MonitorSide=hive::Telemetry::Side;
 class App {
@@ -984,9 +984,11 @@ private:
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false,warm_check=false,peek_check=false;
+    DWORD prelogon_parent=0;
     HANDLE previous=nullptr;bool valid_arguments=true,recover=false,manual_restart=false;
     if(arguments){for(int i=1;i<count;++i){
-        if(wcscmp(arguments[i],L"--background")==0)background=true;
+        if(wcscmp(arguments[i],L"--prelogon")==0){if(++i>=count){valid_arguments=false;break;}wchar_t* end=nullptr;prelogon_parent=wcstoul(arguments[i],&end,10);if(!prelogon_parent||!end||*end||count!=3){valid_arguments=false;break;}}
+        else if(wcscmp(arguments[i],L"--background")==0)background=true;
         else if(wcscmp(arguments[i],L"--quiet")==0)quiet=true;
         else if(wcscmp(arguments[i],L"--host-check")==0)host_check=true;
         else if(wcscmp(arguments[i],L"--warm-broker-check")==0)warm_check=true;
@@ -996,6 +998,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
         else if(wcscmp(arguments[i],L"--recover-after")==0){recover=true;if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
     }LocalFree(arguments);}open_settings=!background&&!quiet;
     if(!valid_arguments||(manual_restart&&previous))return ERROR_INVALID_PARAMETER;
+    if(prelogon_parent){try{return hive::prelogon_main(prelogon_parent);}catch(const std::exception& e){hive::update::log(std::string("Prelogon fatal: ")+e.what());return 1;}}
     // Also works when the tray's message loop cannot open its context menu.
     if(manual_restart){
         quiet=true;open_settings=false;

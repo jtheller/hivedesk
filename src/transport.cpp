@@ -21,6 +21,7 @@
 #include "video_write_progress.h"
 #include "input_send_window.h"
 #include "datagram_video.h"
+#include "network_watch.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -45,7 +46,6 @@ uint64_t transport_us(Clock::time_point point=Clock::now()){return uint64_t(std:
 constexpr uint32_t kMaxFrame = 16 * 1024 * 1024;
 constexpr uint32_t kMaxClipboard = 1024 * 1024;
 constexpr uint32_t kMaxPacket = kMaxFrame + 64;
-constexpr uint16_t kDiscoveryPort = 47979;
 constexpr size_t kMaxConnections = 128;
 // Unsent freshness is tuning; the seconds-long write watchdog is session failure
 // policy. TCP cannot skip an already submitted packet halfway through.
@@ -124,7 +124,7 @@ struct Agreement {
         if(secret)BCryptDestroySecret(secret);if(peer)BCryptDestroyKey(peer);return ok;
     }
 };
-struct LanAddress {uint32_t address,mask;};
+struct LanAddress {uint32_t address,mask;auto operator<=>(const LanAddress&)const=default;};
 std::vector<LanAddress> lan_addresses(){
     ULONG size=16384;std::vector<uint8_t> storage(size);
     ULONG result=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data()),&size);
@@ -137,7 +137,7 @@ std::vector<LanAddress> lan_addresses(){
             const auto ip=ntohl(reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr)->sin_addr.s_addr);
             addresses.push_back({ip,0xffffffffu<<(32-unicast->OnLinkPrefixLength)});
         }
-    }return addresses;
+    }std::sort(addresses.begin(),addresses.end());return addresses;
 }
 bool on_link(const std::string& address){
     IN_ADDR parsed{};if(inet_pton(AF_INET,address.c_str(),&parsed)!=1)return false;
@@ -608,7 +608,11 @@ struct Transport::Impl {
     TransportConfig cfg; TransportCallbacks callbacks; Key group{};
     std::atomic<bool> running{false}; bool winsock = false;std::atomic<uint64_t> connection_sequence{0};
     std::atomic<SOCKET> listener{INVALID_SOCKET}, discovery{INVALID_SOCKET};
-    std::thread accept_thread, discovery_thread;
+    std::thread accept_thread, discovery_thread, discovery_dial_thread;
+    std::mutex listener_mutex;
+    std::condition_variable discovery_cv;
+    std::deque<Peer> discovery_pending;
+    std::atomic<bool> refresh_network{false};
     mutable std::mutex mutex; std::mutex thread_mutex, connect_mutex,clipboard_connect_mutex,config_mutex; std::vector<std::shared_ptr<Conn>> connections;
     std::map<std::string,Pair> connected;
     std::map<std::string,std::chrono::steady_clock::time_point> next_attempt;
@@ -732,10 +736,29 @@ struct Transport::Impl {
         if (!running || connections.size() >= kMaxConnections) { c->close(); return {}; }
         connections.push_back(c); return c;
     }
+    bool open_listener() {
+        std::lock_guard lock(listener_mutex);
+        if(!running)return false;
+        SOCKET s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+        if(s==INVALID_SOCKET)return false;
+        BOOL exclusive=TRUE;setsockopt(s,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<const char*>(&exclusive),sizeof(exclusive));
+        sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=INADDR_ANY;address.sin_port=htons(cfg.port);
+        if(bind(s,reinterpret_cast<sockaddr*>(&address),sizeof(address))||listen(s,SOMAXCONN)) {closesocket(s);return false;}
+        int size=sizeof(address);getsockname(s,reinterpret_cast<sockaddr*>(&address),&size);
+        {std::lock_guard config_lock(config_mutex);cfg.port=ntohs(address.sin_port);}
+        listener=s;refresh_network=true;return true;
+    }
     void accept_loop() {
         while (running) {
+            if(listener==INVALID_SOCKET&&!open_listener()) {
+                std::unique_lock lock(sleep_mutex);sleep_cv.wait_for(lock,std::chrono::milliseconds(500),[&]{return !running;});continue;
+            }
             sockaddr_in address{}; int size = sizeof(address); SOCKET s = accept(listener.load(),reinterpret_cast<sockaddr*>(&address),&size);
-            if (s == INVALID_SOCKET) break;
+            if (s == INVALID_SOCKET) {
+                {std::lock_guard lock(listener_mutex);auto failed=listener.exchange(INVALID_SOCKET);if(failed!=INVALID_SOCKET)closesocket(failed);}
+                if(running){status("TCP listener interrupted; retrying.");std::unique_lock lock(sleep_mutex);sleep_cv.wait_for(lock,std::chrono::milliseconds(500),[&]{return !running;});}
+                continue;
+            }
             char ip[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET,&address.sin_addr,ip,sizeof(ip)); auto c = add(s,ip); if (!c) continue;
             std::lock_guard thread_lock(thread_mutex);
             if (!running) { c->close(); break; }
@@ -840,7 +863,12 @@ struct Transport::Impl {
         }
         case InputReady: {
             const auto session=r.qword();const auto accepted=r.byte();if(!session||accepted>1||!r.end())return false;
-            {std::lock_guard lock(c.queue_mutex);if(session==c.input_send.session()&&!c.input_ending)c.input_enabled=accepted!=0;}
+            {std::lock_guard lock(c.queue_mutex);if(session==c.input_send.session()&&!c.input_ending){
+                c.input_enabled=accepted!=0;
+                // A declined warm/startup request is complete, not forever
+                // pending. Promotion may retry authority for this same lease.
+                if(!accepted){c.input_ending=true;c.input_send.finish();}
+            }}
             c.queue_cv.notify_all();return true;
         }
         case InputData: {
@@ -977,19 +1005,88 @@ struct Transport::Impl {
         Bytes b{'H','I','V','D',uint8_t(cfg.automatic_lan?2:1)}; str(b,cfg.device_id); str(b,cfg.device_name); u16(b,cfg.port);
         if(!cfg.automatic_lan){Key proof{};if(!hmac(group,b,proof))return {};b.insert(b.end(),proof.begin(),proof.end());}return b;
     }
-    void discovery_loop() {
-        auto last = std::chrono::steady_clock::now()-std::chrono::seconds(3);
-        while (running) {
-            SOCKET s = discovery.load(); auto now = std::chrono::steady_clock::now();
-            if (now-last >= std::chrono::seconds(2)) {
-                Bytes b = announcement(); sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(kDiscoveryPort); to.sin_addr.s_addr = INADDR_BROADCAST;
-                if (!b.empty()) {
-                    std::set<uint32_t> destinations{INADDR_BROADCAST};
-                    for(const auto& local:lan_addresses())if(local.mask!=0xffffffffu)destinations.insert(htonl(local.address|~local.mask));
-                    for(const auto destination:destinations){to.sin_addr.s_addr=destination;sendto(s,reinterpret_cast<const char*>(b.data()),int(b.size()),0,reinterpret_cast<sockaddr*>(&to),sizeof(to));}
-                }last = now;
+    void discovery_dial_loop() {
+        while(running){
+            Peer peer;
+            {std::unique_lock lock(mutex);discovery_cv.wait(lock,[&]{return !running||!discovery_pending.empty();});
+                if(!running)break;
+                peer=discovery_pending.front();discovery_pending.pop_front();
+                const auto current=connected.find(peer.id);
+                if(current!=connected.end()&&complete(current->second))continue;
             }
-            fd_set read; FD_ZERO(&read); FD_SET(s,&read); timeval timeout{0,250000}; if (select(0,&read,nullptr,nullptr,&timeout) <= 0) continue;
+            std::string id,error;
+            if(!connect(peer.address,peer.port,id,error)&&running)status("Discovered peer connection failed: "+peer.name+"; "+error);
+        }
+    }
+    void discovery_loop() {
+        NetworkWatch watch;watch.start();
+        auto next_broadcast=Clock::now(),burst_until=next_broadcast+std::chrono::seconds(10),next_poll=next_broadcast;
+        auto next_bind=next_broadcast,last_rebind=next_broadcast-std::chrono::seconds(1);
+        bool rebind=true,reported_bind=false;std::vector<LanAddress> addresses;
+        std::vector<SOCKET> senders;
+        auto close_senders=[&]{for(auto s:senders)if(s!=INVALID_SOCKET)closesocket(s);senders.clear();};
+        while(running){
+            auto now=Clock::now();const bool event=watch.changed(),refresh=refresh_network.exchange(false);const bool notified=event||refresh;
+            if(notified||now>=next_poll){
+                auto current=lan_addresses();next_poll=now+std::chrono::seconds(5);
+                if(notified||current!=addresses){
+                    const bool removed=!addresses.empty()&&current!=addresses;
+                    addresses=std::move(current);rebind=true;burst_until=now+std::chrono::seconds(10);next_broadcast=now;
+                    {std::lock_guard lock(mutex);next_attempt.clear();discovery_pending.clear();
+                        // Route/metric changes alone must not break healthy streams.
+                        // Retire only sockets whose bound local address disappeared.
+                        if(removed)for(const auto& c:connections){
+                            if(c->closed||!c->ready)continue;
+                            IN_ADDR parsed{};inet_pton(AF_INET,c->local_ipv4().c_str(),&parsed);
+                            const auto local=ntohl(parsed.s_addr);
+                            if(local&&(local>>24)!=127&&std::none_of(addresses.begin(),addresses.end(),[&](const auto& a){return a.address==local;}))c->close();
+                        }
+                    }
+                }
+            }
+            if(rebind&&now-last_rebind>=std::chrono::milliseconds(250)){
+                auto old=discovery.exchange(INVALID_SOCKET);if(old!=INVALID_SOCKET)closesocket(old);
+                close_senders();last_rebind=now;next_bind=now;rebind=false;
+                // Bind each announcement source to its actual interface address.
+                // A wildcard send can otherwise leave through the wrong NIC.
+                for(const auto& local:addresses){
+                    SOCKET out=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+                    if(out==INVALID_SOCKET){senders.push_back(INVALID_SOCKET);continue;}
+                    BOOL yes=TRUE;setsockopt(out,SOL_SOCKET,SO_BROADCAST,reinterpret_cast<const char*>(&yes),sizeof(yes));
+                    sockaddr_in bind_to{};bind_to.sin_family=AF_INET;bind_to.sin_addr.s_addr=htonl(local.address);
+                    if(bind(out,reinterpret_cast<sockaddr*>(&bind_to),sizeof(bind_to))){closesocket(out);out=INVALID_SOCKET;}
+                    senders.push_back(out);
+                }
+            }
+            SOCKET s=discovery.load();
+            if(s==INVALID_SOCKET&&now>=next_bind){
+                s=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+                BOOL yes=TRUE;setsockopt(s,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const char*>(&yes),sizeof(yes));setsockopt(s,SOL_SOCKET,SO_BROADCAST,reinterpret_cast<const char*>(&yes),sizeof(yes));
+                sockaddr_in local{};local.sin_family=AF_INET;local.sin_port=htons(cfg.discovery_port);
+                if(s==INVALID_SOCKET||bind(s,reinterpret_cast<sockaddr*>(&local),sizeof(local))){
+                    if(s!=INVALID_SOCKET)closesocket(s);s=INVALID_SOCKET;
+                    if(!reported_bind){status("LAN discovery listener unavailable; retrying every 500 ms.");reported_bind=true;}
+                }else{discovery=s;reported_bind=false;next_broadcast=now;}
+                next_bind=now+std::chrono::milliseconds(500);
+            }
+            if(s==INVALID_SOCKET){std::unique_lock lock(sleep_mutex);sleep_cv.wait_for(lock,std::chrono::milliseconds(100),[&]{return !running;});continue;}
+            if(!rebind&&now>=next_broadcast&&listener!=INVALID_SOCKET){
+                const auto bytes=announcement();sockaddr_in to{};to.sin_family=AF_INET;to.sin_port=htons(cfg.discovery_port);
+                if(!bytes.empty()){
+                    // Keep limited broadcast for hosts with unusual prefix/route
+                    // setup; directed broadcasts cover every usable IPv4 NIC.
+                    to.sin_addr.s_addr=INADDR_BROADCAST;
+                    sendto(s,reinterpret_cast<const char*>(bytes.data()),int(bytes.size()),0,reinterpret_cast<sockaddr*>(&to),sizeof(to));
+                    for(size_t i=0;i<addresses.size()&&i<senders.size();++i)if(senders[i]!=INVALID_SOCKET){
+                        to.sin_addr.s_addr=addresses[i].mask==0xffffffffu?INADDR_BROADCAST:htonl(addresses[i].address|~addresses[i].mask);
+                        sendto(senders[i],reinterpret_cast<const char*>(bytes.data()),int(bytes.size()),0,reinterpret_cast<sockaddr*>(&to),sizeof(to));
+                    }
+                }
+                next_broadcast=now+(now<burst_until?std::chrono::milliseconds(250):std::chrono::milliseconds(2000));
+            }
+            fd_set read;FD_ZERO(&read);FD_SET(s,&read);timeval timeout{0,100000};
+            const auto selected=select(0,&read,nullptr,nullptr,&timeout);
+            if(selected==SOCKET_ERROR){rebind=true;std::unique_lock lock(sleep_mutex);sleep_cv.wait_for(lock,std::chrono::milliseconds(50),[&]{return !running;});continue;}if(!selected)continue;
             std::array<uint8_t,1024> buffer{}; sockaddr_in remote{}; int len = sizeof(remote); int n = recvfrom(s,reinterpret_cast<char*>(buffer.data()),int(buffer.size()),0,reinterpret_cast<sockaddr*>(&remote),&len);
             if (n < (cfg.automatic_lan?13:40) || n > 512) continue;
             Bytes b(buffer.begin(),buffer.begin()+n-(cfg.automatic_lan?0:32));
@@ -999,17 +1096,21 @@ struct Transport::Impl {
             if (!r.end() || !peer.port || !text_ok(peer.id,128) || !text_ok(peer.name,256) || peer.id == cfg.device_id || cfg.device_id > peer.id) continue;
             char ip[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET,&remote.sin_addr,ip,sizeof(ip)); peer.address = ip;
             if(cfg.automatic_lan&&!on_link(peer.address))continue;
-            { std::lock_guard lock(mutex);
-                const auto retry=next_attempt.find(peer.id);if(retry!=next_attempt.end()&&now<retry->second)continue;
-                const auto current=connected.find(peer.id);
-                if(current!=connected.end()&&complete(current->second))continue;
-                next_attempt[peer.id]=now+std::chrono::seconds(3);
+            {
+                std::lock_guard lock(mutex);
+                const auto key=peer.id+"@"+peer.address;
+                const auto retry=next_attempt.find(key);if(retry!=next_attempt.end()&&now<retry->second)continue;
+                const auto current=connected.find(peer.id);if(current!=connected.end()&&complete(current->second))continue;
+                if(next_attempt.size()>512)next_attempt.clear();
+                next_attempt[key]=now+std::chrono::seconds(1);
+                auto queued=std::find_if(discovery_pending.begin(),discovery_pending.end(),[&](const Peer& p){return p.id==peer.id&&p.address==peer.address;});
+                if(queued!=discovery_pending.end())*queued=peer;else if(discovery_pending.size()<64)discovery_pending.push_back(peer);
             }
-            // Rebuild the connection after a peer restarts. A new announcement
-            // supplies its current address/port; retry failures without a tight loop.
-            std::string id, error; if (!connect(peer.address,peer.port,id,error) && running) status("Discovered peer connection failed: " + peer.name+"; "+error);
+            discovery_cv.notify_one();
         }
+        auto old=discovery.exchange(INVALID_SOCKET);if(old!=INVALID_SOCKET)closesocket(old);close_senders();
     }
+
 };
 
 Transport::Transport() : impl_(std::make_unique<Impl>()) {}
@@ -1019,18 +1120,15 @@ bool Transport::start(const TransportConfig& cfg, TransportCallbacks callbacks, 
     if (!text_ok(cfg.device_id,128) || !text_ok(cfg.device_name,256) || (!cfg.automatic_lan&&!derive_network_key(cfg.group_key,p.group))) { error = "Invalid device identity or legacy Network Key."; return false; }
     WSADATA ws{}; if (WSAStartup(MAKEWORD(2,2),&ws) != 0) { error = "Winsock initialization failed."; return false; }
     p.winsock = true; p.cfg = cfg; p.callbacks = std::move(callbacks);
-    SOCKET s = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); p.listener = s;
-    BOOL exclusive = TRUE; setsockopt(s,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<const char*>(&exclusive),sizeof(exclusive));
-    sockaddr_in bind_address{}; bind_address.sin_family = AF_INET; bind_address.sin_addr.s_addr = INADDR_ANY; bind_address.sin_port = htons(cfg.port);
-    if (s == INVALID_SOCKET || bind(s,reinterpret_cast<sockaddr*>(&bind_address),sizeof(bind_address)) != 0 || listen(s,SOMAXCONN) != 0) { error = "Cannot listen on the configured TCP port."; stop(); return false; }
-    int length = sizeof(bind_address); getsockname(s,reinterpret_cast<sockaddr*>(&bind_address),&length); p.cfg.port = ntohs(bind_address.sin_port);
-    p.running = true;
-    p.accept_thread = std::thread([&p] { p.accept_loop(); });
-    if (cfg.discovery) {
-        s = socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP); p.discovery = s; BOOL yes = TRUE; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const char*>(&yes),sizeof(yes)); setsockopt(s,SOL_SOCKET,SO_BROADCAST,reinterpret_cast<const char*>(&yes),sizeof(yes));
-        bind_address.sin_port = htons(kDiscoveryPort);
-        if (s != INVALID_SOCKET && bind(s,reinterpret_cast<sockaddr*>(&bind_address),sizeof(bind_address)) == 0) p.discovery_thread = std::thread([&p] { p.discovery_loop(); });
-        else { s = p.discovery.exchange(INVALID_SOCKET); if (s != INVALID_SOCKET) closesocket(s); p.status("LAN discovery unavailable. Check the local network and firewall."); }
+    p.running=true;
+    if(!p.open_listener()){
+        if(!cfg.discovery){error="Cannot listen on the configured TCP port.";stop();return false;}
+        p.status("TCP listener unavailable; retrying every 500 ms.");
+    }
+    p.accept_thread=std::thread([&p]{p.accept_loop();});
+    if(cfg.discovery){
+        p.discovery_dial_thread=std::thread([&p]{p.discovery_dial_loop();});
+        p.discovery_thread=std::thread([&p]{p.discovery_loop();});
     }
     return true;
 }
@@ -1049,15 +1147,16 @@ void Transport::stop() {
             if (std::chrono::steady_clock::now() >= deadline) break;
         }
     }
-    p.running = false; p.sleep_cv.notify_all();
-    for (auto* slot : {&p.listener,&p.discovery}) { SOCKET s = slot->exchange(INVALID_SOCKET); if (s != INVALID_SOCKET) { shutdown(s,SD_BOTH); closesocket(s); } }
+    p.running = false; p.sleep_cv.notify_all();p.discovery_cv.notify_all();
+    {std::lock_guard lock(p.listener_mutex);SOCKET s=p.listener.exchange(INVALID_SOCKET);if(s!=INVALID_SOCKET){shutdown(s,SD_BOTH);closesocket(s);}}
     { std::lock_guard lock(p.mutex); for (auto& c : p.connections) c->close(); }
     if (p.accept_thread.joinable()) p.accept_thread.join(); if (p.discovery_thread.joinable()) p.discovery_thread.join();
+    if(p.discovery_dial_thread.joinable())p.discovery_dial_thread.join();
     // Workers may create their writer only while holding thread_mutex and while running is true.
     { std::lock_guard lock(p.thread_mutex); }
     std::vector<std::shared_ptr<Impl::Conn>> connections; { std::lock_guard lock(p.mutex); connections = p.connections; }
     for (auto& c : connections) { c->close(); if (c->reader.joinable()) c->reader.join(); if (c->writer.joinable()) c->writer.join(); }
-    { std::lock_guard lock(p.mutex); p.connected.clear(); p.connections.clear(); p.next_attempt.clear(); }
+    { std::lock_guard lock(p.mutex); p.connected.clear(); p.connections.clear(); p.next_attempt.clear();p.discovery_pending.clear(); }
     SecureZeroMemory(p.group.data(),p.group.size()); SecureZeroMemory(p.cfg.group_key.data(),p.cfg.group_key.size()); p.cfg.group_key.clear(); if (p.winsock) { WSACleanup(); p.winsock = false; }
 }
 bool Transport::connect(const std::string& address, uint16_t port, std::string& peer_id, std::string& error) { return impl_->connect(address,port,peer_id,error); }
@@ -1339,9 +1438,16 @@ std::string Transport::generate_group_key() {
 }
 
 bool Transport::discovery_self_test(std::string& result){
+    // Broadcast on an ephemeral discovery port so generated test machines
+    // never appear in the installed user's real Hive.
+    WSADATA ws{};if(WSAStartup(MAKEWORD(2,2),&ws)){result="FAIL: Winsock";return false;}
+    SOCKET probe=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);sockaddr_in address{};address.sin_family=AF_INET;int size=sizeof(address);
+    const bool bound=probe!=INVALID_SOCKET&&bind(probe,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0&&getsockname(probe,reinterpret_cast<sockaddr*>(&address),&size)==0;
+    if(probe!=INVALID_SOCKET)closesocket(probe);WSACleanup();if(!bound){result="FAIL: isolated discovery port";return false;}
+    const auto discovery_port=ntohs(address.sin_port);
     Transport a,b;std::string error;const auto suffix=std::to_string(GetCurrentProcessId());
     const std::string aid="discovery-a-"+suffix,bid="discovery-b-"+suffix;
-    if(!a.start({aid,"Discovery A","",0,true,true},{},error)||!b.start({bid,"Discovery B","",0,true,true},{},error)){result="FAIL: "+error;return false;}
+    if(!a.start({aid,"Discovery A","",0,true,true,true,discovery_port},{},error)||!b.start({bid,"Discovery B","",0,true,true,true,discovery_port},{},error)){result="FAIL: "+error;return false;}
     auto paired=[&]{
       const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
       while(std::chrono::steady_clock::now()<deadline){
@@ -1357,15 +1463,53 @@ bool Transport::discovery_self_test(std::string& result){
     if(!paired()){result="FAIL: initial automatic discovery did not complete.";return false;}
     const auto first_token=a.connection_token(bid);if(!first_token){result="FAIL: paired connection has no token.";return false;}
     b.stop();
-    if(!b.start({bid,"Discovery B restarted","",0,true,true},{},error)||!paired()){result="FAIL: listener restart was not rediscovered while initiator stayed running: "+error;return false;}
+    if(!b.start({bid,"Discovery B restarted","",0,true,true,true,discovery_port},{},error)||!paired()){result="FAIL: listener restart was not rediscovered while initiator stayed running: "+error;return false;}
     if(a.connection_token(bid)==first_token){result="FAIL: restart reused the old connection token.";return false;}
     a.stop();
-    if(!a.start({aid,"Discovery A restarted","",0,true,true},{},error)||!paired()){result="FAIL: initiator restart was not rediscovered while listener stayed running: "+error;return false;}
+    if(!a.start({aid,"Discovery A restarted","",0,true,true,true,discovery_port},{},error)||!paired()){result="FAIL: initiator restart was not rediscovered while listener stayed running: "+error;return false;}
     const auto broken=b.impl_->find(aid,true);if(!broken){result="FAIL: missing video channel before teardown check.";return false;}broken->close();
     if(!paired()){result="FAIL: a closed video channel left an unusable control-only peer.";return false;}
     result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
 }
 bool Transport::self_test(std::string& result) {
+    {
+        // Real socket failures on isolated ephemeral ports: never close the
+        // installed agent's listeners or change a physical NIC for this test.
+        WSADATA ws{};if(WSAStartup(MAKEWORD(2,2),&ws)){result="Recovery test Winsock startup";return false;}
+        struct Sockets{SOCKET tcp=INVALID_SOCKET,udp=INVALID_SOCKET;~Sockets(){if(tcp!=INVALID_SOCKET)closesocket(tcp);if(udp!=INVALID_SOCKET)closesocket(udp);WSACleanup();}}held;
+        auto reserve=[&](int type,SOCKET& socket_value,uint16_t& port){
+            socket_value=socket(AF_INET,type,type==SOCK_STREAM?IPPROTO_TCP:IPPROTO_UDP);
+            BOOL yes=TRUE;setsockopt(socket_value,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<const char*>(&yes),sizeof(yes));
+            sockaddr_in local{};local.sin_family=AF_INET;int size=sizeof(local);
+            if(socket_value==INVALID_SOCKET||bind(socket_value,reinterpret_cast<sockaddr*>(&local),sizeof(local))||getsockname(socket_value,reinterpret_cast<sockaddr*>(&local),&size))return false;
+            port=ntohs(local.sin_port);return type!=SOCK_STREAM||listen(socket_value,SOMAXCONN)==0;
+        };
+        TransportConfig cfg{"recovery-listener","Listener recovery",generate_group_key(),0,true,false};
+        if(!reserve(SOCK_STREAM,held.tcp,cfg.port)||!reserve(SOCK_DGRAM,held.udp,cfg.discovery_port)){result="Cannot reserve isolated recovery ports";return false;}
+        Transport recovering;std::string error;
+        if(!recovering.start(cfg,{},error)){result="Transient listener conflict still fails startup: "+error;return false;}
+        Sleep(150);
+        if(recovering.impl_->listener!=INVALID_SOCKET||recovering.impl_->discovery!=INVALID_SOCKET){result="Exclusive conflict was not exercised";return false;}
+        closesocket(held.tcp);held.tcp=INVALID_SOCKET;closesocket(held.udp);held.udp=INVALID_SOCKET;
+        auto deadline=Clock::now()+std::chrono::seconds(3);
+        while(Clock::now()<deadline&&(recovering.impl_->listener==INVALID_SOCKET||recovering.impl_->discovery==INVALID_SOCKET))Sleep(20);
+        if(recovering.impl_->listener==INVALID_SOCKET||recovering.impl_->discovery==INVALID_SOCKET){result="TCP/UDP listeners did not recover automatically";return false;}
+        Transport peer;auto peer_cfg=cfg;peer_cfg.device_id="recovery-peer";peer_cfg.port=0;peer_cfg.discovery=false;
+        if(!peer.start(peer_cfg,{},error)){result=error;return false;}
+        std::string id;if(!peer.connect("127.0.0.1",cfg.port,id,error)){result="Recovered listener cannot pair: "+error;return false;}
+        const auto token=peer.connection_token(cfg.device_id);
+        for(int i=0;i<20;++i){recovering.impl_->refresh_network=true;Sleep(25);}
+        if(!token||peer.connection_token(cfg.device_id)!=token){result="Topology notification burst broke a healthy pair";return false;}
+        {std::lock_guard lock(recovering.impl_->listener_mutex);const auto failed=recovering.impl_->listener.exchange(INVALID_SOCKET);shutdown(failed,SD_BOTH);closesocket(failed);}
+        deadline=Clock::now()+std::chrono::seconds(3);
+        while(Clock::now()<deadline&&recovering.impl_->listener==INVALID_SOCKET)Sleep(20);
+        if(recovering.impl_->listener==INVALID_SOCKET||peer.connection_token(cfg.device_id)!=token){result="Failed accept socket did not recover without breaking the live pair";return false;}
+        Transport newcomer;peer_cfg.device_id="recovery-newcomer";
+        if(!newcomer.start(peer_cfg,{},error)||!newcomer.connect("127.0.0.1",cfg.port,id,error)){result="Reopened listener did not accept a new peer: "+error;return false;}
+        const auto stop_started=Clock::now();recovering.stop();
+        if(Clock::now()-stop_started>std::chrono::seconds(3)){result="Topology/discovery cancellation exceeded stop deadline";return false;}
+    }
+
     {
         VideoWriteProgress progress;progress.reset(0);
         if(progress.due(499999)||!progress.due(500000)||progress.expired(1999999)){
@@ -2185,6 +2329,7 @@ bool Transport::self_test(std::string& result) {
     ok=b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000,500,734,10000,true})&&ok;
     {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_snapshot&&got_cursor&&got_diagnostics&&got_encode_diagnostics;})&&ok;
         ok=ok&&state==0&&snapshot_count==1;}
+    if(!ok){result="Auxiliary loopback failed: snapshot="+std::to_string(got_snapshot)+" cursor="+std::to_string(got_cursor)+" diagnostics="+std::to_string(got_diagnostics)+" encode="+std::to_string(got_encode_diagnostics);return false;}
     cursor.width=cursor.height=cursor.hotspot_x=0;cursor.mask.clear();cursor.visible=false;
     ok=b.send_cursor("test-a",cursor)&&ok;
     ok = a.send_clipboard("test-b",L"Hive \x4e2d\x6587 \xd83d\xde80") && a.send_input("test-b",{InputKind::Key,30,0,0}) && a.request_stream("test-b",{237,80}) && a.request_stream("test-b",{0,80}) && ok;
@@ -2195,6 +2340,7 @@ bool Transport::self_test(std::string& result) {
         std::unique_lock lock(mutex); ok = cv.wait_for(lock,std::chrono::seconds(5),[&] { return state == 3 && got_uncapped && input_order && received_frame && returned_text && got_stop && got_host_ended && got_cursor && cursor_count==2; }) && ok;
     }
     ok=ok&&token_before_kick&&a.connection_token("test-b")==token_before_kick&&a.frame_ready("test-b")&&b.frame_ready("test-a");
+    if(!ok){result="Control/video loopback failed: state="+std::to_string(state)+" frame="+std::to_string(received_frame)+" text="+std::to_string(returned_text)+" stop="+std::to_string(got_stop)+" ended="+std::to_string(got_host_ended)+" cursor_count="+std::to_string(cursor_count)+" a_ready="+std::to_string(a.frame_ready("test-b"))+" b_ready="+std::to_string(b.frame_ready("test-a"));return false;}
     {
         const auto deadline=Clock::now()+std::chrono::milliseconds(500);
         auto timing=a.video_send_diagnostics("test-b");
@@ -2214,6 +2360,7 @@ bool Transport::self_test(std::string& result) {
     ok = ok && !a.send_clipboard("test-b",oversized) && !a.send_clipboard("test-b",malformed) && !a.send_input("test-b",{InputKind(999),0,0,0});
     frame.data.resize(kMaxFrame+1); ok = ok && !a.send_frame("test-b",frame);
     cursor.width=257;ok=ok&&!b.send_cursor("test-a",cursor)&&!a.request_snapshot("test-b",0)&&!b.send_snapshot("test-a",{901,Bytes(MaxSnapshotBytes+1)});
+    if(!ok){result="Warm cancellation or malformed-payload bounds failed";return false;}
     {
         std::shared_ptr<Impl::Conn> lane;{std::lock_guard lock(a.impl_->mutex);lane=a.impl_->connected.at("test-b").clipboard;}
         if(!lane){result="Missing negotiated clipboard lane";return false;}const auto connection=a.connection_token("test-b");lane->close();
@@ -2225,6 +2372,7 @@ bool Transport::self_test(std::string& result) {
     { std::unique_lock lock(mutex); ok = cv.wait_for(lock,std::chrono::milliseconds(500),[&] { return got_release; }) && ok; }
     b.stop();
     ok = ok && std::chrono::steady_clock::now()-before < std::chrono::seconds(3);
+    if(!ok){result="Shutdown release/deadline failed: release="+std::to_string(got_release);return false;}
     {
         // Real encrypted packets of different lengths must stay in posting
         // order while two overlapped writes share the stream. No desktop input.

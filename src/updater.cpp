@@ -37,7 +37,10 @@ struct Users {
         Handle source;HANDLE token=nullptr;
         if(OpenProcessToken(process,TOKEN_QUERY|TOKEN_DUPLICATE,&source.value)&&DuplicateTokenEx(source.value,TOKEN_ALL_ACCESS,nullptr,SecurityImpersonation,TokenPrimary,&token)){
             BYTE info[1024]{};DWORD size=0;
-            if(GetTokenInformation(token,TokenUser,info,sizeof(info),&size)&&!IsWellKnownSid(reinterpret_cast<TOKEN_USER*>(info)->User.Sid,WinLocalSystemSid))tokens.emplace(session,token);else CloseHandle(token);
+            if(GetTokenInformation(token,TokenUser,info,sizeof(info),&size)){
+                if(IsWellKnownSid(reinterpret_cast<TOKEN_USER*>(info)->User.Sid,WinLocalSystemSid)){CloseHandle(token);return;} // Prelogon endpoint: service restarts it, never a user tray.
+                tokens.emplace(session,token);
+            }else CloseHandle(token);
         }
         if(!tokens.contains(session))throw std::runtime_error("Cannot retain user token; update deferred");
     }

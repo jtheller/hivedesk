@@ -23,7 +23,7 @@ DWORD WINAPI watch_parent(void* argument){
 }
 bool local_system(){HANDLE token{};if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return false;BYTE user[512]{},system[SECURITY_MAX_SID_SIZE]{};DWORD bytes=0,size=sizeof(system);bool ok=GetTokenInformation(token,TokenUser,user,sizeof(user),&bytes)&&CreateWellKnownSid(WinLocalSystemSid,nullptr,system,&size)&&EqualSid(reinterpret_cast<TOKEN_USER*>(user)->User.Sid,system);CloseHandle(token);return ok;}
 std::wstring user_sid(DWORD session){
-    HANDLE token{};if(!WTSQueryUserToken(session,&token))throw std::runtime_error("No signed-in console user");
+    HANDLE token{};if(!WTSQueryUserToken(session,&token)){if(GetLastError()==ERROR_NO_TOKEN)return L"S-1-5-18";throw std::runtime_error("Console user token unavailable");}
     BYTE user[4096]{};DWORD bytes=0;LPWSTR sid=nullptr;
     bool ok=GetTokenInformation(token,TokenUser,user,sizeof(user),&bytes)&&ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user)->User.Sid,&sid);CloseHandle(token);
     if(!ok)throw std::runtime_error("Read session identity");std::wstring result=sid;LocalFree(sid);return result;

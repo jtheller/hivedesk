@@ -13,7 +13,7 @@ internal sealed class SettingsWindow : Window
 {
     private readonly AgentBridge bridge;
     private readonly TextBox name = new() { Header = "Computer name", MaxLength = 128, IsSpellCheckEnabled = false };
-    private readonly ToggleSwitch startup = new() { Header = "Start when I sign in", OnContent = "On", OffContent = "Off" };
+    private readonly ToggleSwitch startup = new() { Header = "Start with Windows", OnContent = "On", OffContent = "Off" };
     private readonly ToggleSwitch tray = new() { Header = "Show tray icon", OnContent = "On", OffContent = "Off" };
     private readonly ToggleSwitch debug = new() { Header = "Debug overlay", OnContent = "On", OffContent = "Off" };
     private readonly Button shortcut = new() { MinWidth = 180, HorizontalAlignment = HorizontalAlignment.Left };

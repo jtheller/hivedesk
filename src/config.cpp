@@ -1,4 +1,5 @@
 #include "hivedesk/config.h"
+#include "hivedesk/bootstrap.h"
 #include "hivedesk/transport.h"
 #include <windows.h>
 #include <wincrypt.h>
@@ -50,6 +51,7 @@ AppConfig load_config() {
     const auto path = data_directory() / L"settings.ini";
     config.first_run = !std::filesystem::exists(path);
     config.device_id = narrow(read_ini(path, L"DeviceId"));
+    if(config.device_id.empty())config.device_id=narrow(bootstrap::load().id);
     if (config.device_id.empty()) { BYTE random[16]{}; if(BCryptGenRandom(nullptr,random,sizeof(random),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)throw std::runtime_error("Random generator failed"); config.device_id=hex(random,sizeof(random)); }
     config.name=read_ini(path,L"Name");
     if(config.name.empty()) { wchar_t name[MAX_COMPUTERNAME_LENGTH+1]{}; DWORD size=MAX_COMPUTERNAME_LENGTH+1; GetComputerNameW(name,&size); config.name=name; }
