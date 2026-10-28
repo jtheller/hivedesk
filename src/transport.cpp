@@ -176,7 +176,9 @@ bool send_all(SOCKET s, const uint8_t* p, size_t n) {
     return true;
 }
 bool recv_all(SOCKET s, uint8_t* p, size_t n,std::atomic<uint64_t>* progress=nullptr,uint64_t* first_byte=nullptr) {
-    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (received <= 0) return false; if(first_byte&&!*first_byte)*first_byte=transport_us(); p += received; n -= received; if(progress)progress->fetch_add(received,std::memory_order_relaxed); }
+    // Bound progress-observed reads. A large outstanding receive can absorb
+    // arriving TCP payload without returning application credit for seconds.
+    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, progress?size_t(16*1024):size_t(INT_MAX))), 0); if (received <= 0) return false; if(first_byte&&!*first_byte)*first_byte=transport_us(); p += received; n -= received; if(progress)progress->fetch_add(received,std::memory_order_relaxed); }
     return true;
 }
 bool send_blob(SOCKET s, const Bytes& b) { Bytes head; u32(head, uint32_t(b.size())); return send_all(s, head.data(), head.size()) && send_all(s, b.data(), b.size()); }
@@ -1983,7 +1985,7 @@ bool Transport::self_test(std::string& result) {
     bcb.start_stream = [&](const std::string&,const StreamSettings& s) { std::lock_guard lock(mutex); if(s.warm){got_warm=s.session==919&&s.receiver_millihz==100000;cv.notify_all();return;} if (state == 2 && s.fps == 237 && s.bitrate_mbps == 80) state = 3; else if (state == 3 && s.fps == 0 && s.bitrate_mbps == 80) got_uncapped = true; cv.notify_all(); };
     bcb.cancel_warm=[&](const std::string&,uint64_t session){std::lock_guard lock(mutex);got_warm_cancel=session==919;cv.notify_all();};
     bcb.stop_stream = [&](const std::string&) { std::lock_guard lock(mutex); got_stop = true; cv.notify_all(); };
-    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}) && f.receive_started_us>1 && f.receive_completed_us>=f.receive_started_us; cv.notify_all(); };
+    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}) && f.receive_started_us>1 && f.receive_completed_us>=f.receive_started_us && f.receive_progress && f.receive_progress->load()>=f.data.size(); cv.notify_all(); };
     TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
     acb.host_ended=[&](const std::string& peer,uint64_t session){std::lock_guard lock(mutex);got_host_ended=peer=="test-b"&&session==91;cv.notify_all();};
     acb.diagnostics=[&](const std::string&,const SourceDiagnostics& d){std::lock_guard lock(mutex);const bool base=d.session==91&&d.encoded_millihz==59940&&d.encode_us==1234&&d.capture_wait_us==5678&&d.send_wait_us_per_second==9000&&d.feedback_age_us==11000&&d.network_extra_us==13000;if(d.encode_details)got_encode_diagnostics=base&&d.color_us==500&&d.nvenc_us==734&&d.encode_age_us==10000;else got_diagnostics=base;cv.notify_all();};

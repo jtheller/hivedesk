@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
-project(HiveDesk VERSION 0.7.9 LANGUAGES CXX)
-set(HIVEDESK_VERSION "0.7.9")
+project(HiveDesk VERSION 0.7.10 LANGUAGES CXX)
+set(HIVEDESK_VERSION "0.7.10")
 add_compile_definitions(HIVEDESK_VERSION="${HIVEDESK_VERSION}")
 enable_language(RC)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
