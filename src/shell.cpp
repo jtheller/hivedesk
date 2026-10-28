@@ -1,4 +1,5 @@
 #include "hivedesk/shell.h"
+#include "hivedesk/config.h"
 #include "hivedesk/media.h"
 #include "panel_composition.h"
 #include "taskbar_peek.h"
@@ -1066,10 +1067,14 @@ struct Shell::Impl {
         }});return true;
     }
     ~Impl() {
+        log("Shell shutdown: input capture");
         taskbar_peek.reset();
         shutting_down=true;++generation;publish_input();input_capture.stop();ReleaseCapture();ClipCursor(nullptr);
+        log("Shell shutdown: clipboard");
         clipboard_desktop.stop();
+        log("Shell shutdown: background operations");
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
+        log("Shell shutdown: native windows");
         if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
         if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
@@ -1083,10 +1088,12 @@ struct Shell::Impl {
         reset_remote_cursor();
         if(debug_font)DeleteObject(debug_font);
         if(font)DeleteObject(font);if(small_font)DeleteObject(small_font);if(title_font)DeleteObject(title_font);if(background_brush)DeleteObject(background_brush);if(edit_brush)DeleteObject(edit_brush);
+        log("Shell shutdown: composition resources");
     }
 };
 Shell::Shell():impl_(new Impl){}
-Shell::~Shell(){delete impl_;}
+Shell::~Shell(){close();}
+void Shell::close(){if(impl_){delete impl_;impl_=nullptr;log("Shell shutdown: complete");}}
 #ifdef HIVEDESK_SHELL_TEST
 #include "../tests/shell_taskbar_regression.inc"
 #endif

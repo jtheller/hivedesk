@@ -47,6 +47,8 @@ struct ShellCallbacks {
 class Shell {
 public:
     Shell(); ~Shell();
+    // UI-thread shutdown while every callback owner is still alive.
+    void close();
     bool create(HINSTANCE, const ShellConfig&, ShellCallbacks, std::string& error);
     int run();
     void quit();

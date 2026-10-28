@@ -37,7 +37,12 @@ public:
         telemetry_.enabled(config_.desktop.debug_overlay);
         video_restart_pending_=hive::gpu_policy_restart::pending_request(video_restart_marker_);
     }
-    ~App() { shutdown(); }
+    ~App() {
+        shutdown();
+        // Shell owns callback-producing input/clipboard threads. Stop them
+        // before reverse member destruction releases their App mutexes/state.
+        shell_.close();
+    }
     int run(HINSTANCE instance,bool open_settings=false) {
         hive::ShellCallbacks callbacks;
         callbacks.select_peer=[this](const std::string& peer) {

@@ -27,9 +27,10 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic UI events on interactive station");
     hive::experience_enabled(true);
     auto encoded=hive::media_generated_test_frame();
-    hive::Shell shell;hive::ShellConfig config;config.device_name=L"Generated video test";config.desktop.tray_icon=false;
+    hive::ShellConfig config;config.device_name=L"Generated video test";config.desktop.tray_icon=false;
     std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;
     hive::ShellCallbacks callbacks;callbacks.visible_peers=[&](const auto& surfaces){visible=surfaces;};std::string selected;callbacks.select_peer=[&](const std::string& peer){selected=peer;};
+    hive::Shell shell; // Callback state must outlive native/worker teardown.
     std::string error;require(shell.create(GetModuleHandleW(nullptr),config,std::move(callbacks),error),error.c_str());
     shell.update_peers({{"a","Generated A","",47980,true},{"b","Generated B","",47980,true}});
     const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr),panel=FindWindowW(L"HiveDesk.Switcher",nullptr);KillTimer(owner,1);

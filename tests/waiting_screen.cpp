@@ -31,9 +31,10 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_NAME,station,sizeof(station),&size)!=FALSE,"Read test station");
     USEROBJECTFLAGS flags{};require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)!=FALSE&&!(flags.dwFlags&WSF_VISIBLE),"Refuse UI probe on an interactive window station");
     std::atomic<unsigned> clipboard_echoes=0;
-    hive::Shell shell;hive::ShellConfig config;config.device_name=L"Waiting test";config.desktop.tray_icon=false;
+    hive::ShellConfig config;config.device_name=L"Waiting test";config.desktop.tray_icon=false;
     hive::ShellCallbacks callbacks;unsigned selected=0;std::vector<std::string> saved_order;std::string last_selected;bool allow_save=true;
     std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;std::string peek_id;uint64_t peek_epoch=0;
+    hive::Shell shell; // Stop callbacks before the state captured below expires.
     callbacks.visible_peers=[&](const auto& surfaces){visible=surfaces;};
     callbacks.peek_peer=[&](const auto& id,uint64_t epoch){peek_id=id;peek_epoch=epoch;};
     callbacks.clipboard_changed=[&](const std::wstring&){++clipboard_echoes;};
@@ -220,7 +221,8 @@ int probe(){
     require(shell.viewer_surface()==peek&&shown(peek->window)&&!shown(waiting),"Preview click recreated or covered its live surface");
     SendMessageW(owner,WM_TIMER,4,0);shell.show_peek(peek,media,old_epoch,true);
     require(shown(peek->window)&&!shown(waiting),"Delayed preview/fade event hid the adopted viewer");shell.show_local();
-    std::puts("PASS peek UI: hover authority isolation, stale completion rejection, direct live adoption and fade cancellation");
+    shell.close();require(!IsWindow(owner)&&!IsWindow(panel),"Explicit shell close retained native windows");shell.close();
+    std::puts("PASS peek UI: hover authority isolation, stale completion rejection, direct live adoption, fade cancellation and explicit shutdown");
     return 0;
 }
 }
