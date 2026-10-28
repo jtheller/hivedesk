@@ -38,7 +38,7 @@ struct InputCapture::Impl {
     struct Route {std::shared_ptr<const InputCaptureState> state;uint64_t id;bool enabled;};
     Route snapshot() {
         std::lock_guard lock(mutex);
-        return {state,route,state->remote&&blocked_route!=route&&!stopping&&(!state->windowed||GetForegroundWindow()==state->viewer)};
+        return {state,route,state->remote&&!state->local_shell&&blocked_route!=route&&!stopping&&(!state->windowed||GetForegroundWindow()==state->viewer)};
     }
     void observe_route(uint64_t id) {
         if(observed_route==id)return;
@@ -107,7 +107,7 @@ struct InputCapture::Impl {
             return 1;
         }
         if(s->summon_key_up==k.vkCode){if(up)s->summon_key_up=0;return 1;}
-        if(!up&&k.vkCode==VK_ESCAPE&&route.state->panel_visible){s->summon_key_up=k.vkCode;s->post(CaptureAction::HidePanel,route.state->generation);return 1;}
+        if(!up&&k.vkCode==VK_ESCAPE&&route.state->panel_visible&&!route.state->local_shell){s->summon_key_up=k.vkCode;s->post(CaptureAction::HidePanel,route.state->generation);return 1;}
         if(route.enabled&&!route.state->recording_hotkey&&!up&&k.vkCode==route.state->hotkey_key&&s->fixed.modifiers()==route.state->hotkey_modifiers){
             s->summon_key_up=k.vkCode;s->emit(route,{InputKind::ReleaseAll},now);s->post(CaptureAction::Summon,route.state->generation);return 1;
         }
@@ -122,7 +122,7 @@ struct InputCapture::Impl {
         const auto& m=*reinterpret_cast<MSLLHOOKSTRUCT*>(data);
         if(m.flags&LLMHF_INJECTED)return CallNextHookEx(nullptr,code,msg,data);
         const auto now=input_now_us();const auto route=s->snapshot();s->observe_route(route.id);
-        if(route.state->panel_summoned&&(msg==WM_LBUTTONDOWN||msg==WM_RBUTTONDOWN)&&!own_surface(*route.state,m.pt))s->post(CaptureAction::HidePanelAnimated,route.state->generation);
+        if(route.state->panel_summoned&&!route.state->local_shell&&(msg==WM_LBUTTONDOWN||msg==WM_RBUTTONDOWN)&&!own_surface(*route.state,m.pt))s->post(CaptureAction::HidePanelAnimated,route.state->generation);
         if(msg==WM_MOUSEMOVE){std::lock_guard lock(s->mutex);++s->pointer.revision;s->pointer.point=m.pt;s->pointer.motion_tick=GetTickCount64();}
         if(!route.enabled)return CallNextHookEx(nullptr,code,msg,data);
         const int released=msg==WM_LBUTTONUP?1:msg==WM_RBUTTONUP?2:msg==WM_MBUTTONUP?3:msg==WM_XBUTTONUP?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;
@@ -225,7 +225,7 @@ void InputCapture::stop(){
 void InputCapture::update(InputCaptureState state){
     auto next=std::make_shared<InputCaptureState>(std::move(state));auto& s=*impl_;std::lock_guard lock(s.mutex);
     const bool same_session=next->generation==s.state->generation&&next->session==s.state->session&&next->peer==s.state->peer;
-    const bool focus_changed=same_session&&next->remote!=s.state->remote;
+    const bool focus_changed=same_session&&((next->remote&&!next->local_shell)!=(s.state->remote&&!s.state->local_shell));
     if(!same_session||focus_changed){++s.route;s.queue.clear();}
     // Focus loss releases keys/buttons even without another physical event.
     // Also release on regain so a rapid deactivate/activate cannot discard it.
@@ -309,6 +309,18 @@ bool InputCapture::worker_self_test(std::string& result){
             require(diagnostics.overflows==1&&diagnostics.queue_depth==1&&diagnostics.queue_peak==256,"saturated worker did not bound and replace its edge tail");
             probe.release();require(probe.wait(2),"overflow emergency release did not wake worker");
             {std::lock_guard lock(probe.mutex);require(probe.received.size()==2&&probe.received[1].event.kind==InputKind::ReleaseAll,"overflow replayed stale key transitions");}
+        }
+        {
+            Probe probe;probe.capture.update(route);start(probe);
+            emit(probe,{InputKind::Key,0x1e,0});require(probe.wait(1),"taskbar input fixture did not start");
+            auto local=route;local.local_shell=true;probe.capture.update(local);
+            require(!probe.capture.impl_->snapshot().enabled,"taskbar activation retained remote interception");
+            require(probe.wait(2),"taskbar activation did not release held remote input");
+            probe.capture.update(route);require(probe.wait(3),"taskbar return did not release before resuming");
+            require(probe.capture.impl_->snapshot().enabled,"taskbar return did not resume its existing session");
+            std::lock_guard lock(probe.mutex);
+            require(probe.received[1].event.kind==InputKind::ReleaseAll&&probe.received[2].event.kind==InputKind::ReleaseAll,
+                "taskbar handoff replayed input instead of releasing it");
         }
         {
             InputCaptureState geometry;geometry.windowed=true;geometry.viewer_rect={300,200,1100,650};geometry.remote_width=1920;geometry.remote_height=1080;

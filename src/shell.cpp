@@ -1,5 +1,6 @@
 #include "hivedesk/shell.h"
 #include "panel_composition.h"
+#include "taskbar_peek.h"
 #include "viewer_geometry.h"
 #include "debug_model.h"
 #include <optional>
@@ -212,6 +213,8 @@ struct Shell::Impl {
     bool remote=false,shutting_down=false,selection_armed=false,reconnecting=false;
     bool relative_mode=false,raw_mouse_available=false;
     PanelComposition composition;
+    TaskbarPeek taskbar_peek;
+    bool taskbar_focus_guard=false;
     COLORREF accent=GetSysColor(COLOR_HIGHLIGHT);
     uint32_t remote_width=0,remote_height=0;
     int panel_mode=0,panel_width=200,panel_height=0,hovered=-1,scroll=0;
@@ -230,9 +233,11 @@ struct Shell::Impl {
         auto task=std::make_unique<std::function<void()>>(std::move(f));
         if(owner&&PostMessageW(owner,UiTask,0,reinterpret_cast<LPARAM>(task.get())))task.release();
     }
-    void publish_input() {
+    void publish_input(bool keep_taskbar_guard=false) {
         InputCaptureState state;state.generation=generation.load();state.session=input_session;state.peer=active_id;
-        state.remote=remote&&!reconnecting&&!shutting_down&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
+        if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
+        state.local_shell=taskbar_peek.active()||taskbar_focus_guard;
+        state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel_visible=panel&&IsWindowVisible(panel);state.panel_summoned=panel_summoned;
         state.settings_visible=settings&&IsWindowVisible(settings);
@@ -246,6 +251,7 @@ struct Shell::Impl {
         if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;}
     }
     void hide_panel(bool animate=false) {
+        taskbar_peek.reset();
         cancel_drag();panel_summoned=false;
         if(animate&&panel_mode&&!panel_closing){panel_closing=true;publish_visible();SetTimer(owner,2,composition.hide(),nullptr);publish_input();return;}
         if(animate&&panel_closing)return;
@@ -472,7 +478,7 @@ struct Shell::Impl {
         publish_input();
     }
     void confine_mouse() {
-        if(!remote||reconnecting||panel_mode||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
+        if(!remote||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
         RECT r=viewer_client();
         if(relative_mode){int x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;r={x,y,x+1,y+1};SetCursorPos(x,y);}
         ClipCursor(&r);
@@ -594,6 +600,19 @@ struct Shell::Impl {
         }
         publish_input();
         POINT p{};GetCursorPos(&p);ULONGLONG now=GetTickCount64();
+        taskbar_peek.tick();
+        if(panel_mode==2&&!panel_closing&&pressed_card<0){
+            const bool trigger=TaskbarPeek::corner(p,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),dpi);
+            if(!taskbar_peek.active()&&trigger){
+                taskbar_focus_guard=true;publish_input(true);ClipCursor(nullptr);
+                if(!taskbar_peek.enter(panel,viewer))taskbar_focus_guard=false;
+                publish_input();
+            }
+            if(taskbar_peek.active()){
+                if(taskbar_peek.contains(p,dpi)||TaskbarPeek::shell_menu(GetForegroundWindow())){outside_since=0;return;}
+                taskbar_peek.leave();publish_input();
+            }
+        }else if(taskbar_peek.active()){taskbar_peek.reset();publish_input();}
         const bool corner=p.x>=0&&p.x<=px(3)&&p.y>=0&&p.y<=px(3);
         // Start the fade on the first corner sample; no hover dwell before showing it.
         if(!panel_mode){if(corner)show_panel(1);return;}
@@ -989,6 +1008,7 @@ struct Shell::Impl {
         }});return true;
     }
     ~Impl() {
+        taskbar_peek.reset();
         shutting_down=true;++generation;publish_input();input_capture.stop();ReleaseCapture();ClipCursor(nullptr);
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
         if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);RemoveClipboardFormatListener(owner);tray(true);}
