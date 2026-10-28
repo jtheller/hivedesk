@@ -11,6 +11,7 @@
 #include <bcrypt.h>
 #include <iphlpapi.h>
 #include "hivedesk/transport.h"
+#include "hivedesk/config.h"
 #include "hivedesk/experience_trace.h"
 #include "hivedesk/network_key.h"
 #include "rate_wire.h"
@@ -363,20 +364,37 @@ struct Transport::Impl {
                     conn.video_inflight=0;conn.video_owned_bytes=0;
                 }
             } drain{*this,pending};
-            VideoWriteProgress progress;VideoSendBudget budget;uint64_t next_tcp_sample=0,owned_bytes=0;
+            VideoWriteProgress progress;VideoSendBudget budget;uint64_t next_tcp_sample=0,owned_bytes=0,next_slow_log=0;
             if(!video_wake)return;
             while(!closed&&owner->running){
                 const auto sampled_at=transport_us();
                 if(sampled_at>=next_tcp_sample){
                     VideoTcpSample sample;TCP_INFO_v0 info{};DWORD version=0,bytes=0;ULONG ideal=0;
+                    bool tcp_observed=false;
                     if(test_sample)sample=*test_sample; // Private self-test injection; never negotiated or configured externally.
                     else {std::lock_guard lock(socket_mutex);const auto s=socket.load();
                         if(s!=INVALID_SOCKET&&!WSAIoctl(s,SIO_TCP_INFO,&version,sizeof(version),&info,sizeof(info),&bytes,nullptr,nullptr)&&
                             !idealsendbacklogquery(s,&ideal)){
                             sample={true,info.RttUs,info.MinRttUs,ideal,info.Cwnd,info.SndWnd,info.BytesInFlight};
+                            tcp_observed=true;
                         }
                     }
                     budget.observe(sample);video_send.network(sample,sampled_at,uint32_t(budget.limit()),budget.bytes());
+                    // Also cover read-only warm/Peek streams, which do not own
+                    // the selected host telemetry endpoint. Log source-side TCP
+                    // evidence for genuinely slow writes, at most once / 5 s.
+                    // Receiver-side retransmit counters cannot diagnose this.
+                    if(tcp_observed&&!pending.empty()&&sampled_at>=next_slow_log&&
+                        sampled_at>=pending.front()->attempt.submitted_at+2000000){
+                        log("Slow video TCP: peer="+peer.id+" connection="+std::to_string(token)+
+                            " write_ms="+std::to_string((sampled_at-pending.front()->attempt.submitted_at)/1000)+
+                            " owned_bytes="+std::to_string(owned_bytes)+" rtt_us="+std::to_string(info.RttUs)+
+                            " min_rtt_us="+std::to_string(info.MinRttUs)+" cwnd="+std::to_string(info.Cwnd)+
+                            " sndwnd="+std::to_string(info.SndWnd)+" flight="+std::to_string(info.BytesInFlight)+
+                            " ideal="+std::to_string(ideal)+" bytes_out="+std::to_string(info.BytesOut)+
+                            " bytes_retrans="+std::to_string(info.BytesRetrans)+" rto="+std::to_string(info.TimeoutEpisodes));
+                        next_slow_log=sampled_at+5000000;
+                    }
                     next_tcp_sample=sampled_at+250000;
                 }
                 // Completion events may arrive out of order. Retire in posting

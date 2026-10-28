@@ -24,6 +24,7 @@ bool trusted_server(HANDLE pipe){
 struct HostBridge::Impl {
     HANDLE pipe=INVALID_HANDLE_VALUE;std::mutex writes;std::thread reader;std::atomic<bool> stopped{true};
     broker::ReadySignal downstream;
+    std::thread credit_writer;std::atomic<bool> credit_pending{false};
     std::mutex activation_mutex;std::condition_variable activation_changed;bool activated=false;
     std::atomic<HANDLE> input_pipe{INVALID_HANDLE_VALUE};std::mutex input_writes,input_lifecycle;std::thread input_reader;
     std::atomic<bool> input_stopped{true};std::atomic<uint64_t> input_session{0},legacy_sequence{0};
@@ -41,8 +42,23 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
     }while(std::chrono::steady_clock::now()<deadline);
     if(impl_->pipe==INVALID_HANDLE_VALUE){error="Desktop service unavailable. Install or repair HiveDesk on the controlled computer.";return false;}
     if(!trusted_server(impl_->pipe)){CloseHandle(impl_->pipe);impl_->pipe=INVALID_HANDLE_VALUE;error="Desktop service identity check failed.";return false;}
-    impl_->stopped=false;auto promise=std::make_shared<std::promise<std::string>>();auto initialized=promise->get_future();
-    impl_->reader=std::thread([this,promise,output=std::move(output),ready=std::move(ready),health=std::move(health),diagnostics=std::move(diagnostics)]{
+    impl_->stopped=false;impl_->credit_pending=false;
+    // Return the single frame credit independently of the pipe reader. Waiting
+    // here used to stop reading Activated/diagnostics for the entire TCP send,
+    // so a progressing slow transfer could time out warm promotion locally.
+    impl_->credit_writer=std::thread([this,ready=std::move(ready)]{
+        try{
+            while(impl_->downstream.wait(impl_->stopped,[&]{return impl_->credit_pending.load()&&(!ready||ready());})){
+                impl_->credit_pending=false;
+                if(!impl_->send(broker::Ready))break;
+            }
+        }catch(const std::exception& e){log(std::string("Desktop service frame credit: ")+e.what());}
+        {std::lock_guard lock(impl_->activation_mutex);impl_->stopped=true;}
+        impl_->activation_changed.notify_all();
+        if(impl_->pipe!=INVALID_HANDLE_VALUE)CancelIoEx(impl_->pipe,nullptr);
+    });
+    auto promise=std::make_shared<std::promise<std::string>>();auto initialized=promise->get_future();
+    impl_->reader=std::thread([this,promise,output=std::move(output),health=std::move(health),diagnostics=std::move(diagnostics)]{
         bool announced=false;broker::Kind kind;broker::Bytes bytes;
         try {
             while(!impl_->stopped&&broker::receive(impl_->pipe,kind,bytes,&impl_->stopped)){
@@ -55,8 +71,11 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
                 else if(kind==broker::Frame){
                     EncodedFrame frame;if(!broker::read_frame(bytes,frame))break;
                     output(std::move(frame));
-                    if(!impl_->downstream.wait(impl_->stopped,ready))break;
-                    if(!impl_->send(broker::Ready))break;
+                    // One outstanding return, including when a desktop change
+                    // restarts capture with a new initial picture. Do not
+                    // accumulate credits or grant them ahead of readiness.
+                    impl_->credit_pending=true;
+                    impl_->downstream.notify();
                 }else if(kind==broker::Health){StreamHealth value;value.session=r.u64();value.target_millihz=r.u32();value.rate_millihz=r.u32();value.pressure=r.u32();if(!r.end())break;if(health)health(value);}
                 else break;
             }
@@ -64,6 +83,7 @@ bool HostBridge::start(const StreamSettings& settings,std::function<void(Encoded
         if(!announced)promise->set_value("Desktop service closed before capture started.");
         {std::lock_guard lock(impl_->activation_mutex);impl_->stopped=true;}
         impl_->activation_changed.notify_all();
+        impl_->downstream.notify();
         // The input owner notices this cancellation even if media failed while
         // Start was still establishing its independent pipe. Its ACK reader
         // closes that pipe and the broker releases all held input.
@@ -134,6 +154,8 @@ void HostBridge::stop(){
     impl_->downstream.notify();
     if(impl_->pipe!=INVALID_HANDLE_VALUE)CancelIoEx(impl_->pipe,nullptr);
     if(impl_->reader.joinable()){CancelSynchronousIo(impl_->reader.native_handle());impl_->reader.join();}
+    if(impl_->credit_writer.joinable())impl_->credit_writer.join();
+    impl_->credit_pending=false;
     std::lock_guard lock(impl_->writes);if(impl_->pipe!=INVALID_HANDLE_VALUE){CloseHandle(impl_->pipe);impl_->pipe=INVALID_HANDLE_VALUE;}
 }
 bool HostBridge::activate(){
