@@ -1,6 +1,5 @@
 #pragma once
 #include <windows.h>
-#include <dwmapi.h>
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -69,25 +68,6 @@ public:
         const int edge=std::max(1,MulDiv(4,dpi,96));
         return width>0&&height>0&&p.x>=0&&p.x<edge&&p.y>=height-edge&&p.y<height;
     }
-    static bool shell_menu(HWND window){
-        if(!window||!IsWindowVisible(window))return false;
-        DWORD cloaked=0;if(SUCCEEDED(DwmGetWindowAttribute(window,DWMWA_CLOAKED,&cloaked,sizeof(cloaked)))&&cloaked)return false;
-        DWORD pid=0;GetWindowThreadProcessId(window,&pid);HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
-        if(!process)return false;
-        wchar_t path[32768]{};DWORD length=DWORD(std::size(path));const bool ok=QueryFullProcessImageNameW(process,0,path,&length)!=FALSE;CloseHandle(process);
-        const auto base=wcsrchr(path,L'\\');const wchar_t* name=base?base+1:path;
-        return ok&&(!_wcsicmp(name,L"StartMenuExperienceHost.exe")||!_wcsicmp(name,L"SearchHost.exe")||!_wcsicmp(name,L"SearchApp.exe"));
-    }
-    bool contains(POINT p,int dpi)const{
-        if(!active_)return false;
-        RECT r{};if(!GetWindowRect(tray_,&r))return false;
-        // Keep the entry point and the whole taskbar reachable, including a
-        // centered Windows 11 Start button and an auto-hidden bottom bar.
-        const int height=GetSystemMetrics(SM_CYSCREEN),width=GetSystemMetrics(SM_CXSCREEN);
-        if(r.top>=height-2){r={0,height-MulDiv(48,dpi,96),width,height};}
-        const int margin=MulDiv(6,dpi,96);InflateRect(&r,margin,margin);
-        return PtInRect(&r,p)||corner(p,width,height,dpi);
-    }
     bool enter(HWND panel,HWND viewer,HWND tray=nullptr,bool activate=true){
         if(active_)return true;
         tray_=tray?tray:FindWindowW(L"Shell_TrayWnd",nullptr);
@@ -107,6 +87,9 @@ public:
     void leave(bool animate=true){
         if(!active_){if(!animate)clear_layer();return;}
         if(animate)snapshot(bounds_);else clear_layer();
+        // Restoring foreground can synchronously send WM_ACTIVATE to Hive.
+        // Revoke the lease first so that activation cannot reenter leave().
+        active_=false;
         const HWND foreground=GetForegroundWindow();
         if(IsWindow(tray_)){
             // Restore the original topmost band first, then its predecessor.

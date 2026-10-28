@@ -27,8 +27,8 @@ int probe(){
         const HWND previous=GetWindow(tray,GW_HWNDPREV);RECT before{};GetWindowRect(tray,&before);
         require(peek.enter(panel,viewer,tray)&&peek.active(),"corner did not expose taskbar");
         require(GetWindowLongPtrW(tray,GWL_EXSTYLE)&WS_EX_TOPMOST,"taskbar not raised");
-        require(peek.contains({width/2,height-24},96),"centered Start button not reachable");
-        require(!peek.contains({width/2,height/2},96),"taskbar lease captured desktop");
+        for(int tick=0;tick<8;++tick)peek.tick();
+        require(peek.active(),"timer sampling revoked the latched taskbar lease");
         peek.leave(cycle%2==0);require(!peek.active(),"leaving taskbar retained input lease");
         require(bool(GetWindowLongPtrW(tray,GWL_EXSTYLE)&WS_EX_TOPMOST)==topmost,"Explorer topmost state leaked");
         RECT after{};GetWindowRect(tray,&after);require(EqualRect(&before,&after),"taskbar geometry changed");

@@ -251,7 +251,7 @@ struct Shell::Impl {
         if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;}
     }
     void hide_panel(bool animate=false) {
-        taskbar_peek.reset();
+        if(animate)taskbar_peek.leave();else taskbar_peek.reset();
         cancel_drag();panel_summoned=false;
         if(animate&&panel_mode&&!panel_closing){panel_closing=true;publish_visible();SetTimer(owner,2,composition.hide(),nullptr);publish_input();return;}
         if(animate&&panel_closing)return;
@@ -609,8 +609,9 @@ struct Shell::Impl {
                 publish_input();
             }
             if(taskbar_peek.active()){
-                if(taskbar_peek.contains(p,dpi)||TaskbarPeek::shell_menu(GetForegroundWindow())){outside_since=0;return;}
-                taskbar_peek.leave();publish_input();
+                // Latched until an explicit Hive action or viewer activation.
+                // Neither cursor movement nor Explorer's menu focus is an exit.
+                outside_since=0;return;
             }
         }else if(taskbar_peek.active()){taskbar_peek.reset();publish_input();}
         const bool corner=p.x>=0&&p.x<=px(3)&&p.y>=0&&p.y<=px(3);
@@ -932,7 +933,13 @@ struct Shell::Impl {
         if(window==s->viewer) {
             switch(message){
             case WM_SETCURSOR:if(s->remote&&LOWORD(l)==HTCLIENT){s->apply_remote_cursor();return TRUE;}break;
-            case WM_ACTIVATE:s->publish_input();s->confine_mouse();if(LOWORD(w)==WA_INACTIVE)ShowWindow(s->health_badge,SW_HIDE);break;
+            case WM_ACTIVATE:
+                if(LOWORD(w)!=WA_INACTIVE&&s->taskbar_peek.active())s->hide_panel(true);
+                s->publish_input();s->confine_mouse();if(LOWORD(w)==WA_INACTIVE)ShowWindow(s->health_badge,SW_HIDE);break;
+            case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
+                // Also handle a click if Explorer could not acquire foreground
+                // on entry and the viewer therefore never lost activation.
+                if(s->taskbar_peek.active()){s->hide_panel(true);s->publish_input();return 0;}break;
             case WM_ENTERMENULOOP:case WM_ENTERSIZEMOVE:s->sizing_viewer=true;s->publish_input();ClipCursor(nullptr);ShowWindow(s->health_badge,SW_HIDE);return 0;
             case WM_EXITMENULOOP:case WM_EXITSIZEMOVE:s->sizing_viewer=false;s->size_to_source();s->sync_viewer_ui();s->confine_mouse();return 0;
             case WM_SIZING:if(s->windowed){
