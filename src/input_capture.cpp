@@ -107,7 +107,13 @@ struct InputCapture::Impl {
             return 1;
         }
         if(s->summon_key_up==k.vkCode){if(up)s->summon_key_up=0;return 1;}
-        if(!up&&k.vkCode==VK_ESCAPE&&route.state->panel_visible&&!route.state->local_shell){s->summon_key_up=k.vkCode;s->post(CaptureAction::HidePanel,route.state->generation);return 1;}
+        if(!up&&k.vkCode==VK_ESCAPE&&route.state->panel_visible){
+            if(route.state->local_shell){
+                s->post(CaptureAction::HidePanelAnimated,route.state->generation);
+                return CallNextHookEx(nullptr,code,msg,data); // Explorer also receives Escape.
+            }
+            s->summon_key_up=k.vkCode;s->post(CaptureAction::HidePanel,route.state->generation);return 1;
+        }
         if(route.enabled&&!route.state->recording_hotkey&&!up&&k.vkCode==route.state->hotkey_key&&s->fixed.modifiers()==route.state->hotkey_modifiers){
             s->summon_key_up=k.vkCode;s->emit(route,{InputKind::ReleaseAll},now);s->post(CaptureAction::Summon,route.state->generation);return 1;
         }
@@ -122,7 +128,8 @@ struct InputCapture::Impl {
         const auto& m=*reinterpret_cast<MSLLHOOKSTRUCT*>(data);
         if(m.flags&LLMHF_INJECTED)return CallNextHookEx(nullptr,code,msg,data);
         const auto now=input_now_us();const auto route=s->snapshot();s->observe_route(route.id);
-        if(route.state->panel_summoned&&!route.state->local_shell&&(msg==WM_LBUTTONDOWN||msg==WM_RBUTTONDOWN)&&!own_surface(*route.state,m.pt))s->post(CaptureAction::HidePanelAnimated,route.state->generation);
+        if((msg==WM_LBUTTONDOWN||msg==WM_RBUTTONDOWN)&&dismiss_panel_on_mouse_down(*route.state,m.pt,
+            route.state->local_shell?GetAncestor(WindowFromPoint(m.pt),GA_ROOT):nullptr))s->post(CaptureAction::HidePanelAnimated,route.state->generation);
         if(msg==WM_MOUSEMOVE){std::lock_guard lock(s->mutex);++s->pointer.revision;s->pointer.point=m.pt;s->pointer.motion_tick=GetTickCount64();}
         if(!route.enabled)return CallNextHookEx(nullptr,code,msg,data);
         const int released=msg==WM_LBUTTONUP?1:msg==WM_RBUTTONUP?2:msg==WM_MBUTTONUP?3:msg==WM_XBUTTONUP?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;

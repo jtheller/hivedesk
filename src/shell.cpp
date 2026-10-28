@@ -233,25 +233,28 @@ struct Shell::Impl {
         auto task=std::make_unique<std::function<void()>>(std::move(f));
         if(owner&&PostMessageW(owner,UiTask,0,reinterpret_cast<LPARAM>(task.get())))task.release();
     }
-    void publish_input(bool keep_taskbar_guard=false) {
+    InputCaptureState input_state(bool keep_taskbar_guard=false) {
         InputCaptureState state;state.generation=generation.load();state.session=input_session;state.peer=active_id;
         if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
         state.local_shell=taskbar_peek.active()||taskbar_focus_guard;
         state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
-        state.panel_visible=panel&&IsWindowVisible(panel);state.panel_summoned=panel_summoned;
+        state.panel=panel;state.panel_visible=panel&&(GetWindowLongPtrW(panel,GWL_STYLE)&WS_VISIBLE);state.panel_summoned=panel_summoned;
         state.settings_visible=settings&&IsWindowVisible(settings);
         if(state.panel_visible)GetWindowRect(panel,&state.panel_rect);if(state.settings_visible)GetWindowRect(settings,&state.settings_rect);
         state.screen_width=uint32_t(std::max(1,GetSystemMetrics(SM_CXSCREEN)));state.screen_height=uint32_t(std::max(1,GetSystemMetrics(SM_CYSCREEN)));
         state.remote_width=remote_width;state.remote_height=remote_height;
-        state.hotkey_key=config.desktop.hotkey_key;state.hotkey_modifiers=config.desktop.hotkey_modifiers;input_capture.update(std::move(state));
+        state.hotkey_key=config.desktop.hotkey_key;state.hotkey_modifiers=config.desktop.hotkey_modifiers;return state;
     }
+    void publish_input(bool keep_taskbar_guard=false) {input_capture.update(input_state(keep_taskbar_guard));}
     void sample_physical_pointer() {
         const auto pointer=input_capture.physical_pointer();
         if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;}
     }
-    void hide_panel(bool animate=false) {
-        if(animate)taskbar_peek.leave();else taskbar_peek.reset();
+    void hide_panel(bool animate=false,bool keep_taskbar=false) {
+        // Popup dismissal is independent of the native taskbar interaction.
+        // Restoring z-order here would steal the Start click still in flight.
+        if(!keep_taskbar){if(animate)taskbar_peek.leave();else taskbar_peek.reset();}
         cancel_drag();panel_summoned=false;
         if(animate&&panel_mode&&!panel_closing){panel_closing=true;publish_visible();SetTimer(owner,2,composition.hide(),nullptr);publish_input();return;}
         if(animate&&panel_closing)return;
@@ -545,6 +548,7 @@ struct Shell::Impl {
         }
         catch(const std::exception&){hide_panel();return;}
         SetWindowPos(panel,HWND_TOPMOST,0,0,panel_width,panel_height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        taskbar_peek.keep_panel_below();
         publish_input();
         confine_mouse();
         if(entering&&callbacks.panel_opened)callbacks.panel_opened();
@@ -599,7 +603,9 @@ struct Shell::Impl {
             else if(!settings)settings=external_settings_window();
         }
         publish_input();
-        POINT p{};GetCursorPos(&p);ULONGLONG now=GetTickCount64();
+        POINT p{};GetCursorPos(&p);update_panel_pointer(p,GetTickCount64());
+    }
+    void update_panel_pointer(POINT p,ULONGLONG now) {
         taskbar_peek.tick();
         if(panel_mode==2&&!panel_closing&&pressed_card<0){
             const bool trigger=TaskbarPeek::corner(p,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),dpi);
@@ -608,16 +614,11 @@ struct Shell::Impl {
                 if(!taskbar_peek.enter(panel,viewer))taskbar_focus_guard=false;
                 publish_input();
             }
-            if(taskbar_peek.active()){
-                // Latched until an explicit Hive action or viewer activation.
-                // Neither cursor movement nor Explorer's menu focus is an exit.
-                outside_since=0;return;
-            }
-        }else if(taskbar_peek.active()){taskbar_peek.reset();publish_input();}
+        }
         const bool corner=p.x>=0&&p.x<=px(3)&&p.y>=0&&p.y<=px(3);
         // Start the fade on the first corner sample; no hover dwell before showing it.
         if(!panel_mode){if(corner)show_panel(1);return;}
-        if(panel_closing){if(p.x>=0&&p.x<panel_width&&p.y>=0&&p.y<panel_height)show_panel(panel_mode);return;}
+        if(panel_closing){if(!taskbar_peek.active()&&p.x>=0&&p.x<panel_width&&p.y>=0&&p.y<panel_height)show_panel(panel_mode);return;}
         if(panel_mode==1&&p.x>=0&&p.x<px(42)&&p.y>px(32))show_panel(2);
         if(pressed_card>=0){
             if(dragging&&p.x>=0&&p.x<panel_width&&now-last_drag_scroll>=120){
@@ -626,7 +627,7 @@ struct Shell::Impl {
                 if(next!=scroll){scroll=next;drop_slot=std::clamp(int((p.y-px(12)+tile_stride()/2)/tile_stride())+scroll-1,0,int(peers.size()));composition.finish_cards(false);paint_panel(false);drag_layers();move_drag_visual(p);}last_drag_scroll=now;
             }return;
         }
-        if(!panel_summoned&&(p.x<0||p.x>panel_width+px(40)||p.y<0||p.y>panel_height+px(30))) {if(!outside_since)outside_since=now;if(now-outside_since>250)hide_panel(true);}else outside_since=0;
+        if(!panel_summoned&&(p.x<0||p.x>panel_width+px(40)||p.y<0||p.y>panel_height+px(30))) {if(!outside_since)outside_since=now;if(now-outside_since>250)hide_panel(true,taskbar_peek.active());}else outside_since=0;
     }
     bool paint_panel(bool commit=true) {
         PAINTSTRUCT ps{};BeginPaint(panel,&ps);RECT r{};GetClientRect(panel,&r);
@@ -835,7 +836,7 @@ struct Shell::Impl {
                 case CaptureAction::ReturnLocal:s->local(true);break;
                 case CaptureAction::Failed:s->local(true);s->status=L"Input channel stalled. Returned to this computer.";break;
                 case CaptureAction::HidePanel:s->hide_panel();break;
-                case CaptureAction::HidePanelAnimated:s->hide_panel(true);break;
+                case CaptureAction::HidePanelAnimated:s->hide_panel(true,s->taskbar_peek.active());break;
                 case CaptureAction::Summon:if(s->panel_mode)s->hide_panel(true);else{s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;}s->publish_input();break;
                 default:break;
                 }return 0;
@@ -852,7 +853,7 @@ struct Shell::Impl {
                 std::shared_ptr<ClipboardJob> job;{std::lock_guard lock(s->jobs_mutex);auto it=s->jobs.find(static_cast<uint64_t>(w));if(it!=s->jobs.end())job=it->second;}
                 if(job){std::lock_guard lock(job->mutex);try{s->write_clipboard(job->value);job->done=true;}catch(const std::exception& e){job->error=e.what();}return job->done?1:0;}return 0;
             }
-            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel();else if(w==3){KillTimer(window,3);s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
+            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel(false,s->taskbar_peek.active());else if(w==3){KillTimer(window,3);s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
             case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:case WM_SETTINGCHANGE:s->system_color();return 0;
             case WM_CLIPBOARDUPDATE:s->read_clipboard(true);return 0;
             case TrayMessage:
@@ -1035,6 +1036,9 @@ struct Shell::Impl {
 };
 Shell::Shell():impl_(new Impl){}
 Shell::~Shell(){delete impl_;}
+#ifdef HIVEDESK_SHELL_TEST
+#include "../tests/shell_taskbar_regression.inc"
+#endif
 bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks callbacks,std::string& error){return impl_->create(instance,config,std::move(callbacks),error);}
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
 HWND Shell::viewer_window()const{const auto surface=viewer_surface();return surface?surface->window:nullptr;}

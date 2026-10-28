@@ -13,11 +13,19 @@ struct InputCaptureState {
     uint64_t generation=0,session=0;
     std::string peer;
     bool remote=false,relative=false,settings_visible=false,panel_visible=false,panel_summoned=false,recording_hotkey=false;
-    bool windowed=false,panel_dragging=false,local_shell=false;HWND viewer{};
+    bool windowed=false,panel_dragging=false,local_shell=false;HWND viewer{},panel{};
     RECT panel_rect{},settings_rect{},viewer_rect{};
     uint32_t screen_width=1,screen_height=1,remote_width=0,remote_height=0;
     uint32_t hotkey_key=0,hotkey_modifiers=0;
 };
+// Hit-tested root distinguishes Explorer covering the bottom of the sidebar
+// from a click on Hive itself. The hook only posts a dismissal; never consumes it.
+inline bool dismiss_panel_on_mouse_down(const InputCaptureState& s,POINT p,HWND root) {
+    if(!s.panel_visible||!(s.panel_summoned||s.local_shell)||s.panel_dragging||
+        (s.settings_visible&&PtInRect(&s.settings_rect,p)))return false;
+    if(s.local_shell&&root&&root!=s.panel)return true;
+    return !PtInRect(&s.panel_rect,p);
+}
 struct PhysicalPointer { POINT point{};uint64_t revision=0,motion_tick=0; };
 struct InputCaptureDiagnostics {
     uint64_t captured=0,dispatched=0,coalesced=0,overflows=0,expired=0;

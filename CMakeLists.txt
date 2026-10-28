@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
-project(HiveDesk VERSION 0.5.3 LANGUAGES CXX)
-set(HIVEDESK_VERSION "0.5.3")
+project(HiveDesk VERSION 0.5.4 LANGUAGES CXX)
+set(HIVEDESK_VERSION "0.5.4")
 add_compile_definitions(HIVEDESK_VERSION="${HIVEDESK_VERSION}")
 enable_language(RC)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -165,6 +165,7 @@ target_link_libraries(HiveDeskMediaFreshnessCheck PRIVATE hive_core)
 
 # Waiting-screen regression runs on an isolated, noninteractive window station.
 add_executable(HiveDeskWaitingCheck tests/waiting_screen.cpp src/shell.cpp)
+target_compile_definitions(HiveDeskWaitingCheck PRIVATE HIVEDESK_SHELL_TEST)
 target_link_libraries(HiveDeskWaitingCheck PRIVATE hive_core shell32 dcomp d2d1 msimg32)
 add_test(NAME waiting_screen COMMAND HiveDeskWaitingCheck)
 set_tests_properties(waiting_screen PROPERTIES TIMEOUT 30)

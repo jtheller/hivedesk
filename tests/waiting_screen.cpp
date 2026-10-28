@@ -45,6 +45,7 @@ int probe(){
         SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));
         waiting=find(L"HiveDesk.Waiting");
     };
+    shell.taskbar_interaction_self_test();
     shell.update_thumbnail("a",image(80));select(1);
     const auto initial_revision=GetPropW(waiting,L"HiveDesk.SurfaceRevision");
     SendMessageW(shell.viewer_window(),WM_SIZE,SIZE_RESTORED,0);

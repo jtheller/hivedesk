@@ -64,6 +64,10 @@ public:
     TaskbarPeek(const TaskbarPeek&)=delete;TaskbarPeek& operator=(const TaskbarPeek&)=delete;
     bool active()const{return active_;}
     bool fading()const{return fade_started_!=0;}
+    void keep_panel_below()const{
+        // Reopening Hive must not cover Start or raise Explorer above its menus.
+        if(active_&&IsWindow(tray_)&&IsWindow(panel_))SetWindowPos(panel_,tray_,0,0,0,0,Flags);
+    }
     static bool corner(POINT p,int width,int height,int dpi){
         const int edge=std::max(1,MulDiv(4,dpi,96));
         return width>0&&height>0&&p.x>=0&&p.x<edge&&p.y>=height-edge&&p.y<height;

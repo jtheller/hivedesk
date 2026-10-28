@@ -73,6 +73,9 @@ public:
     // Atomically exclude a new Settings window from the final restart decision.
     bool prepare_video_restart();
     void cancel_video_restart();
+#ifdef HIVEDESK_SHELL_TEST
+    void taskbar_interaction_self_test();
+#endif
 private: struct Impl; Impl* impl_ = nullptr;
 };
 // Primary screen injection. Track only injected held keys/buttons, release on explicit handoff.
