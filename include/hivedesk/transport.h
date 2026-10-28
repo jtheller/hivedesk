@@ -24,6 +24,7 @@ struct TransportCallbacks {
     std::function<void(const std::string&, const StreamSettings&)> start_stream;
     std::function<void(const std::string&)> stop_stream;
     std::function<void(const std::string&, uint64_t)> cancel_warm;
+    std::function<void(const std::string&, uint64_t,bool)> preview;
     std::function<void(const std::string&, EncodedFrame)> frame;
     std::function<void(const std::string&, const InputEvent&)> input;
     std::function<void(const std::string&, const std::wstring&)> clipboard;
@@ -65,6 +66,7 @@ public:
     void rename(const std::string& name);
     bool request_stream(const std::string& peer, const StreamSettings&);
     void stop_stream(const std::string& peer);
+    bool preview(const std::string& peer,uint64_t session,bool enabled);
     bool cancel_warm(const std::string& peer, uint64_t session);
     // Revoke source output before calling. Removes its unsent video and queues a
     // session-scoped notice on the reliable control channel, keeping the pair

@@ -58,6 +58,7 @@ if($Hardware){
     foreach($probe in @('MediaReady','MediaFreshness','Presentation','TaskbarPresentation')){
         Check ('hardware-'+$probe) (Join-Path $build ('HiveDesk'+$probe+'Check.exe')) @() 90
     }
+    Check 'hardware-live-peek' (Join-Path $build 'HiveDeskPresentationCheck.exe') @('--peek-only') 90
     Check 'loopback-automatic' (Join-Path $build 'HiveDeskLoopback.exe') @('--background-automatic') 90
     Check 'loopback-delayed-feedback' (Join-Path $build 'HiveDeskLoopback.exe') @('--background-feedback-delay') 90
     Check 'vendor-capabilities' (Join-Path $build 'HiveDeskMediaProbe.exe') @() 45

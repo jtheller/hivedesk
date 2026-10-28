@@ -22,6 +22,7 @@ public:
     // directly rather than waiting for the compatibility timeout.
     void notify_ready();
     void activate();
+    void preview(bool enabled);
     bool running() const;
     std::string failure() const;
     void feedback(const StreamFeedback&);
@@ -36,6 +37,8 @@ public:
     // Prewarm prepares pixels without touching the hidden swapchain. Selection
     // enables presentation after the UI has assigned its final window/style.
     void activate();
+    void preview(bool enabled);
+    void peek_opacity(bool visible,bool animate=true);
     void set_display_cadence(bool enabled);
     void submit(EncodedFrame frame);
     void request_stop(); // Invalidate work immediately; close() joins separately.

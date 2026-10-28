@@ -1,4 +1,5 @@
 #include "hivedesk/shell.h"
+#include "hivedesk/media.h"
 #include "../src/viewer_geometry.h"
 #include <cmath>
 #include <windows.h>
@@ -32,6 +33,9 @@ int probe(){
     std::atomic<unsigned> clipboard_echoes=0;
     hive::Shell shell;hive::ShellConfig config;config.device_name=L"Waiting test";config.desktop.tray_icon=false;
     hive::ShellCallbacks callbacks;unsigned selected=0;std::vector<std::string> saved_order;std::string last_selected;bool allow_save=true;
+    std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;std::string peek_id;uint64_t peek_epoch=0;
+    callbacks.visible_peers=[&](const auto& surfaces){visible=surfaces;};
+    callbacks.peek_peer=[&](const auto& id,uint64_t epoch){peek_id=id;peek_epoch=epoch;};
     callbacks.clipboard_changed=[&](const std::wstring&){++clipboard_echoes;};
     callbacks.select_peer=[&](const std::string& id){++selected;last_selected=id;};
     callbacks.save_order=[&](const std::vector<std::string>& order){if(!allow_save)return false;saved_order=order;return true;};
@@ -200,6 +204,23 @@ int probe(){
     SendMessageW(floating->window,WM_CLOSE,0,0);require(!shown(floating->window),"Closing floating viewer did not return locally");
     SendMessageW(owner,WM_HOTKEY,81,0);SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
     require(!(GetWindowLongW(shell.viewer_window(),GWL_STYLE)&WS_THICKFRAME),"Normal click inherited floating mode");shell.show_local();
+    // Peek is a separate, epoch-bound UI lease. A ready preview is adopted
+    // directly; delayed ready/hide events cannot cover or hide the selection.
+    shell.update_peers({{"a","Computer A","",47980,true,hive::FeatureWarmStream|hive::FeatureLivePeek},{"b","Computer B","",47980,true,hive::FeatureWarmStream|hive::FeatureLivePeek}});pump(10);
+    SendMessageW(owner,WM_HOTKEY,81,0);require(visible.size()==2,"Peek surfaces not prewarmed");
+    auto peek=visible.front();auto media=std::make_shared<hive::MediaViewer>();const auto before=selected;
+    SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),center(1)));const auto old_epoch=peek_epoch;
+    require(peek_id==peek->peer&&selected==before,"Hover selected a controller");
+    shell.show_peek(peek,media,old_epoch,true);require(shown(peek->window)&&GetPropW(panel,L"HiveDesk.PeekReady"),"Ready preview did not show");
+    SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(0,0));shell.show_peek(peek,media,old_epoch,true);
+    require(!GetPropW(panel,L"HiveDesk.PeekReady"),"Stale preview completion reclaimed hover");
+    SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),center(1)));shell.show_peek(peek,media,peek_epoch,true);
+    SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
+    waiting=find(L"HiveDesk.Waiting");
+    require(shell.viewer_surface()==peek&&shown(peek->window)&&!shown(waiting),"Preview click recreated or covered its live surface");
+    SendMessageW(owner,WM_TIMER,4,0);shell.show_peek(peek,media,old_epoch,true);
+    require(shown(peek->window)&&!shown(waiting),"Delayed preview/fade event hid the adopted viewer");shell.show_local();
+    std::puts("PASS peek UI: hover authority isolation, stale completion rejection, direct live adoption and fade cancellation");
     return 0;
 }
 }

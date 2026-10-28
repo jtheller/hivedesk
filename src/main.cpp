@@ -27,7 +27,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace hive {int host_check();int warm_broker_check();}
+namespace hive {int host_check();int warm_broker_check(bool peek=false);}
 namespace {
 using MonitorSide=hive::Telemetry::Side;
 class App {
@@ -68,7 +68,16 @@ public:
         };
         callbacks.visible_peers=[this](const std::vector<std::shared_ptr<const hive::ViewerSurface>>& surfaces){
             {const std::lock_guard lock(warm_mutex_);warm_visible_=surfaces;}
-            wake_.notify_one();
+            warm_dirty_=true;wake_.notify_one();
+        };
+        callbacks.peek_peer=[this](const std::string& peer,uint64_t epoch){
+            {std::lock_guard lock(warm_mutex_);
+                // Enqueue pause immediately, even while the lifecycle worker is
+                // waiting for another machine's first picture. Never join here.
+                if(auto old=warm_views_.find(peek_peer_);old!=warm_views_.end())transport_.preview(old->first,old->second->settings.session,false);
+                peek_peer_=peer;peek_epoch_=epoch;
+            }
+            peek_requested_=!peer.empty();warm_dirty_=true;wake_.notify_one();
         };
         callbacks.panel_opened=[this] {
             for(const auto& peer:transport_.peers())if(peer.features&hive::FeatureDesktopAux) {
@@ -186,7 +195,7 @@ private:
         SetThreadDescription(GetCurrentThread(),L"HiveDesk commands / viewer lifecycle");
         for(;;) {
             std::function<void()> job;
-            {std::unique_lock lock(queue_mutex_);wake_.wait_for(lock,std::chrono::milliseconds(250),[this]{return closing_||!queue_.empty();});if(closing_)break;if(!queue_.empty()){job=std::move(queue_.front());queue_.pop_front();}}
+            {std::unique_lock lock(queue_mutex_);wake_.wait_for(lock,std::chrono::milliseconds(peek_requested_?16:250),[this]{return closing_||!queue_.empty()||warm_dirty_;});warm_dirty_=false;if(closing_)break;if(!queue_.empty()){job=std::move(queue_.front());queue_.pop_front();}}
             try {if(job)job();update_tick();retry_tick();warm_tick();} catch(const std::exception& error) {status(error.what());}
         }
         // Keep DXGI destruction and socket/thread joins off the HWND-owning thread.
@@ -230,12 +239,12 @@ private:
                     },true))warm->failed=true;
             }catch(const std::exception& e){warm->open_error=e.what();warm->failed=true;}
             if(warm->abandoned||closing_)warm->viewer->request_stop();
-            warm->done=true;--preparing_;wake_.notify_one();
+            warm->done=true;--preparing_;warm_dirty_=true;wake_.notify_one();
         },priority);
         return warm;
     }
     void retire_warm(const std::shared_ptr<WarmView>& warm) {
-        warm->abandoned=true;retiring_warm_.push_back(warm);
+        warm->abandoned=true;retiring_warm_.push_back(warm);shell_.cancel_peek(warm->surface);
         if(warm->requested)transport_.cancel_warm(warm->surface->peer,warm->settings.session);
         if(warm->done)warm->viewer->request_stop();
         retire_lane_.post([warm]{
@@ -255,10 +264,10 @@ private:
                 host->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(host->peer,host->session);
             }
         }
-        std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;
+        std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;std::string peek_peer;uint64_t peek_epoch=0;
         std::vector<std::shared_ptr<WarmView>> expired;
         {
-            const std::lock_guard lock(warm_mutex_);visible=warm_visible_;
+            const std::lock_guard lock(warm_mutex_);visible=warm_visible_;peek_peer=peek_peer_;peek_epoch=peek_epoch_;
             for(auto it=warm_views_.begin();it!=warm_views_.end();){
                 auto& warm=it->second;
                 const bool wanted=std::any_of(visible.begin(),visible.end(),[&](const auto& surface){return surface==warm->surface;});
@@ -271,7 +280,31 @@ private:
             }
         }
         for(const auto& warm:expired)retire_warm(warm);
+        std::vector<std::shared_ptr<WarmView>> preview_candidates;
+        {std::lock_guard lock(warm_mutex_);for(const auto& [id,warm]:warm_views_)preview_candidates.push_back(warm);}
+        for(const auto& warm:preview_candidates){
+            const bool wanted=!update_pending&&warm->surface->peer==peek_peer&&!warm->failed&&!warm->abandoned;
+            if(warm->peeking&&(!wanted||warm->peek_epoch!=peek_epoch)){
+                transport_.preview(warm->surface->peer,warm->settings.session,false);warm->peeking=false;warm->peek_revealed=false;
+            }
+            if(wanted&&warm->requested&&warm->done&&!warm->peeking){
+                const auto before=warm->viewer->cursor_presentation();
+                bool sent=false;
+                {std::lock_guard lock(warm_mutex_);if(peek_peer_==peek_peer&&peek_epoch_==peek_epoch)sent=transport_.preview(warm->surface->peer,warm->settings.session,true);}
+                if(sent){
+                    warm->peeking=true;warm->peek_epoch=peek_epoch;warm->peek_before=before;warm->peek_revealed=false;
+                    shell_.show_peek(warm->surface,warm->viewer,peek_epoch,false);warm->viewer->preview(true);
+                }
+            }
+            if(warm->peeking&&!warm->peek_revealed){
+                const auto frame=warm->viewer->cursor_presentation();
+                if(frame.valid&&frame.session==warm->settings.session&&(!warm->peek_before.valid||frame.sequence!=warm->peek_before.sequence)){
+                    warm->peek_revealed=true;shell_.show_peek(warm->surface,warm->viewer,warm->peek_epoch,true);
+                }
+            }
+        }
         if(update_pending)return;
+        std::stable_sort(visible.begin(),visible.end(),[&](const auto& a,const auto& b){return (a->peer==peek_peer)>(b->peer==peek_peer);});
         for(const auto& surface:visible){
             {const std::lock_guard lock(queue_mutex_);if(closing_||!queue_.empty())break;}
             if(const auto active=active_.load();active&&*active==surface->peer)continue;
@@ -491,6 +524,14 @@ private:
                 status("Streaming primary display to a computer on your network.");
             }
         };
+        callbacks.preview=[this](const std::string& peer,uint64_t session,bool enabled){
+            const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
+            // A preview can only change an existing warm lease. It never starts
+            // a host, preempts a controller or grants clipboard/input authority.
+            if(closing_||!target||target->revoked||!target->warming||target->peer!=peer||target->session!=session||target->connection!=transport_.connection_token(peer))return;
+            if(!host_.preview(enabled)){target->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,session);}
+            else target->warm_until=GetTickCount64()+10000;
+        };
         callbacks.cancel_warm=[this](const std::string& peer,uint64_t session){
             const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
             if(target&&target->warming&&target->peer==peer&&target->session==session){
@@ -692,6 +733,7 @@ private:
         // lock held while UI selection or the input thread needs that lock.
         if(!admitted){go_local(nullptr,false,false);return;}
         {const std::lock_guard lock(config_mutex_);viewer_.load()->set_display_cadence(config_.desktop.display_cadence);}
+        const auto startup_picture=viewer_.load()->cursor_presentation();
         if(warm)viewer_.load()->activate();
         if(warm){const auto size=warm->size.load();remote_size_=size;if(size)shell_.set_remote_size(uint32_t(size>>32),uint32_t(size));}
         telemetry_.select(MonitorSide::View,peer,stream.session,hive::narrow(label));
@@ -709,7 +751,9 @@ private:
             // The waiting cover already makes the viewer visible. Keep it
             // opaque until this session has actually submitted its first image,
             // not merely finished decoding while the old HWND image remains.
-            if(viewer_.load()->has_presented_frame()&&(!active_dedicated_input_||transport_.input_ready(peer,stream.session))) {ready=true;break;}
+            const auto picture=viewer_.load()->cursor_presentation();
+            const bool new_picture=picture.valid&&(!startup_picture.valid||picture.session!=startup_picture.session||picture.sequence>startup_picture.sequence);
+            if(new_picture&&viewer_.load()->has_presented_frame()&&(!active_dedicated_input_||transport_.input_ready(peer,stream.session))) {ready=true;break;}
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if(epoch!=generation_||closing_) {go_local(active_.exchange(nullptr),false);return;}
@@ -799,7 +843,7 @@ private:
         std::shared_ptr<hive::MediaViewer> viewer=std::make_shared<hive::MediaViewer>();
         hive::StreamSettings settings;
         uint64_t connection=0,last_visible=0,renewed=0,last_feedback=0;
-        bool requested=false;
+        bool requested=false,peeking=false,peek_revealed=false;uint64_t peek_epoch=0;hive::CursorPresentation peek_before;
         std::string open_error;
         std::atomic<bool> done{false},abandoned{false},retired{false},failed{false};std::atomic<uint64_t> size{0};
     };
@@ -810,6 +854,7 @@ private:
     std::mutex warm_mutex_;
     std::map<std::string,std::shared_ptr<WarmView>> warm_views_;
     std::vector<std::shared_ptr<const hive::ViewerSurface>> warm_visible_;
+    std::string peek_peer_;uint64_t peek_epoch_=0;std::atomic<bool> peek_requested_{false},warm_dirty_{false};
     hive::AppConfig config_;
     hive::Shell shell_;
     hive::Transport transport_;
@@ -853,13 +898,14 @@ private:
 #ifndef HIVEDESK_APP_SESSION_TEST
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false,warm_check=false;
+    int count=0;LPWSTR* arguments=CommandLineToArgvW(GetCommandLineW(),&count);bool open_settings=true;bool background=false,quiet=false,host_check=false,warm_check=false,peek_check=false;
     HANDLE previous=nullptr;bool valid_arguments=true,recover=false,manual_restart=false;
     if(arguments){for(int i=1;i<count;++i){
         if(wcscmp(arguments[i],L"--background")==0)background=true;
         else if(wcscmp(arguments[i],L"--quiet")==0)quiet=true;
         else if(wcscmp(arguments[i],L"--host-check")==0)host_check=true;
         else if(wcscmp(arguments[i],L"--warm-broker-check")==0)warm_check=true;
+        else if(wcscmp(arguments[i],L"--peek-broker-check")==0){warm_check=true;peek_check=true;}
         else if(wcscmp(arguments[i],L"--restart")==0)manual_restart=true;
         else if(wcscmp(arguments[i],L"--restart-after")==0){if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
         else if(wcscmp(arguments[i],L"--recover-after")==0){recover=true;if(previous||++i>=count||!hive::gpu_policy_restart::parse_wait_handle(arguments[i],previous)){valid_arguments=false;break;}}
@@ -894,7 +940,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!singleton)return 1;
     const DWORD singleton_status=GetLastError();
     if(host_check){CloseHandle(singleton);return hive::host_check();}
-    if(warm_check){CloseHandle(singleton);return hive::warm_broker_check();}
+    if(warm_check){CloseHandle(singleton);return hive::warm_broker_check(peek_check);}
     if(singleton_status==ERROR_ALREADY_EXISTS){if(open_settings){const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr);DWORD process=0;GetWindowThreadProcessId(owner,&process);AllowSetForegroundWindow(process);PostMessageW(owner,WM_APP+45,0,0);}CloseHandle(singleton);return 0;}
     if(recovery_guard.value){CloseHandle(recovery_guard.value);recovery_guard.value=nullptr;}
     update_startup.release();

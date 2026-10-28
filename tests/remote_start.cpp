@@ -9,7 +9,7 @@
 
 // Read-only warm lease probe: never sends a normal Start, clipboard or input.
 // A busy host rejects the lease. Cleanup only cancels this warm session.
-int warm_remote_check(const char* address) {
+int warm_remote_check(const char* address,bool peek) {
     const auto config=hive::load_config();std::mutex mutex;std::condition_variable changed;
     hive::Transport client;const uint64_t session=GetTickCount64();unsigned frames=0;bool declined=false;
     hive::TransportCallbacks callbacks;
@@ -26,6 +26,19 @@ int warm_remote_check(const char* address) {
     if(!client.request_stream(peer,settings)){std::puts("FAIL warm renewal");return 1;}
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     {std::lock_guard lock(mutex);if(frames!=1||declined){std::puts("FAIL warm lease did not retain exactly one picture");return 1;}}
+    if(peek){
+        const auto count=[&]{std::lock_guard lock(mutex);return frames;};
+        if(!client.preview(peer,session+1,true)){std::puts("FAIL live preview capability unavailable");return 1;}
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));if(count()!=1){std::puts("FAIL wrong-session preview changed warm host");return 1;}
+        if(!client.preview(peer,session,true)){std::puts("FAIL live preview request");return 1;}
+        {std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return frames>=4||declined;})||declined){std::puts("FAIL preview did not continue streaming");return 1;}}
+        if(!client.preview(peer,session,false)){std::puts("FAIL live preview pause");return 1;}
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));const auto paused=count();std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        if(count()!=paused){std::puts("FAIL paused preview kept sending frames");return 1;}
+        client.preview(peer,session,true);
+        {std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return frames>=paused+3||declined;})||declined){std::puts("FAIL preview resume");return 1;}}
+        std::puts("PASS remote live preview: wrong-session rejection, continuous frames, pause/resume; no input/clipboard/normal Start.");
+    }
     std::puts("PASS remote warm request, single encoded picture, paused renewal, scoped cancellation; no input/clipboard/normal Start.");return 0;
 }
 

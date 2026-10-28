@@ -13,6 +13,7 @@
 #include "capture_sequence.h"
 #include "viewer_queue.h"
 #include "latest_picture.h"
+#include "viewer_composition.h"
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -858,6 +859,7 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain> swap_;
+    std::shared_ptr<ViewerComposition> composition_;
     HANDLE display_ready_=nullptr;
     bool display_credit_=false; // Presenter thread; consumed only by a successful Present.
     bool paced_present_=false;
@@ -878,7 +880,7 @@ private:
         hr(device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &target_), "Create render target");
     }
 public:
-    explicit Renderer(HWND window,bool paced=false) : window_(window),paced_present_(paced) {
+    explicit Renderer(HWND window,bool paced=false,bool composed=false) : window_(window),paced_present_(paced) {
         if (!IsWindow(window)) throw std::runtime_error("Invalid viewer window.");
         // Match capture's primary-output ownership. A default D3D adapter can
         // differ on hybrid/multiple-GPU machines; NVDEC follows this device.
@@ -900,8 +902,19 @@ public:
         swap.BufferCount = 2; swap.OutputWindow = window; swap.Windowed = TRUE;
         swap.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         if(paced_present_)swap.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        if(composed){
+            hr(D3D11CreateDevice(adapter_.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device_,nullptr,&context_),"Create composed viewer device");
+            ComPtr<IDXGIFactory2> factory;hr(adapter_->GetParent(IID_PPV_ARGS(&factory)),"Get composition factory");
+            RECT bounds{};GetClientRect(window,&bounds);DXGI_SWAP_CHAIN_DESC1 desc{};
+            desc.Width=std::max(1L,bounds.right);desc.Height=std::max(1L,bounds.bottom);desc.Format=swap.BufferDesc.Format;
+            desc.SampleDesc.Count=1;desc.BufferUsage=swap.BufferUsage;desc.BufferCount=2;desc.Scaling=DXGI_SCALING_STRETCH;
+            desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;desc.AlphaMode=DXGI_ALPHA_MODE_IGNORE;desc.Flags=swap.Flags;
+            ComPtr<IDXGISwapChain1> chain;hr(factory->CreateSwapChainForComposition(device_.Get(),&desc,nullptr,&chain),"Create preview swapchain");hr(chain.As(&swap_),"Get preview swapchain");
+            composition_=std::make_shared<ViewerComposition>();composition_->create(window,device_.Get(),swap_.Get());
+        }else{
         hr(D3D11CreateDeviceAndSwapChain(adapter_.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
              nullptr, 0, D3D11_SDK_VERSION, &swap, &swap_, &device_, nullptr, &context_), "Create viewer D3D11 device");
+        }
         DXGI_SWAP_CHAIN_DESC actual{}; hr(swap_->GetDesc(&actual), "Get swapchain description");
         window_width_ = actual.BufferDesc.Width; window_height_ = actual.BufferDesc.Height; target();
         constexpr char shader[] =
@@ -942,6 +955,7 @@ public:
     bool present_pending() const {return pending_present_;}
     bool cancel_pending() {return std::exchange(pending_present_,false);}
     void set_present_for_test(std::function<HRESULT()> callback){present_for_test_=std::move(callback);}
+    std::shared_ptr<ViewerComposition> composition()const{return composition_;}
     void set_cursor_presented(std::function<void(const CursorPresentation&)> callback){cursor_presented_=std::move(callback);}
     bool retry_present(const std::function<bool()>& eligible={},uint32_t* present_cost=nullptr) {
         if(present_cost)*present_cost=0;
@@ -1053,6 +1067,7 @@ struct MediaViewer::Impl {
     std::condition_variable changed;
     ViewerQueue frames;
     bool stopping = true, displayed = false, present_enabled = true;
+    std::shared_ptr<ViewerComposition> composition;
     std::atomic<bool> display_cadence=false;
     CursorPresentation cursor;
     std::thread worker;
@@ -1111,7 +1126,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
     // DXGI creation may synchronously send window messages. Create it on the
     // caller/UI thread, then hand the device/context to the render worker.
     std::unique_ptr<Renderer> renderer;
-    try { renderer = std::make_unique<Renderer>(window,true); }
+    try { renderer = std::make_unique<Renderer>(window,true,GetPropW(window,L"HiveDesk.PeekSurface")!=nullptr); }
     catch (const std::exception& problem) { error = problem.what(); return false; }
     renderer->set_cursor_presented([this,presented=std::move(presented)](const CursorPresentation& cursor){
         bool changed=false;
@@ -1125,7 +1140,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
         // transitions need UI work; retain the last presented state for startup.
         if(changed&&presented)presented(cursor);
     });
-    { std::lock_guard guard(impl_->mutex); impl_->stopping = false; impl_->present_enabled=!warm; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
+    { std::lock_guard guard(impl_->mutex); impl_->composition=renderer->composition(); impl_->stopping = false; impl_->present_enabled=!warm; impl_->frames.reset(); impl_->displayed = false; impl_->status = "Opening HEVC444 viewer";
         impl_->cursor={};
         impl_->live_window={};impl_->live_totals={};impl_->live_window.sample(now_us(),{});
         impl_->feedback={};impl_->last_arrival=0;impl_->service_samples.clear();impl_->present_samples.clear();impl_->diagnostics={};impl_->sample_since=now_us();impl_->receive_sample_at=0;impl_->received_count=impl_->decoded_count=impl_->presented_count=impl_->received_bytes=0;}
@@ -1308,10 +1323,13 @@ void MediaViewer::request_stop() {
 }
 void MediaViewer::close() {
     request_stop();if (impl_->worker.joinable()) impl_->worker.join();
+    std::lock_guard guard(impl_->mutex);impl_->composition.reset();
 }
 void MediaViewer::set_display_cadence(bool enabled){impl_->display_cadence=enabled;}
+void MediaViewer::peek_opacity(bool visible,bool animate){std::lock_guard guard(impl_->mutex);if(impl_->composition)impl_->composition->opacity(visible,animate);}
+void MediaViewer::preview(bool enabled){if(!enabled)return;{std::lock_guard guard(impl_->mutex);impl_->present_enabled=true;}impl_->changed.notify_all();}
 void MediaViewer::activate(){
-    {std::lock_guard guard(impl_->mutex);impl_->present_enabled=true;}
+    {std::lock_guard guard(impl_->mutex);if(impl_->composition)impl_->composition->opacity(true,false);impl_->present_enabled=true;}
     impl_->changed.notify_all();
 }
 std::string MediaViewer::stats() const { std::lock_guard guard(impl_->mutex); return impl_->status; }

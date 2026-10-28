@@ -147,6 +147,7 @@ public:
         else check(list_opacity_->SetOpacity(1.0f));
         check(device_->Commit());
     }
+    void ready(){check(device_->WaitForCommitCompletion());}
     void create(HWND window) {
         window_=window;
         check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&gpu_,nullptr,nullptr));

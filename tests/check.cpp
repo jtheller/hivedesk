@@ -8,11 +8,12 @@
 #include <iostream>
 #include <thread>
 int remote_start_check(const char* address,const std::string& part);
-int warm_remote_check(const char* address);
+int warm_remote_check(const char* address,bool peek=false);
 int main(int argc,char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const std::string mode=argc>1?argv[1]:"--all";
+        if(mode=="--peek"||mode=="--peek-remote"){if(mode=="--peek-remote"&&argc!=3)return 2;return warm_remote_check(mode=="--peek"?"127.0.0.1":argv[2],true);}
         if(mode=="--warm-remote"){
             if(argc!=3){std::cerr<<"Use --warm-remote <IPv4 address>\n";return 2;}
             return warm_remote_check(argv[2]);

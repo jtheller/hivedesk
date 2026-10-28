@@ -10,7 +10,7 @@
 namespace hive {
 // Explicit installed-main-app diagnostic. The broker has one pipe instance:
 // an existing controller cannot be displaced. No input/hooks/clipboard calls.
-int warm_broker_check(){
+int warm_broker_check(bool peek){
     std::mutex mutex;std::condition_variable changed;
     unsigned frames=0;uint64_t first=0,second=0;bool fresh_idr=false;
     HostBridge host; // Join callbacks before their state is destroyed.
@@ -30,6 +30,15 @@ int warm_broker_check(){
         wait(1,"Warm SYSTEM capture produced no first picture");
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         {std::lock_guard lock(mutex);if(frames!=1)throw std::runtime_error("Warm SYSTEM encoder did not pause");}
+        if(peek){
+            if(!host.preview(true))throw std::runtime_error("Read-only preview request failed");
+            wait(4,"Read-only preview did not produce continuous pictures");
+            if(!host.preview(false))throw std::runtime_error("Preview pause failed");
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));unsigned paused;{std::lock_guard lock(mutex);paused=frames;}
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));{std::lock_guard lock(mutex);if(frames!=paused)throw std::runtime_error("Preview pause kept encoding");}
+            if(!host.preview(true))throw std::runtime_error("Preview resume failed");wait(paused+3,"Preview resume stalled");
+            log("PASS installed read-only preview: continuous pictures, pause and resume; no input or clipboard calls.");
+        }
         if(!host.activate())throw std::runtime_error("SYSTEM broker activation acknowledgement failed");
         wait(2,"Activated SYSTEM encoder produced no fresh picture");
         host.stop();

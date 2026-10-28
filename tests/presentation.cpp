@@ -19,13 +19,14 @@ int main(int argc,char** argv){
     // Observe only this probe's focus events. The user may change applications
     // during verification; that is not evidence that a generated window activated.
     const auto focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,foreground_event,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
+    const bool peek_only=argc==2&&std::strcmp(argv[1],"--peek-only")==0;
     const bool warm_only=argc==2&&std::strcmp(argv[1],"--warm-only")==0;
     try{
         if(!focus_hook)throw std::runtime_error("Cannot observe probe foreground events");
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         WNDCLASSW c{};c.lpfnWndProc=proc;c.hInstance=GetModuleHandleW(nullptr);c.lpszClassName=L"HiveDeskGeneratedPresentation";RegisterClassW(&c);
         const int x=GetSystemMetrics(SM_CXSCREEN)-330,y=80,w=320,h=180;
-        video=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT,c.lpszClassName,L"HiveDesk generated video check",WS_POPUP,x,y,w,h,nullptr,nullptr,c.hInstance,nullptr);
+        video=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|(peek_only?WS_EX_NOREDIRECTIONBITMAP:0),c.lpszClassName,L"HiveDesk generated video check",WS_POPUP,x,y,w,h,nullptr,nullptr,c.hInstance,nullptr);
         cover=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP|WS_EX_TRANSPARENT,c.lpszClassName,L"HiveDesk generated cover check",WS_POPUP,x,y,w,h,video,nullptr,c.hInstance,nullptr);
         PanelComposition composition;composition.create(cover);std::vector<uint32_t> pixels(w*h,0xff162030);
         for(int row=0;row<3;++row)for(int yy=8+row*58;yy<54+row*58;++yy)for(int xx=12;xx<308;++xx)pixels[yy*w+xx]=0xff2080e0;
@@ -48,6 +49,7 @@ int main(int argc,char** argv){
         if(gap!=RGB(22,32,48))throw std::runtime_error("Drag did not animate the adjacent card out of the insertion slot");
         composition.finish_cards();
         }
+        if(peek_only)SetPropW(video,L"HiveDesk.PeekSurface",reinterpret_cast<HANDLE>(1));
         hive::experience_enabled(true);hive::MediaViewer viewer;auto open=std::async(std::launch::async,[&]{std::string error;if(!viewer.open(video,error,{},true))throw std::runtime_error(error);});
         while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
         auto frame=hive::media_generated_test_frame();
@@ -65,9 +67,24 @@ int main(int argc,char** argv){
         // was open. It can be older than the presentation freshness budget.
         // The next live frame arrives only after the remote host is activated.
         pump(300);
-        viewer.activate();pump(100);
+        if(peek_only)viewer.preview(true);else viewer.activate();pump(100);
         for(unsigned i=0;i<100&&!viewer.has_presented_frame();++i){++frame.sequence;viewer.submit(frame);pump(25);}
         const bool presented=viewer.has_presented_frame();std::printf("Real covered viewer: decoded=%d presented=%d status=%s\n",viewer.has_frame(),presented,viewer.stats().c_str());
+        if(peek_only){
+            // Put our generated opaque surface below the transparent preview.
+            // Pixel reads remain entirely inside these two generated windows.
+            SetWindowLongPtrW(cover,GWLP_HWNDPARENT,0);
+            composition.present(pixels.data(),w,h);composition.cover(w,h,false);composition.ready();
+            SetWindowPos(cover,HWND_TOPMOST,x,y,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+            SetWindowPos(video,HWND_TOPMOST,x,y,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);pump(100);
+            const auto sample=[&]{HDC screen=GetDC(nullptr);const auto color=GetPixel(screen,x+160,y+30);ReleaseDC(nullptr,screen);return color;};
+            const auto backdrop=sample();if(backdrop!=RGB(32,128,224))throw std::runtime_error("Unready preview is not transparent over generated background");
+            viewer.peek_opacity(true);pump(240);const auto live=sample();
+            if(live==backdrop||live==CLR_INVALID||live==RGB(0,0,0))throw std::runtime_error("Live preview did not become visible through DWM");
+            viewer.peek_opacity(false);pump(240);if(sample()!=backdrop)throw std::runtime_error("Preview fade-out did not restore underlying image");
+            viewer.peek_opacity(true);pump(50);viewer.activate();pump(80);if(sample()!=live)throw std::runtime_error("Preview promotion changed/lost its presented pixels");
+            std::printf("PASS real DWM peek: transparent readiness, live fade-in/out, same-surface promotion; pixels=%06lx\n",(unsigned long)live);
+        }
         viewer.set_display_cadence(true);++frame.sequence;viewer.submit(frame);pump(200);
         const auto repeats=viewer.diagnostics().repeated_presentations;
         if(!repeats)throw std::runtime_error("Cadence did not repeat the final displayed image without new input");

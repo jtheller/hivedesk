@@ -156,7 +156,11 @@ struct Session {
                 if(!send(broker::Started))break;
             }else if(kind==broker::Activate){
                 std::lock_guard lock(media_mutex);if(!b.empty()||!active)break;
-                settings.warm=false;warming=false;media.activate();if(!send(broker::Activated))break;
+                settings.warm=false;settings.preview=false;warming=false;media.activate();if(!send(broker::Activated))break;
+            }else if(kind==broker::Preview){
+                const auto enabled=r.u32();std::lock_guard lock(media_mutex);
+                if(!r.end()||enabled>1||!active)break;
+                if(warming){settings.preview=enabled!=0;media.preview(settings.preview);}
             }else if(kind==broker::Ready){if(!b.empty()||!active)break;credit=true;media.notify_ready();}
             else if(kind==broker::Keyframe){if(!b.empty()||!active)break;media.request_keyframe();}
             else if(kind==broker::Feedback){

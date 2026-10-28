@@ -1,6 +1,6 @@
 // Included within namespace hive in media.cpp, after the private GPU classes.
 struct MediaHost::Impl {
-    std::atomic<bool> stop{true},keyframe{true},warming{false};
+    std::atomic<bool> stop{true},keyframe{true},warming{false},previewing{false};
     std::mutex wait_mutex;
     std::condition_variable changed;
     FrameTimer pacing_timer;
@@ -18,7 +18,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
     stop();
     if(!output){error="Missing encoded-frame callback.";return false;}
     if(settings.session&&(settings.receiver_millihz<1000||settings.receiver_millihz>2000000)){error="Invalid receiver refresh rate.";return false;}
-    impl_->sequence.begin(settings.session);impl_->warming=settings.warm;
+    impl_->sequence.begin(settings.session);impl_->warming=settings.warm;impl_->previewing=settings.preview;
     {std::lock_guard lock(impl_->wait_mutex);impl_->stop=false;impl_->failure.clear();impl_->keyframe=true;impl_->feedback={};impl_->session=settings.session;impl_->feedback_time=impl_->feedback_sequence=impl_->last_recovery=0;}
     std::promise<std::string> initialized;auto ready=initialized.get_future();
     impl_->worker=std::thread([this,settings,output=std::move(output),ready_to_send=std::move(ready_to_send),health=std::move(health),diagnostics=std::move(diagnostics),initialized=std::move(initialized)]()mutable{
@@ -103,9 +103,9 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                 uint64_t last_reconfigure=diagnostic_since;
                 uint32_t capture_wait=0,network_extra=0;bool warm_submitted=false;
                 while(!impl_->stop){
-                    if(impl_->warming&&warm_submitted&&!impl_->keyframe){
+                    if(impl_->warming&&!impl_->previewing&&warm_submitted&&!impl_->keyframe){
                         std::unique_lock lock(impl_->wait_mutex);
-                        impl_->changed.wait(lock,[&]{return impl_->stop||!impl_->warming||impl_->keyframe;});
+                        impl_->changed.wait(lock,[&]{return impl_->stop||!impl_->warming||impl_->previewing||impl_->keyframe;});
                         if(impl_->stop)break;
                         deadline=Clock::now();
                     }
@@ -268,6 +268,7 @@ void MediaHost::stop(){{std::lock_guard lock(impl_->wait_mutex);impl_->stop=true
 bool MediaHost::running()const{return !impl_->stop.load();}
 std::string MediaHost::failure()const{std::lock_guard lock(impl_->wait_mutex);return impl_->failure;}
 void MediaHost::request_keyframe(){{std::lock_guard lock(impl_->wait_mutex);impl_->keyframe=true;}impl_->wake();}
+void MediaHost::preview(bool enabled){std::lock_guard lock(impl_->wait_mutex);impl_->previewing=enabled;if(enabled)impl_->keyframe=true;impl_->wake();}
 void MediaHost::activate(){std::lock_guard lock(impl_->wait_mutex);impl_->warming=false;impl_->keyframe=true;impl_->wake();}
 void MediaHost::notify_ready(){std::lock_guard lock(impl_->wait_mutex);impl_->changed.notify_all();}
 void MediaHost::feedback(const StreamFeedback& feedback){

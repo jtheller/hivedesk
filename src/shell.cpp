@@ -1,4 +1,5 @@
 #include "hivedesk/shell.h"
+#include "hivedesk/media.h"
 #include "panel_composition.h"
 #include "taskbar_peek.h"
 #include "viewer_geometry.h"
@@ -84,13 +85,63 @@ struct Shell::Impl {
         for(const auto& id:ids){
             auto& surface=warm_surfaces[id];
             if(!surface){
-                const auto window=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,
+                const auto window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,
                     0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
-                if(window)surface=std::make_shared<const ViewerSurface>(ViewerSurface{window,id});
+                if(window){SetPropW(window,L"HiveDesk.PeekSurface",reinterpret_cast<HANDLE>(1));surface=std::make_shared<const ViewerSurface>(ViewerSurface{window,id});}
             }
             if(surface)surfaces.push_back(surface);
         }
         callbacks.visible_peers(surfaces);
+    }
+    std::string peek_id;uint64_t peek_epoch=0;bool peek_live=false;
+    std::shared_ptr<const ViewerSurface> peek_surface;
+    std::shared_ptr<MediaViewer> peek_media;
+    struct FadingPeek {std::shared_ptr<const ViewerSurface> surface;std::shared_ptr<MediaViewer> media;ULONGLONG until;};
+    std::vector<FadingPeek> fading_peeks;
+    void end_peek(bool animate=true,HWND adopt=nullptr){
+        if(peek_surface){
+            if(peek_surface->window!=adopt){
+                try{peek_media->peek_opacity(false,animate);}catch(...){}
+                if(animate)fading_peeks.push_back({peek_surface,peek_media,GetTickCount64()+200});
+                else ShowWindow(peek_surface->window,SW_HIDE);
+            }
+            peek_surface.reset();peek_media.reset();
+        }
+        peek_live=false;RemovePropW(panel,L"HiveDesk.PeekReady");
+        if(!peek_id.empty()){peek_id.clear();++peek_epoch;if(callbacks.peek_peer)callbacks.peek_peer({},peek_epoch);}
+        if(!animate){for(const auto& old:fading_peeks)if(old.surface->window!=adopt)ShowWindow(old.surface->window,SW_HIDE);fading_peeks.clear();}
+        publish_input();
+    }
+    void hover_peek(int index){
+        if(pressed_card>=0)return;
+        std::string id;
+        if(panel_mode&&!panel_closing&&pressed_card<0&&!taskbar_peek.active()&&index>0&&index<=int(peers.size())){
+            const auto& p=peers[index-1];if(p.id!=active_id&&p.authenticated&&(p.features&FeatureLivePeek))id=p.id;
+        }
+        if(id==peek_id)return;
+        end_peek();peek_id=id;
+        if(!id.empty()){++peek_epoch;if(callbacks.peek_peer)callbacks.peek_peer(id,peek_epoch);}
+        publish_input();
+    }
+    void show_peek_ui(std::shared_ptr<const ViewerSurface> surface,std::shared_ptr<MediaViewer> media,uint64_t epoch,bool ready){
+        if(shutting_down||!panel_mode||panel_closing||epoch!=peek_epoch||surface->peer!=peek_id||surface->window==viewer||dragging||taskbar_peek.active())return;
+        std::erase_if(fading_peeks,[&](const auto& p){return p.surface==surface;});
+        peek_surface=surface;peek_media=media;
+        SetWindowPos(surface->window,HWND_TOPMOST,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SetWindowPos(panel,HWND_TOPMOST,0,0,0,0,SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
+        if(ready&&!peek_live){try{media->peek_opacity(true);}catch(...){end_peek(false);return;}peek_live=true;}
+        SetPropW(panel,L"HiveDesk.PeekReady",reinterpret_cast<HANDLE>(ULONG_PTR(peek_live)));publish_input();
+    }
+    void tick_peek(){
+        std::erase_if(fading_peeks,[&](const auto& old){if(GetTickCount64()<old.until)return false;if((!peek_surface||peek_surface!=old.surface)&&old.surface->window!=viewer)ShowWindow(old.surface->window,SW_HIDE);return true;});
+        if(peek_surface&&peek_media->stats().starts_with("Media error:"))end_peek(false);
+    }
+    HWND transition_viewer{},transition_waiting{};
+    PanelComposition transition_composition;
+    void finish_transition(){
+        if(transition_viewer&&transition_viewer!=viewer)ShowWindow(transition_viewer,SW_HIDE);
+        if(transition_waiting){ShowWindow(transition_waiting,SW_HIDE);DestroyWindow(transition_waiting);}
+        transition_viewer=transition_waiting=nullptr;transition_composition=PanelComposition{};
     }
     PanelComposition waiting_composition;
     bool waiting_visible=false,waiting_fading=false,waiting_retry=false;
@@ -235,7 +286,7 @@ struct Shell::Impl {
     InputCaptureState input_state(bool keep_taskbar_guard=false) {
         InputCaptureState state;state.generation=generation.load();state.session=input_session;state.peer=active_id;
         if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
-        state.local_shell=taskbar_peek.active()||taskbar_focus_guard;
+        state.local_shell=taskbar_peek.active()||taskbar_focus_guard||!peek_id.empty()||!fading_peeks.empty();
         state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel=panel;state.panel_visible=panel&&(GetWindowLongPtrW(panel,GWL_STYLE)&WS_VISIBLE);state.panel_summoned=panel_summoned;
@@ -251,6 +302,7 @@ struct Shell::Impl {
         if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;}
     }
     void hide_panel(bool animate=false,bool keep_taskbar=false) {
+        end_peek(animate);
         // Popup dismissal is independent of the native taskbar interaction.
         // Restoring z-order here would steal the Start click still in flight.
         if(!keep_taskbar){if(animate)taskbar_peek.leave();else taskbar_peek.reset();}
@@ -292,8 +344,9 @@ struct Shell::Impl {
             bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,nullptr,nullptr,instance,this);
         if(surface){
             SetWindowLongPtrW(next,GWL_STYLE,style);
-            SetWindowPos(next,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
-                SWP_NOACTIVATE|SWP_NOZORDER|SWP_FRAMECHANGED);
+            auto ex=GetWindowLongPtrW(next,GWL_EXSTYLE);SetWindowLongPtrW(next,GWL_EXSTYLE,(ex&~(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE))|WS_EX_APPWINDOW);
+            SetWindowPos(next,HWND_NOTOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
+                SWP_NOACTIVATE|SWP_FRAMECHANGED);
         }
         if(!next)return false;
         const HWND next_waiting=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,
@@ -307,23 +360,24 @@ struct Shell::Impl {
         }catch(const std::exception&){DestroyWindow(next_waiting);if(surface)retired_viewers.push_back(surface);else DestroyWindow(next);return false;}
         if(!surface)surface=std::make_shared<const ViewerSurface>(ViewerSurface{next,peer});
         if(!IsWindowVisible(viewer)&&!remote&&GetForegroundWindow()!=panel)prior_focus=GetForegroundWindow();
-        ShowWindow(viewer,SW_HIDE);
+        finish_transition();transition_viewer=viewer;
         // The waiting HWND also retains its previous snapshot/fade in DWM.
         // Give it a fresh target, rather than racing a reset commit against Show.
         KillTimer(owner,4);waiting_visible=waiting_fading=false;
-        ShowWindow(waiting,SW_HIDE);DestroyWindow(waiting);
+        transition_waiting=waiting;transition_composition=std::move(waiting_composition);
         waiting=next_waiting;waiting_composition=std::move(next_composition);
         // Move the remaining owned popup before retiring its owner.
         SetWindowLongPtrW(health_badge,GWLP_HWNDPARENT,reinterpret_cast<LONG_PTR>(next));
         viewer=next;viewer_maximized=viewer_restore_pending=false;
         if(auto previous=viewer_surface.exchange(std::move(surface)))retired_viewers.push_back(std::move(previous));
-        collect_viewers();return true;
+        return true;
     }
     void hide_waiting() {
+        finish_transition();
         KillTimer(owner,4);waiting_visible=waiting_fading=false;
         if(waiting)ShowWindow(waiting,SW_HIDE);
     }
-    void paint_waiting(bool entering) {
+    void paint_waiting(bool /*entering*/) {
         const auto client=viewer_client();const int width=std::max(1L,client.right-client.left),height=std::max(1L,client.bottom-client.top);
         BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;
         info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* pixels=nullptr;
@@ -355,22 +409,23 @@ struct Shell::Impl {
         message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
         draw_text(dc,small_font,message,{left+px(16),badge.top+px(39),badge.right-px(12),bottom-px(5)},Muted);
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
-        try{waiting_composition.present(pixels,width,height,false);waiting_composition.cover(float(width),float(height),entering);}
+        try{waiting_composition.present(pixels,width,height,false);waiting_composition.cover(float(width),float(height),false);}
         catch(...){SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);throw;}
         SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);
         SetWindowTextW(waiting,(L"HiveDesk - "+message+L" - "+label).c_str());
     }
-    void begin_waiting(const std::string& id,bool retry) {
+    void begin_waiting(const std::string& id,bool retry,bool adopting=false) {
         KillTimer(owner,4);waiting_fading=false;waiting_retry=retry;
         if(active_id!=id)previous_id=active_id;
         if(!IsWindowVisible(viewer)&&!prior_focus)prior_focus=GetForegroundWindow();
         active_id=id;remote=true;reconnecting=true;input_session=0;publish_input();
         reset_remote_cursor();
+        if(adopting){hide_waiting();SetWindowPos(viewer,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);SetForegroundWindow(viewer);return;}
         try{
-            const auto r=viewer_client();const int width=r.right-r.left,height=r.bottom-r.top;
-            waiting_composition.cover(float(width),float(height),false,true);
-            SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-            paint_waiting(true);
+            paint_waiting(false);
+            // Submit the complete opaque snapshot before exposing either HWND.
+            // Commit() alone is asynchronous and can expose a black new surface.
+            waiting_composition.ready();
         }catch(const std::exception&){
             // Never expose the previous swap chain if composition failed.
             local(true);status=L"Could not display the connection screen.";return;
@@ -382,6 +437,7 @@ struct Shell::Impl {
         // Showing an owner can change its owned popup visibility. Reassert the
         // prepared cover after the viewer becomes visible, before activation.
         SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        finish_transition();collect_viewers();
         SetForegroundWindow(viewer);SetFocus(viewer);SetCursor(LoadCursorW(nullptr,IDC_ARROW));
     }
     void reset_remote_cursor() {
@@ -454,13 +510,15 @@ struct Shell::Impl {
         auto it=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==id;});
         if(it==peers.end()){status=L"Computer is no longer in the device list.";InvalidateRect(panel,nullptr,FALSE);return;}
         ++generation;input_session=0;publish_input();
+        const bool adopting=peek_live&&peek_surface&&peek_surface->peer==id&&!as_window;
+        const HWND adopted=adopting?peek_surface->window:nullptr;end_peek(false,adopted);
         windowed=as_window;window_ratio=16.0/9;
         if(const auto snapshot=full_snapshots.find(id);snapshot!=full_snapshots.end()){BITMAP b{};GetObjectW(snapshot->second,sizeof(b),&b);if(b.bmWidth>0&&b.bmHeight>0)window_ratio=double(b.bmWidth)/b.bmHeight;}
         if(!replace_viewer(id,drop)){local(true);status=L"Could not create the desktop window.";return;}
         remote=false;reconnecting=false;publish_input();
         reset_remote_cursor();
         remote_width=remote_height=0;selection_armed=true;pending_id=id;ReleaseCapture();ClipCursor(nullptr);hide_panel();
-        begin_waiting(id,false);
+        begin_waiting(id,false,adopting);
         if(!selection_armed)return;
         if(callbacks.select_peer)callbacks.select_peer(id);
     }
@@ -532,6 +590,7 @@ struct Shell::Impl {
         if(panel)InvalidateRect(panel,nullptr,FALSE);
     }
     void begin_panel_cycle(POINT pointer) {
+        end_peek(false);
         // A new opening owns a fresh taskbar state. Pointer exit during the
         // previous opening never revokes the lease, but reopening always does.
         taskbar_peek.reset();
@@ -584,7 +643,7 @@ struct Shell::Impl {
         if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
     }
     void timer() {
-        publish_visible();collect_viewers();
+        tick_peek();publish_visible();collect_viewers();
         // Latest-state mailbox: no per-report UI messages or stale report FIFO.
         std::optional<PendingSource> incoming;
         {std::lock_guard lock(source_mutex);incoming=std::move(pending_source);pending_source.reset();}
@@ -616,12 +675,13 @@ struct Shell::Impl {
         POINT p{};GetCursorPos(&p);update_panel_pointer(p,GetTickCount64());
     }
     void update_panel_pointer(POINT p,ULONGLONG now) {
+        if(panel_mode&&!panel_closing){const int h=card_at(p);hover_peek(h);}else hover_peek(-1);
         taskbar_peek.tick();
         if(panel_mode==2&&!panel_closing&&pressed_card<0){
             const bool trigger=TaskbarPeek::corner(p,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),dpi);
             if(!trigger)taskbar_corner_armed=true;
             if(!taskbar_peek.active()&&trigger&&taskbar_corner_armed){
-                taskbar_corner_armed=false;
+                taskbar_corner_armed=false;end_peek(false);
                 taskbar_focus_guard=true;publish_input(true);ClipCursor(nullptr);
                 if(!taskbar_peek.enter(panel,viewer))taskbar_focus_guard=false;
                 publish_input();
@@ -843,6 +903,11 @@ struct Shell::Impl {
             case WM_CLOSE:s->local(true);s->shutting_down=true;s->tray(true);PostQuitMessage(0);return 0;
             }
         }
+        if(window!=s->viewer&&GetPropW(window,L"HiveDesk.PeekSurface")){
+            if(message==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
+            if(message==WM_NCHITTEST)return HTTRANSPARENT;
+            if(message==WM_ERASEBKGND)return 1;
+        }
         if(window==s->panel) {
             switch(message) {
             case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
@@ -862,13 +927,13 @@ struct Shell::Impl {
             case WM_CAPTURECHANGED:case WM_CANCELMODE:s->cancel_drag();return 0;
             case WM_MOUSEMOVE:{
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
-                if(s->pressed_card>0&&!s->dragging&&(abs(p.x-s->drag_origin.x)>=GetSystemMetrics(SM_CXDRAG)||abs(p.y-s->drag_origin.y)>=GetSystemMetrics(SM_CYDRAG))){s->dragging=true;if(s->panel_mode==1)s->show_panel(2);s->begin_drag_visual();}
+                if(s->pressed_card>0&&!s->dragging&&(abs(p.x-s->drag_origin.x)>=GetSystemMetrics(SM_CXDRAG)||abs(p.y-s->drag_origin.y)>=GetSystemMetrics(SM_CYDRAG))){s->end_peek(false);s->dragging=true;if(s->panel_mode==1)s->show_panel(2);s->begin_drag_visual();}
                 if(s->dragging){
                     const bool outside=p.x>=s->panel_width;
                     s->drop_slot=outside?-1:std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
                     SetCursor(LoadCursorW(nullptr,outside?IDC_SIZEALL:IDC_SIZENS));s->move_drag_visual(p);return 0;
                 }
-                int h=s->card_at(p);if(h!=s->hovered){s->hovered=h;InvalidateRect(window,nullptr,FALSE);}return 0;
+                int h=s->card_at(p);s->hover_peek(h);if(h!=s->hovered){s->hovered=h;InvalidateRect(window,nullptr,FALSE);}return 0;
             }
             case WM_LBUTTONUP:{
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};const bool dragged=s->dragging;const auto id=s->dragged_peer;const int slot=std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
@@ -969,7 +1034,7 @@ struct Shell::Impl {
         // Consume a launcher's STARTF_USESHOWWINDOW override on the invisible,
         // zero-size tool window, so the first real settings/viewer show is honored.
         if(owner){ShowWindow(owner,SW_SHOWNOACTIVATE);ShowWindow(owner,SW_HIDE);}
-        viewer=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
+        viewer=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Viewer",L"HiveDesk",WS_POPUP,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),nullptr,nullptr,instance,this);
         if(viewer)viewer_surface.store(std::make_shared<const ViewerSurface>(ViewerSurface{viewer,{}}));
         panel=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP,L"HiveDesk.Switcher",L"HiveDesk computers",WS_POPUP,0,0,px(200),px(123),nullptr,nullptr,instance,this);
         health_badge=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED|WS_EX_TRANSPARENT,L"HiveDesk.Health",L"Stream status",WS_POPUP,0,0,px(136),px(30),viewer,nullptr,instance,this);
@@ -1038,6 +1103,8 @@ void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->gener
     s->begin_waiting(peer,true);
 });}
 void Shell::set_remote_size(uint32_t width,uint32_t height){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,width,height,g]{if(g==s->generation.load()){s->remote_width=width;s->remote_height=height;s->size_to_source();s->publish_input();}});}
+void Shell::cancel_peek(std::shared_ptr<const ViewerSurface> surface){impl_->dispatch([s=impl_,surface=std::move(surface)]{if(s->peek_id==surface->peer&&(!s->peek_surface||s->peek_surface==surface))s->end_peek(false);});}
+void Shell::show_peek(std::shared_ptr<const ViewerSurface> surface,std::shared_ptr<MediaViewer> media,uint64_t epoch,bool ready){impl_->dispatch([s=impl_,surface=std::move(surface),media=std::move(media),epoch,ready]{s->show_peek_ui(surface,media,epoch,ready);});}
 void Shell::show_local(){impl_->dispatch([s=impl_]{s->local(false);});}
 void Shell::quit(){impl_->dispatch([s=impl_]{PostMessageW(s->owner,WM_CLOSE,0,0);});}
 void Shell::set_status(const std::wstring& status){impl_->dispatch([s=impl_,status]{s->status=status;InvalidateRect(s->panel,nullptr,FALSE);});}

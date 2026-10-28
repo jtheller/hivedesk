@@ -49,7 +49,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -209,7 +209,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -788,6 +788,11 @@ struct Transport::Impl {
             if(!(c.peer.features&FeatureWarmStream)||!session||!r.end())return false;
             if(callbacks.cancel_warm)callbacks.cancel_warm(c.peer.id,session);return true;
         }
+        case LivePeek: {
+            const auto session=r.qword();const auto enabled=r.byte();
+            if(!(c.peer.features&FeatureLivePeek)||!session||enabled>1||!r.end())return false;
+            if(callbacks.preview)callbacks.preview(c.peer.id,session,enabled!=0);return true;
+        }
         case WarmStart:
         case AutoStart: {
             StreamSettings settings;settings.session=r.qword();settings.receiver_millihz=r.dword();settings.warm=type==WarmStart;
@@ -982,6 +987,10 @@ bool Transport::request_stream(const std::string& peer, const StreamSettings& s)
         if(s.warm&&!(c->peer.features&FeatureWarmStream))return false;
         Bytes b{uint8_t(s.warm?WarmStart:AutoStart)};u64(b,s.session);u32(b,s.receiver_millihz);return c->enqueue(std::move(b));}
     auto c = impl_->find(peer); if (!c || !s.bitrate_mbps || s.bitrate_mbps > 10000) return false; Bytes b{Start}; u32(b,s.fps); u32(b,s.bitrate_mbps); return c->enqueue(std::move(b));
+}
+bool Transport::preview(const std::string& peer,uint64_t session,bool enabled){
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureLivePeek)||!session)return false;
+    Bytes b{LivePeek};u64(b,session);b.push_back(enabled?1:0);return c->enqueue(std::move(b));
 }
 bool Transport::cancel_warm(const std::string& peer,uint64_t session) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureWarmStream)||!session)return false;

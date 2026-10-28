@@ -340,3 +340,7 @@ receive it and writes PASS/FAIL to log.txt; it does not lock the PC or alter the
 
 See docs/VALIDATION.md for exact validation and known limitations. Logs and settings
 are stored under the current user's LOCALAPPDATA/HiveDesk directory. Logs rotate at 1 MiB.
+
+Live Peek (0.7.0): hover a remote card in Hive for a fading, read-only live preview;
+leave to restore the current desktop, click to take control. Both ends need 0.7.0.
+Only the hovered warm host streams continuously. See [Peek behavior](docs/PEEK.zh-CN.md).

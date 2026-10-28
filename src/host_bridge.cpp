@@ -142,6 +142,7 @@ bool HostBridge::activate(){
     std::unique_lock lock(impl_->activation_mutex);
     return impl_->activation_changed.wait_for(lock,std::chrono::seconds(2),[&]{return impl_->activated||impl_->stopped;})&&impl_->activated;
 }
+bool HostBridge::preview(bool enabled){broker::Bytes b;broker::u32(b,enabled?1:0);return impl_->send(broker::Preview,b);}
 void HostBridge::notify_ready(){impl_->downstream.notify();}
 void HostBridge::request_keyframe(){impl_->send(broker::Keyframe);}
 void HostBridge::feedback(const StreamFeedback& report){broker::Bytes b;broker::u64(b,report.session);broker::u64(b,report.capture_time_us);broker::u32(b,report.arrival_age_us);broker::u32(b,report.service_us);broker::u32(b,report.queue_us);broker::u32(b,report.recover?1:0);if(report.rate_details)rate_wire::write_feedback(report,[&](uint32_t n){broker::u32(b,n);},[&](uint64_t n){broker::u64(b,n);});impl_->send(broker::Feedback,b);}

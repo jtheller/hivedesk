@@ -14,6 +14,7 @@ public:
     // Wakes a blocked frame-credit handoff without polling the scheduler.
     void notify_ready();
     bool activate();
+    bool preview(bool enabled);
     bool input(const InputEvent&);
     bool input(const InputPacket&);
     // Close input authority immediately, then join only its own small-pipe ACK

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 namespace hive {
+class MediaViewer;
 // The renderer holds this lease until its worker/swap chain has stopped. Shell
 // hides retired windows immediately and destroys them only after lease release.
 struct ViewerSurface { HWND window{};std::string peer; };
@@ -33,6 +34,7 @@ struct ShellCallbacks {
     std::function<void(const std::wstring&, const std::string&, const StreamSettings&)> save_settings;
     std::function<void(const std::string&)> connect_address;
     std::function<void()> panel_opened;
+    std::function<void(const std::string&,uint64_t)> peek_peer;
     std::function<void(const std::vector<std::shared_ptr<const ViewerSurface>>&)> visible_peers;
     std::function<bool(const std::string&, const CursorState&)> cursor_changed;
     std::function<void()> stream_tick;
@@ -55,6 +57,8 @@ public:
     void show_reconnecting(const std::string& peer);
     void set_remote_size(uint32_t width, uint32_t height);
     void show_local();
+    void cancel_peek(std::shared_ptr<const ViewerSurface>);
+    void show_peek(std::shared_ptr<const ViewerSurface>,std::shared_ptr<MediaViewer>,uint64_t epoch,bool ready);
     void set_status(const std::wstring&);
     void show_error(const std::wstring&);
     // Synchronously marshal to UI, complete the write before returning, deduplicate listener events.

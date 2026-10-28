@@ -10,14 +10,15 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic events on interactive station");
     const auto profile=std::filesystem::temp_directory_path()/(L"HiveDesk-AppSessions-"+std::to_wstring(GetCurrentProcessId()));std::filesystem::create_directories(profile);SetEnvironmentVariableW(L"LOCALAPPDATA",profile.c_str());
     auto encoded=hive::media_generated_test_frame();
-    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;};
-    std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0;std::atomic<bool> bad_handoff=false;
+    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;};
+    std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0,previews=0,preview_stops=0,visible_previews=0;std::atomic<bool> bad_handoff=false;
     for(unsigned i=0;i<3;++i){auto& p=peers[i];hive::TransportCallbacks cb;
         cb.clipboard=[&p](const std::string&,const std::wstring&){std::lock_guard lock(p.mutex);p.handoff=true;};
-        cb.start_stream=[&p,&starts,&promotions,&warms,&bad_handoff](const std::string& id,const hive::StreamSettings& s){std::lock_guard lock(p.mutex);if(s.warm)++warms;else{++starts;if(!std::exchange(p.handoff,false))bad_handoff=true;if(p.warm&&p.session==s.session)++promotions;}p.client=id;if(p.session!=s.session)p.sequence=0;p.session=s.session;p.warm=s.warm;p.remaining=s.warm?1:10000;};
+        cb.start_stream=[&p,&starts,&promotions,&warms,&bad_handoff](const std::string& id,const hive::StreamSettings& s){std::lock_guard lock(p.mutex);if(s.warm){++warms;if(p.session==s.session&&p.warm)return;p.handoff=false;p.peek=false;}else{p.peek=false;++starts;if(!std::exchange(p.handoff,false))bad_handoff=true;if(p.warm&&p.session==s.session)++promotions;}p.client=id;if(p.session!=s.session)p.sequence=0;p.session=s.session;p.warm=s.warm;p.remaining=s.warm?1:10000;};
+        cb.preview=[&p,&previews,&preview_stops,&bad_handoff](const std::string&,uint64_t session,bool enabled){std::lock_guard lock(p.mutex);if(p.warm&&p.session==session){if(enabled){++previews;if(p.handoff)bad_handoff=true;}else ++preview_stops;p.peek=enabled;p.remaining=enabled?10000:0;}};
         cb.stop_stream=[&p](const std::string&){p.remaining=0;};
         cb.cancel_warm=[&p](const std::string&,uint64_t s){if(p.session==s&&p.warm)p.remaining=0;};
-        cb.input_begin=[](const std::string&,uint64_t){return true;};
+        cb.input_begin=[&p,&bad_handoff](const std::string&,uint64_t){if(p.warm){bad_handoff=true;return false;}return true;};
         cb.input_packet=[&p](const std::string& id,const hive::InputPacket& in){p.net.send_input_ack(id,{in.session,in.sequence,in.capture_time_us,0,0,true});};
         std::string error;require(p.net.start({"peer-"+std::to_string(i),"Generated peer "+std::to_string(i),"stress-key",uint16_t(48190+i),false,true},cb,error),error.c_str());
     }
@@ -31,8 +32,25 @@ int probe(){
         for(auto& p:peers){std::string id,error;for(unsigned attempt=0;attempt<30&&!stop;++attempt){if(p.net.connect("127.0.0.1",48194,id,error))break;Sleep(100);}}
 
         Sleep(150);
+        PostMessageW(owner,WM_HOTKEY,81,0);Sleep(1500);
+        for(int index=1;index<=2;++index){
+            SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&,index]{const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));})));
+            Sleep(700);
+        }
+        SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&]{SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(0,0));})));
+        Sleep(300);PostMessageW(owner,WM_HOTKEY,81,0);Sleep(250);
         for(unsigned n=0;n<24&&!stop;++n){
             PostMessageW(owner,WM_HOTKEY,81,0);Sleep(n%6==0?1500:350);
+            auto hover=new std::function<void()>([&,n]{
+                const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;
+                SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),px(12)+(1+n%3)*(tile+px(16))+tile/2));
+            });SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(hover));
+            Sleep(n%4==0?700:30);if(GetPropW(panel,L"HiveDesk.PeekReady"))++visible_previews;
+            if(n%4==0){
+                SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&]{SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(0,0));})));
+                Sleep(60);
+                require(!GetPropW(panel,L"HiveDesk.PeekReady"),"Pointer leave retained active preview");
+            }
             auto task=new std::function<void()>([&,n]{
                 const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;
                 const int y=px(12)+(1+n%3)*(tile+px(16))+tile/2;
@@ -47,7 +65,9 @@ int probe(){
     const int result=app.run(GetModuleHandleW(nullptr),false);stop=true;driver.join();producer.join();for(auto& p:peers)p.net.stop();
     std::printf("session counts: starts=%u warm=%u promotions=%u\n",starts.load(),warms.load(),promotions.load());
     require(starts>=8&&warms>=3&&promotions>=1,"Stress did not exercise actual warm promotion and repeated Start");
-    require(!bad_handoff,"A selected stream started before its clipboard handoff");
+    std::printf("peek counts: starts=%u stops=%u shown=%u\n",previews.load(),preview_stops.load(),visible_previews.load());
+    require(previews>=2&&preview_stops>=1,"Stress did not exercise live preview, reveal and leave");
+    require(!bad_handoff,"Preview granted input/clipboard or selection missed handoff");
     std::puts("PASS isolated actual App: three encrypted generated peers, prewarm, rapid selection, windowed drops, cancellation and shutdown");return result;
 }
 int wmain(int argc,wchar_t**){
