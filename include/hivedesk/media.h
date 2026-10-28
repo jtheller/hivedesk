@@ -31,9 +31,11 @@ private: struct Impl; std::unique_ptr<Impl> impl_;
 class MediaViewer {
 public:
     MediaViewer(); ~MediaViewer();
-    // HWND belongs to UI; decoder/rendering must not depend on UI message pumping.
+    // HWND belongs to UI. Optional Present replacement is only for explicit
+    // noninteractive tests; production callers leave it empty.
     bool open(HWND window, std::string& error,
-        std::function<void(const CursorPresentation&)> presented={},bool warm=false);
+        std::function<void(const CursorPresentation&)> presented={},bool warm=false,
+        std::function<HRESULT()> present_for_test={});
     // Prewarm prepares pixels without touching the hidden swapchain. Selection
     // enables presentation after the UI has assigned its final window/style.
     void activate();

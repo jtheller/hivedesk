@@ -81,6 +81,7 @@ int main(int argc,char** argv){
             const auto sample=[&]{HDC screen=GetDC(nullptr);const auto color=GetPixel(screen,x+160,y+30);ReleaseDC(nullptr,screen);return color;};
             const auto backdrop=sample();if(backdrop!=RGB(32,128,224))throw std::runtime_error("Unready preview is not transparent over generated background");
             viewer.peek_opacity(true);pump(240);const auto live=sample();
+            std::printf("Peek visibility pixels: backdrop=%06lx live=%06lx status=%s\n",(unsigned long)backdrop,(unsigned long)live,viewer.stats().c_str());
             if(live==backdrop||live==CLR_INVALID||live==RGB(0,0,0))throw std::runtime_error("Live preview did not become visible through DWM");
             viewer.peek_opacity(false);pump(240);if(sample()!=backdrop)throw std::runtime_error("Preview fade-out did not restore underlying image");
             viewer.peek_opacity(true);pump(50);viewer.activate();pump(80);if(sample()!=live)throw std::runtime_error("Preview promotion changed/lost its presented pixels");
@@ -118,6 +119,34 @@ int main(int argc,char** argv){
         viewer.set_display_cadence(false);pump(40);const auto stopped=viewer.diagnostics().repeated_presentations;pump(100);
         if(viewer.diagnostics().repeated_presentations!=stopped)throw std::runtime_error("Cadence kept repeating after disable");
         std::printf("Cadence: %llu repeats with no additional encoded frames; live disable passed\n",static_cast<unsigned long long>(repeats));
+        if(peek_only){
+            // Keep a live preview behind each replacement. Exercise actual
+            // DComp targets, CUDA registration, Present and asynchronous close
+            // repeatedly without activating windows or touching user input.
+            for(unsigned cycle=0;cycle<12;++cycle){
+                HWND next=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP|WS_EX_TRANSPARENT,c.lpszClassName,
+                    L"HiveDesk generated preview replacement",WS_POPUP,x,y,w,h,nullptr,nullptr,c.hInstance,nullptr);
+                if(!next)throw std::runtime_error("Create replacement preview");
+                struct WindowLease{HWND value;~WindowLease(){DestroyWindow(value);}} lease{next};
+                SetPropW(next,L"HiveDesk.PeekSurface",reinterpret_cast<HANDLE>(1));
+                hive::MediaViewer replacement;std::string error;
+                auto opening=std::async(std::launch::async,[&]{return replacement.open(next,error,{},true);});
+                while(opening.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(2);
+                if(!opening.get())throw std::runtime_error(error);
+                SetWindowPos(next,HWND_TOPMOST,x,y,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);replacement.preview(true);
+                auto fresh=ramp[cycle%ramp.size()];fresh.sequence=0;fresh.session=100+cycle;fresh.capture_time_us=fresh.source_ready_us=0;
+                for(unsigned attempt=0;attempt<100&&!replacement.has_presented_frame();++attempt){++fresh.sequence;replacement.submit(fresh);pump(15);}
+                if(!replacement.has_presented_frame())throw std::runtime_error("Replacement preview never completed a real Present");
+                replacement.peek_opacity(true);pump(35);replacement.peek_opacity(false);pump(25);replacement.activate();pump(70);
+                const auto actual=samples();const int expected_red=80+20*(cycle%ramp.size());
+                if(std::abs(int(GetRValue(actual[0]))-expected_red)>5||std::abs(int(GetGValue(actual[0]))-int(GetGValue(stable[0])))>5)
+                    throw std::runtime_error("Rapid preview replacement showed black or stale pixels");
+                replacement.request_stop();ShowWindow(next,SW_HIDE);
+                auto retirement=std::async(std::launch::async,[&]{replacement.close();});
+                while(retirement.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(2);retirement.get();
+            }
+            std::puts("PASS real DWM: 12 replacement preview lifecycles, rapid fade reversal/promotion, distinct final pixels and retirement");
+        }
         auto close=std::async(std::launch::async,[&]{viewer.close();});while(close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);close.get();
         if(!presented)throw std::runtime_error("No real first Present under cover");
         pump(1);DWORD foreground_process=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground_process);

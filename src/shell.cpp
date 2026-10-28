@@ -337,7 +337,7 @@ struct Shell::Impl {
             DestroyWindow(surface->window);return true;
         });
     }
-    bool replace_viewer(const std::string& peer,POINT drop) {
+    bool replace_viewer(const std::string& peer,POINT drop,bool use_warm=true) {
         // A reused flip-model HWND can expose its last DWM image before the
         // asynchronous waiting-cover commit. Never show that HWND again for a
         // new selection, even if its render worker is still finishing a frame.
@@ -352,7 +352,7 @@ struct Shell::Impl {
             bounds.left=std::clamp(drop.x-w/2,work_area.left,std::max(work_area.left,work_area.right-w));bounds.top=std::clamp(drop.y-px(24),work_area.top,std::max(work_area.top,work_area.bottom-h));bounds.right=bounds.left+w;bounds.bottom=bounds.top+h;
         }
         std::shared_ptr<const ViewerSurface> surface;
-        if(auto warm=warm_surfaces.find(peer);warm!=warm_surfaces.end()){surface=warm->second;warm_surfaces.erase(warm);}
+        if(auto warm=warm_surfaces.find(peer);use_warm&&warm!=warm_surfaces.end()){surface=warm->second;warm_surfaces.erase(warm);}
         const HWND next=surface?surface->window:CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Viewer",L"HiveDesk",style,
             bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,nullptr,nullptr,instance,this);
         if(surface){
@@ -1130,6 +1130,29 @@ bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks c
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
 HWND Shell::viewer_window()const{const auto surface=viewer_surface();return surface?surface->window:nullptr;}
 std::shared_ptr<const ViewerSurface> Shell::viewer_surface()const{return impl_->viewer_surface.load();}
+std::future<std::shared_ptr<const ViewerSurface>> Shell::renew_viewer_surface(std::shared_ptr<const ViewerSurface> expected){
+    auto reply=std::make_shared<std::promise<std::shared_ptr<const ViewerSurface>>>();auto result=reply->get_future();
+    const auto generation=impl_->generation.load();
+    impl_->dispatch([s=impl_,expected=std::move(expected),reply,generation]{
+        try{
+            if(!expected||generation!=s->generation||s->viewer_surface.load()!=expected||!s->selection_armed||s->pending_id!=expected->peer){reply->set_value(nullptr);return;}
+            RECT bounds{};GetWindowRect(s->viewer,&bounds);const bool maximized=IsZoomed(s->viewer)!=FALSE;
+            if(!s->replace_viewer(expected->peer,{bounds.left,bounds.top},false)){reply->set_value(nullptr);return;}
+            if(s->windowed){SetWindowPos(s->viewer,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);if(maximized)ShowWindow(s->viewer,SW_MAXIMIZE);}
+            s->begin_waiting(expected->peer,true);
+            reply->set_value(s->selection_armed?s->viewer_surface.load():nullptr);
+        }catch(...){reply->set_exception(std::current_exception());}
+    });return result;
+}
+void Shell::discard_warm_surface(std::shared_ptr<const ViewerSurface> surface){
+    impl_->dispatch([s=impl_,surface=std::move(surface)]{
+        const auto found=s->warm_surfaces.find(surface->peer);
+        if(found==s->warm_surfaces.end()||found->second!=surface)return;
+        if(s->peek_surface==surface)s->end_peek(false);
+        s->retired_viewers.push_back(surface);s->warm_surfaces.erase(found);
+        s->warm_visible.clear();s->publish_visible();
+    });
+}
 void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl_,peers]{if(s->pressed_card>=0&&!s->dragged_peer.empty()&&std::none_of(peers.begin(),peers.end(),[&](const Peer& p){return p.id==s->dragged_peer;}))s->cancel_drag();if(s->peers.size()!=peers.size())s->composition.finish_cards();s->peers=peers;s->sort_peers();s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));InvalidateRect(s->panel,nullptr,FALSE);});}
 void Shell::show_remote(const std::string& peer,const std::wstring& label,uint64_t session,HWND surface){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,peer,label,session,g,surface]{if(g==s->generation.load()&&(!surface||surface==s->viewer))s->show_remote_ui(peer,label,session);});}
 void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->generation.load();impl_->dispatch([s=impl_,peer,g]{
@@ -1139,7 +1162,11 @@ void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->gener
     s->begin_waiting(peer,true);
 });}
 void Shell::set_remote_size(uint32_t width,uint32_t height){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,width,height,g]{if(g==s->generation.load()){s->remote_width=width;s->remote_height=height;s->size_to_source();s->publish_input();}});}
-void Shell::cancel_peek(std::shared_ptr<const ViewerSurface> surface){impl_->dispatch([s=impl_,surface=std::move(surface)]{if(s->peek_id==surface->peer&&(!s->peek_surface||s->peek_surface==surface))s->end_peek(false);});}
+void Shell::cancel_peek(std::shared_ptr<const ViewerSurface> surface){impl_->dispatch([s=impl_,surface=std::move(surface)]{
+    const auto warm=s->warm_surfaces.find(surface->peer);
+    const bool owns=s->peek_surface==surface||(!s->peek_surface&&warm!=s->warm_surfaces.end()&&warm->second==surface);
+    if(s->peek_id==surface->peer&&owns)s->end_peek(false);
+});}
 void Shell::show_peek(std::shared_ptr<const ViewerSurface> surface,std::shared_ptr<MediaViewer> media,uint64_t epoch,bool ready){impl_->dispatch([s=impl_,surface=std::move(surface),media=std::move(media),epoch,ready]{s->show_peek_ui(surface,media,epoch,ready);});}
 void Shell::show_local(){impl_->dispatch([s=impl_]{s->local(false);});}
 void Shell::quit(){impl_->dispatch([s=impl_]{PostMessageW(s->owner,WM_CLOSE,0,0);});}

@@ -25,7 +25,8 @@ int probe(){
     hive::AppConfig config;config.device_id="isolated-viewer";config.name=L"Isolated viewer";config.group_key="stress-key";config.port=48194;config.first_run=false;config.desktop.tray_icon=false;
     App app(config);std::atomic<bool> stop=false;
     std::thread producer([&]{while(!stop){for(auto& p:peers){std::lock_guard lock(p.mutex);if(p.remaining&&p.net.frame_ready(p.client)){auto f=encoded;f.session=p.session;f.sequence=p.sequence++;f.capture_time_us=f.source_ready_us=0;if(p.net.send_frame(p.client,f))--p.remaining;}}Sleep(5);}});
-    std::thread driver([&]{
+    std::exception_ptr driver_failure;
+    std::thread driver([&]{try{
         HWND owner=nullptr,panel=nullptr;while(!stop&&!(owner=FindWindowW(L"HiveDesk.Owner",nullptr)))Sleep(5);if(stop)return;
         // Owner is created before the switcher. Do not keep a null HWND for
         // the entire run when GPU/window setup yields between those creates.
@@ -69,9 +70,37 @@ int probe(){
             });PostMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(task));
             Sleep(n%5==0?600:40);
         }
-        Sleep(2000);PostMessageW(owner,WM_CLOSE,0,0);
+        // Rapid hover swaps without closing Hive, then demand an actually
+        // presented final selection. Counting Start requests alone misses hangs.
+        SendMessageW(owner,WM_APP+48,1,0);PostMessageW(owner,WM_HOTKEY,81,0);Sleep(1200);
+        for(unsigned n=0;n<72;++n){
+            SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&,n]{
+                const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;
+                SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),px(12)+(1+n%3)*(tile+px(16))+tile/2));
+            })));Sleep(20);
+        }
+        SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&]{
+            const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;
+            const auto point=MAKELPARAM(px(100),px(12)+tile+px(16)+tile/2);
+            SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,point);SendMessageW(panel,WM_LBUTTONUP,0,point);
+        })));
+        const auto await_ready=[&]{const auto until=GetTickCount64()+7000;while(!app.test_ready("peer-0")&&GetTickCount64()<until)Sleep(10);return app.test_ready("peer-0");};
+        const bool final_ready=await_ready();if(!final_ready)app.test_report();require(final_ready,"Final selection after rapid Peek never presented a desktop");
+        for(unsigned n=0;n<3;++n){
+            const auto old=app.test_surface();
+            app.test_delay_retirement(2000);app.test_stop_viewer();
+            require(await_ready(),"Failed viewer could not recover while old graphics retirement was delayed");
+            require(app.test_surface()!=old,"Recovery reused the failed renderer's HWND");
+        }
+        std::puts("PASS 72 rapid Peek transitions and three same-peer recoveries with blocked retirement; final frames verified");
+        auto recovery=app.test_recovery_guards();
+        require(recovery.wait_for(std::chrono::seconds(3))==std::future_status::ready&&recovery.get(),"Graphics watchdog interrupted a healthy session or failed to request idle recovery");
+        std::puts("PASS aged-retirement watchdog: healthy viewer/controller/preview protected; idle recovery requested (process helper tested separately)");
+        Sleep(300);PostMessageW(owner,WM_CLOSE,0,0);
+    }catch(...){driver_failure=std::current_exception();if(const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr))PostMessageW(owner,WM_CLOSE,0,0);}
     });
     const int result=app.run(GetModuleHandleW(nullptr),false);stop=true;driver.join();producer.join();for(auto& p:peers)p.net.stop();
+    if(driver_failure)std::rethrow_exception(driver_failure);
     std::printf("session counts: starts=%u warm=%u promotions=%u\n",starts.load(),warms.load(),promotions.load());
     require(starts>=8&&warms>=3&&promotions>=1,"Stress did not exercise actual warm promotion and repeated Start");
     std::printf("peek counts: starts=%u stops=%u shown=%u\n",previews.load(),preview_stops.load(),visible_previews.load());

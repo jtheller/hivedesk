@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
+#include <cstdint>
 
 // Only prewarmed HWNDs use composition. Their video opacity can change without
 // copying pixels, changing input focus or rebuilding the decoder/swap chain.
@@ -17,12 +19,14 @@ class ViewerComposition {
     Ptr<IDCompositionEffectGroup> effect_;
     std::mutex mutex_;
     float from_=0,to_=0;ULONGLONG start_=0;bool animated_=false;
-    static void check(HRESULT hr){if(FAILED(hr))throw std::runtime_error("Viewer composition failed");}
+    static void check(HRESULT hr,const char* step="update"){
+        if(FAILED(hr)){std::ostringstream message;message<<"Viewer composition "<<step<<" failed: HRESULT 0x"<<std::hex<<uint32_t(hr);throw std::runtime_error(message.str());}
+    }
 public:
     void create(HWND window,ID3D11Device* gpu,IDXGISwapChain* swap){
         Ptr<IDXGIDevice> dxgi;check(gpu->QueryInterface(IID_PPV_ARGS(&dxgi)));
-        check(DCompositionCreateDevice(dxgi.Get(),IID_PPV_ARGS(&device_)));
-        check(device_->CreateTargetForHwnd(window,TRUE,&target_));
+        check(DCompositionCreateDevice(dxgi.Get(),IID_PPV_ARGS(&device_)),"create device");
+        check(device_->CreateTargetForHwnd(window,TRUE,&target_),"attach HWND");
         check(device_->CreateVisual(&visual_));check(visual_->SetContent(swap));
         check(device_->CreateEffectGroup(&effect_));check(effect_->SetOpacity(0.0f));
         check(visual_->SetEffect(effect_.Get()));check(target_->SetRoot(visual_.Get()));check(device_->Commit());

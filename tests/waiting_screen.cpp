@@ -102,7 +102,18 @@ int probe(){
     shell.show_reconnecting("c");
     require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"Reconnection flashed its hint without waiting");
     require(shown(waiting)&&title(waiting).find(L"Reconnecting")!=std::wstring::npos&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Reconnection reused stale video instead of a waiting screen");
+    auto failed_surface=shell.viewer_surface();
+    auto renewal=shell.renew_viewer_surface(failed_surface);pump(20);auto recovered_surface=renewal.get();
+    require(recovered_surface&&recovered_surface!=failed_surface&&IsWindow(failed_surface->window)&&!shown(failed_surface->window),"Retry reused or destroyed a still-leased failed renderer window");
+    waiting=find(L"HiveDesk.Waiting");
+    require(shown(waiting)&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Fresh retry lost the selected peer cover");
+    shell.show_remote("c",L"Computer C",99,failed_surface->window);pump(20);
+    require(shown(waiting),"Failed renderer dismissed the recovery cover");
+    auto obsolete_renewal=shell.renew_viewer_surface(failed_surface);pump(10);
+    require(!obsolete_renewal.get(),"Stale recovery replaced a newer surface");
     shell.show_local();shell.show_remote("c",L"Computer C",4);shell.update_thumbnail("c",image(220));pump(260);
+    auto cancelled_renewal=shell.renew_viewer_surface(recovered_surface);pump(10);
+    require(!cancelled_renewal.get(),"Cancelled selection allowed recovery to reopen its window");
     SendMessageW(owner,WM_TIMER,5,0);
     require(!shown(waiting)&&!shown(shell.viewer_window()),"Canceled connection reopened on a late completion");
     // DEVG -> VI -> DEVG -> 6Re: keep the VI renderer lease alive to

@@ -42,7 +42,12 @@ probes on the user's working desktop as a substitute for these isolated checks.
 
 Passing this suite is not a proof of every real-world interaction. The isolated
 App stress test verifies startup/cancellation and decoder lifecycle; its station
-cannot scan out. Actual DWM is tested separately. Physical Start-menu clicks,
+cannot scan out, so Present completion is injected after actual GPU drawing.
+It now requires final readiness after 72 rapid Peek transitions and three
+same-peer recoveries while old graphics retirement is deliberately delayed.
+Actual DWM is tested separately, including twelve preview replacements with
+distinct pixel checks, rapid fade reversal/promotion and asynchronous retirement.
+Physical Start-menu clicks,
 lock/PIN/unlock, two-machine long-duration motion and input-to-display latency,
 high-RTT remote hardware, AMD/Intel production streaming and early R500 drivers
 still require their corresponding environments. Capability enumeration is not an

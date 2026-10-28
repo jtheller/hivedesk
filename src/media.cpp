@@ -566,6 +566,7 @@ private:
     struct Job {CUVIDPARSERDISPINFO picture{};uint32_t width=0,height=0;AsyncOutput output;};
     bool asynchronous_=false;
     std::function<bool()> cancelled_;
+    std::shared_ptr<std::recursive_mutex> graphics_gate_;
     std::mutex jobs_mutex_;
     std::condition_variable jobs_changed_;
     std::deque<Job> jobs_;
@@ -589,6 +590,11 @@ private:
         jobs_changed_.notify_all();
     }
     void map_picture(const CUVIDPARSERDISPINFO& picture,uint32_t width,uint32_t height,const Output& output,uint32_t& map_cost,uint32_t& service_cost){
+        // CUDA's D3D interop takes both driver/context and D3D locks. Present
+        // takes them in the opposite direction on some drivers. Serialize the
+        // entire map/convert/unmap transaction with this viewer's graphics calls.
+        std::unique_lock<std::recursive_mutex> graphics;
+        if(graphics_gate_)graphics=std::unique_lock(*graphics_gate_);
         CUVIDPROCPARAMS process{};process.progressive_frame=picture.progressive_frame;
         process.top_field_first=picture.top_field_first;process.unpaired_field=1;
         unsigned long long device=0;unsigned int pitch=0;const auto began=now_us();
@@ -704,8 +710,9 @@ private:
         });
     }
 public:
-    explicit Decoder(Output output, IDXGIAdapter* adapter = nullptr,bool asynchronous=false,std::function<bool()> cancelled={})
-        : cuda_(adapter), output_(std::move(output)),asynchronous_(asynchronous),cancelled_(std::move(cancelled)) {
+    explicit Decoder(Output output, IDXGIAdapter* adapter = nullptr,bool asynchronous=false,std::function<bool()> cancelled={},
+        std::shared_ptr<std::recursive_mutex> graphics_gate={})
+        : cuda_(adapter), output_(std::move(output)),asynchronous_(asynchronous),cancelled_(std::move(cancelled)),graphics_gate_(std::move(graphics_gate)) {
         CUVIDDECODECAPS caps{}; caps.eCodecType = cudaVideoCodec_HEVC; caps.eChromaFormat = cudaVideoChromaFormat_444;
         cu(caps_(&caps), "NVDEC HEVC444 capabilities");
         if (!caps.bIsSupported || !(caps.nOutputFormatMask & (1u << cudaVideoSurfaceFormat_YUV444)))
@@ -875,6 +882,7 @@ private:
     std::function<HRESULT()> present_for_test_;
     CursorPresentation pending_cursor_;
     std::function<void(const CursorPresentation&)> cursor_presented_;
+    std::shared_ptr<std::recursive_mutex> graphics_gate_=std::make_shared<std::recursive_mutex>();
     void target() {
         ComPtr<ID3D11Texture2D> backbuffer; hr(swap_->GetBuffer(0, IID_PPV_ARGS(&backbuffer)), "Get swapchain backbuffer");
         hr(device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &target_), "Create render target");
@@ -945,9 +953,11 @@ public:
     }
     ~Renderer(){if(display_ready_)CloseHandle(display_ready_);}
     IDXGIAdapter* adapter() const { return adapter_.Get(); }
+    auto graphics_gate()const{return graphics_gate_;}
     uint32_t convert_us() const{return convert_us_;}
     uint32_t draw_us() const{return draw_us_;}
     std::array<uint64_t,6> display_observation() const {
+        const std::lock_guard graphics(*graphics_gate_);
         DXGI_FRAME_STATISTICS value{};const auto result=swap_->GetFrameStatistics(&value);
         UINT submitted=0;swap_->GetLastPresentCount(&submitted);
         return {uint32_t(result),value.PresentCount,value.PresentRefreshCount,value.SyncRefreshCount,uint64_t(value.SyncQPCTime.QuadPart),submitted};
@@ -962,7 +972,9 @@ public:
         if(!pending_present_)return false;
         if(eligible&&!eligible()){pending_present_=false;return false;}
         const auto began=now_us();
-        const auto result=present_for_test_?present_for_test_():swap_->Present(paced_present_?1:0,DXGI_PRESENT_DO_NOT_WAIT);
+        HRESULT result;
+        {const std::lock_guard graphics(*graphics_gate_);
+            result=present_for_test_?present_for_test_():swap_->Present(paced_present_?1:0,DXGI_PRESENT_DO_NOT_WAIT);}
         if(present_cost)*present_cost=uint32_t(std::min<uint64_t>(10000000,now_us()-began));
         // Keep only the latest prepared backbuffer. No NVDEC surface remains
         // mapped and a retry never repeats conversion or queues another frame.
@@ -1005,6 +1017,7 @@ public:
         ComPtr<ID3D11Texture2D> texture; hr(device_->CreateTexture2D(&desc, &data, &texture), "Upload benchmark texture"); return texture;
     }
     void convert(Picture& picture,uint64_t yuv,size_t pitch,uint32_t width,uint32_t height,HiveGpu* gpu){
+        const std::lock_guard graphics(*graphics_gate_);
         if(picture.width!=width||picture.height!=height){
             D3D11_TEXTURE2D_DESC texture{};texture.Width=width;texture.Height=height;
             texture.MipLevels=1;texture.ArraySize=1;texture.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1020,6 +1033,7 @@ public:
     }
     void draw_prepared(const Picture& picture,Image* proof=nullptr,uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,
         std::function<bool()> eligible={},bool defer_present=false){
+        std::unique_lock graphics(*graphics_gate_);
         const auto render_begin=now_us();pending_present_=false;convert_us_=picture.convert_us;draw_us_=0;
         if(presented)*presented=false;if(render_cost)*render_cost=0;if(present_cost)*present_cost=0;
         RECT client{};if(!GetClientRect(window_,&client))return;
@@ -1046,6 +1060,7 @@ public:
         draw_us_=uint32_t(std::min<uint64_t>(10000000,now_us()-render_begin));
         if(render_cost)*render_cost=uint32_t(std::min<uint64_t>(10000000,uint64_t(draw_us_)+convert_us_));
         pending_cursor_=picture.cursor;pending_present_=true;
+        graphics.unlock(); // Never keep the graphics gate across state callbacks or display waits.
         if(defer_present)return;
         const bool result=retry_present(eligible,present_cost);if(presented)*presented=result;
     }
@@ -1121,13 +1136,14 @@ bool media_prewarm_capacity() {
     return false;
 }
 MediaViewer::~MediaViewer() { close(); }
-bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented,bool warm) {
+bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented,bool warm,std::function<HRESULT()> present_for_test) {
     close();
-    // DXGI creation may synchronously send window messages. Create it on the
-    // caller/UI thread, then hand the device/context to the render worker.
+    // DXGI creation may synchronously send window messages. The caller must
+    // keep the HWND owner's message pump running while this preparation runs.
     std::unique_ptr<Renderer> renderer;
-    try { renderer = std::make_unique<Renderer>(window,true,GetPropW(window,L"HiveDesk.PeekSurface")!=nullptr); }
+    try { renderer = std::make_unique<Renderer>(window,!present_for_test,GetPropW(window,L"HiveDesk.PeekSurface")!=nullptr); }
     catch (const std::exception& problem) { error = problem.what(); return false; }
+    if(present_for_test)renderer->set_present_for_test(std::move(present_for_test));
     renderer->set_cursor_presented([this,presented=std::move(presented)](const CursorPresentation& cursor){
         bool changed=false;
         {
@@ -1160,7 +1176,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                 const bool fresh=!impl_->stopping&&impl_->frames.output_fresh(*pending,now_us());
                 impl_->sync_queue();return fresh&&!impl_->stopping;
             };
-            Decoder decoder({},renderer->adapter(),true,cancelled);
+            Decoder decoder({},renderer->adapter(),true,cancelled,renderer->graphics_gate());
             std::thread presenter;
             struct Workers {
                 std::atomic<bool>& stop;LatestPicture& pictures;Decoder& decoder;std::thread& presenter;

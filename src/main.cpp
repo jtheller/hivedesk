@@ -43,6 +43,27 @@ public:
         // before reverse member destruction releases their App mutexes/state.
         shell_.close();
     }
+#ifdef HIVEDESK_APP_SESSION_TEST
+    bool test_ready(const std::string& peer)const{const auto active=active_.load();return active&&*active==peer&&view_ready_&&viewer_.load()->has_presented_frame();}
+    HWND test_surface()const{return shell_.viewer_window();}
+    void test_stop_viewer(){viewer_.load()->request_stop();}
+    void test_delay_retirement(DWORD duration){retire_lane_.post([duration]{Sleep(duration);});}
+    void test_report()const{const auto v=viewer_.load();const auto active=active_.load();std::fprintf(stderr,"viewer test: active=%s ready=%d frame=%d presented=%d received=%llu state=%s input=%d\n",active?active->c_str():"none",int(view_ready_.load()),v->has_frame(),v->has_presented_frame(),(unsigned long long)received_frames_.load(),v->stats().c_str(),active&&transport_.input_ready(*active,active_session_));}
+    std::future<bool> test_recovery_guards(){
+        auto reply=std::make_shared<std::promise<bool>>();auto result=reply->get_future();
+        enqueue([this,reply]{
+            auto stuck=std::make_shared<WarmView>();stuck->retiring_since=GetTickCount64()-16000;retiring_warm_.push_back(stuck);
+            const bool ready=view_ready_;const auto host=hosting_.load();bool ok=true;
+            view_ready_=true;graphics_recovery_tick();ok&=!graphics_recovery_requested_;
+            view_ready_=false;auto controller=std::make_shared<hive::HostControl>("test-inbound",1,1);hosting_=controller;
+            graphics_recovery_tick();ok&=!graphics_recovery_requested_;
+            controller->warming=true;controller->previewing=true;graphics_recovery_tick();ok&=!graphics_recovery_requested_;
+            controller->previewing=false;graphics_recovery_tick();ok&=graphics_recovery_requested_;
+            hosting_=host;view_ready_=ready;graphics_recovery_requested_=false;std::erase(retiring_warm_,stuck);graphics_recovery_tick();
+            reply->set_value(ok);
+        });return result;
+    }
+#endif
     int run(HINSTANCE instance,bool open_settings=false) {
         hive::ShellCallbacks callbacks;
         callbacks.select_peer=[this](const std::string& peer) {
@@ -201,7 +222,7 @@ private:
         for(;;) {
             std::function<void()> job;
             {std::unique_lock lock(queue_mutex_);wake_.wait_for(lock,std::chrono::milliseconds(peek_requested_?16:250),[this]{return closing_||!queue_.empty()||warm_dirty_;});warm_dirty_=false;if(closing_)break;if(!queue_.empty()){job=std::move(queue_.front());queue_.pop_front();}}
-            try {if(job)job();update_tick();retry_tick();warm_tick();} catch(const std::exception& error) {status(error.what());}
+            try {if(job)job();graphics_recovery_tick();update_tick();retry_tick();warm_tick();} catch(const std::exception& error) {status(error.what());}
         }
         // Keep DXGI destruction and socket/thread joins off the HWND-owning thread.
         finish_shutdown();
@@ -235,28 +256,61 @@ private:
         warm->connection=connection;warm->last_visible=warm->renewed=GetTickCount64();++preparing_;
         prepare_lane_.post([this,warm]{
             SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer preparation");
+            hive::log("Viewer graphics preparing: "+warm->surface->peer+" session="+std::to_string(warm->settings.session));
             try {
                 if(closing_||warm->abandoned)warm->failed=true;
                 else if(!warm->viewer->open(warm->surface->window,warm->open_error,
                     [this,peer=warm->surface->peer,session=warm->settings.session](const hive::CursorPresentation& cursor){
                         const auto active=active_.load();if(!closing_&&active&&*active==peer&&active_session_==session)
                             shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
-                    },true))warm->failed=true;
+                    },true
+#ifdef HIVEDESK_APP_SESSION_TEST
+                    // A noninteractive station has no DWM scanout. Keep actual
+                    // NVDEC/conversion/drawing but complete presentation here;
+                    // the separate DWM pixel probes test real presentation.
+                    ,[]{return S_OK;}
+#endif
+                    ))warm->failed=true;
             }catch(const std::exception& e){warm->open_error=e.what();warm->failed=true;}
             if(warm->abandoned||closing_)warm->viewer->request_stop();
+            hive::log("Viewer graphics preparation "+std::string(warm->failed?"failed: ":"complete: ")+warm->surface->peer+
+                " elapsed_ms="+std::to_string(GetTickCount64()-warm->created)+(warm->failed?" "+warm->open_error:""));
             warm->done=true;--preparing_;warm_dirty_=true;wake_.notify_one();
         },priority);
         return warm;
     }
     void retire_warm(const std::shared_ptr<WarmView>& warm) {
-        warm->abandoned=true;retiring_warm_.push_back(warm);shell_.cancel_peek(warm->surface);
+        if(warm->abandoned.exchange(true))return;
+        warm->retiring_since=GetTickCount64();retiring_warm_.push_back(warm);shell_.cancel_peek(warm->surface);
+        shell_.discard_warm_surface(warm->surface);
         if(warm->requested)transport_.cancel_warm(warm->surface->peer,warm->settings.session);
         if(warm->done)warm->viewer->request_stop();
         retire_lane_.post([warm]{
             SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer retirement");
             while(!warm->done)Sleep(1);
             warm->viewer->close();warm->retired=true; // Keep the HWND lease until every GPU worker exits.
+            hive::log("Viewer graphics retired: "+warm->surface->peer+" elapsed_ms="+std::to_string(GetTickCount64()-warm->retiring_since));
         });
+    }
+    void graphics_recovery_tick(){
+        const auto now=GetTickCount64();
+        std::erase_if(retiring_warm_,[](const auto& warm){return warm->retired.load();});
+        graphics_stalled_=std::any_of(retiring_warm_.begin(),retiring_warm_.end(),[&](const auto& warm){return now-warm->retiring_since>=8000;});
+        if(!graphics_stalled_||graphics_recovery_requested_)return;
+        const bool expired=std::any_of(retiring_warm_.begin(),retiring_warm_.end(),[&](const auto& warm){return now-warm->retiring_since>=15000;});
+        if(!expired)return;
+        // An in-process driver call cannot safely be killed. Use the existing
+        // supervised restart only when no healthy session would be interrupted.
+        const std::scoped_lock admission(host_mutex_,view_intent_mutex_);
+        const auto host=hosting_.load();
+        if(view_ready_||(host&&(!host->warming||host->previewing))||closing_||updating_)return;
+#ifndef HIVEDESK_APP_SESSION_TEST
+        hive::gpu_policy_restart::Relaunch relaunch(false,true);
+        if(!relaunch.commit())return;
+        updating_=true;
+#endif
+        hive::log("Graphics recovery: retirement exceeded 15 seconds; restarting the unresponsive video agent.");
+        graphics_recovery_requested_=true;
     }
     void warm_tick() {
         if(closing_||updating_)return;
@@ -278,6 +332,7 @@ private:
                 const bool wanted=std::any_of(visible.begin(),visible.end(),[&](const auto& surface){return surface==warm->surface;});
                 if(wanted)warm->last_visible=now;
                 if(warm->done&&warm->viewer->stats().starts_with("Media error:"))warm->failed=true;
+                if(!warm->done&&now-warm->created>=8000){warm->failed=true;hive::log("Viewer preparation timed out: "+it->first);}
                 if((update_pending&&!warm->peeking)||warm->failed||now-warm->last_visible>2000){
                     if(warm->failed)warm_retry_[it->first]=now+2000;
                     expired.push_back(warm);it=warm_views_.erase(it);
@@ -328,7 +383,7 @@ private:
                 }
                 continue;
             }
-            if(update_pending||preparing_||warm_retry_[surface->peer]>now||!hive::media_prewarm_capacity())continue;
+            if(update_pending||graphics_stalled_||preparing_||warm_retry_[surface->peer]>now||!hive::media_prewarm_capacity())continue;
             if(std::any_of(retiring_warm_.begin(),retiring_warm_.end(),[&](const auto& old){return old->surface==surface&&!old->retired;}))continue;
             hive::StreamSettings settings;settings.session=++session_sequence_;
             settings.receiver_millihz=hive::primary_refresh_millihz();settings.warm=true;
@@ -637,7 +692,7 @@ private:
         const auto current=active_.load();
         if(current&&view_ready_) {
             const auto state=viewer_.load()->stats();
-            if(active_connection_!=transport_.connection_token(*current)||state.starts_with("Media error:")){
+            if(active_connection_!=transport_.connection_token(*current)||state.starts_with("Media error:")||!viewer_.load()->has_frame()){
                 hive::log("Viewer recovery: "+*current+" session="+std::to_string(active_session_.load())+" "+state);
                 view_ready_=false;
             }
@@ -686,26 +741,36 @@ private:
         active_connection_=transport_.connection_token(peer);if(!active_connection_)return;
         // Retain one immutable HWND lease throughout validation and startup.
         // A second read could bind a warmed decoder to a newer same-peer window.
-        const auto selected_surface=shell_.viewer_surface();
+        auto selected_surface=shell_.viewer_surface();
         if(!selected_surface||selected_surface->peer!=peer||epoch!=generation_)return;
+        const auto renew_surface=[&]{
+            auto renewed=shell_.renew_viewer_surface(selected_surface);
+            const auto until=GetTickCount64()+8000;
+            while(renewed.wait_for(std::chrono::milliseconds(2))!=std::future_status::ready){
+                if(epoch!=generation_||closing_||GetTickCount64()>=until)return false;
+            }
+            selected_surface=renewed.get();return selected_surface&&epoch==generation_&&!closing_;
+        };
         std::shared_ptr<WarmView> warm;
         {const std::lock_guard lock(warm_mutex_);auto cached=warm_views_.find(peer);if(cached!=warm_views_.end()){warm=cached->second;warm_views_.erase(cached);}}
         if(warm&&(warm->failed||warm->connection!=active_connection_||warm->surface!=selected_surface||warm->settings.receiver_millihz!=refresh)){
             retire_warm(warm);
-            // A swapchain must release this exact HWND before another is made.
-            // Cancellation can leave the wait immediately; the reaper owns it.
-            while(!warm->retired){if(epoch!=generation_||closing_)return;Sleep(2);}
             warm.reset();
+            if(!renew_surface())return;
         }
         const bool reused=bool(warm);
         if(!warm){
-            for(const auto& old:retiring_warm_)if(old->surface==selected_surface)
-                while(!old->retired){if(epoch!=generation_||closing_)return;Sleep(2);}
+            // Even completed retirement can leave a queued DComp/UI reference.
+            // Every recovery attempt after the first uses a fresh window.
+            if(last_attempt_surface_.lock()==selected_surface||std::any_of(retiring_warm_.begin(),retiring_warm_.end(),[&](const auto& old){return old->surface==selected_surface;}))
+                if(!renew_surface())return;
             hive::StreamSettings settings;settings.session=automatic?++session_sequence_:0;settings.receiver_millihz=refresh;
             warm=prepare_view(selected_surface,settings,active_connection_,true);
         }
+        last_attempt_surface_=selected_surface;
         while(!warm->done){
             if(epoch!=generation_||closing_){retire_warm(warm);return;}
+            if(GetTickCount64()-warm->created>=8000){retire_warm(warm);status("Viewer preparation timed out; recovering graphics.");return;}
             Sleep(2);
         }
         if(epoch!=generation_||closing_){retire_warm(warm);return;}
@@ -801,10 +866,10 @@ private:
             retired=viewer_.exchange(std::make_shared<hive::MediaViewer>());
             surface=std::exchange(view_surface_,nullptr);retired->request_stop();}
         if(surface)hive::log("Viewer graphics retiring: "+surface->peer+" session="+std::to_string(old_session));
-        retire_lane_.post([retired=std::move(retired),surface=std::move(surface)]{
-            SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer retirement");
-            retired->close();if(surface)hive::log("Viewer graphics retired: "+surface->peer);
-        });
+        if(surface){
+            auto warm=std::make_shared<WarmView>();warm->surface=std::move(surface);warm->viewer=std::move(retired);warm->done=true;
+            retire_warm(warm);
+        } // An unopened viewer has no worker and can be destroyed immediately.
         if(!closing_&&notify_shell)shell_.show_local();
     }
     void finish_shutdown() {
@@ -850,9 +915,11 @@ private:
         uint64_t connection=0,last_visible=0,renewed=0,last_feedback=0;
         bool requested=false,peeking=false,peek_revealed=false;uint64_t peek_epoch=0;hive::CursorPresentation peek_before;
         std::string open_error;
+        uint64_t created=GetTickCount64(),retiring_since=0;
         std::atomic<bool> done{false},abandoned{false},retired{false},failed{false};std::atomic<uint64_t> size{0};
     };
     hive::TaskLane prepare_lane_,retire_lane_;
+    bool graphics_stalled_=false,graphics_recovery_requested_=false;
     std::atomic<unsigned> preparing_{0};
     std::map<std::string,uint64_t> warm_retry_;
     std::vector<std::shared_ptr<WarmView>> retiring_warm_;
@@ -866,6 +933,7 @@ private:
     hive::ClipboardTransfer clipboard_transfer_{transport_};
     hive::HostBridge host_;
     std::shared_ptr<const hive::ViewerSurface> view_surface_;
+    std::weak_ptr<const hive::ViewerSurface> last_attempt_surface_; // Command worker, including failed attempts.
     std::atomic<std::shared_ptr<hive::MediaViewer>> viewer_{std::make_shared<hive::MediaViewer>()};
     hive::Telemetry telemetry_{hive::data_directory()};
     std::mutex snapshot_mutex_;std::map<std::string,uint64_t> snapshot_pending_;

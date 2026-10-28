@@ -104,6 +104,21 @@ bool media_async_decode_self_test(std::string& report){
             require(std::abs(int(proof.bgra[middle+2])-190)<=4,"Resized registered texture retained old pixels");
             latest.release(*replacement);renderer.cancel_pending();
         }
+        phase="CUDA interop / Present exclusion";
+        {
+            Renderer::Picture pixels;
+            {Decoder initial([&](uint64_t yuv,size_t pitch,uint32_t w,uint32_t h,HiveGpu* gpu){renderer.convert(pixels,yuv,pitch,w,h,gpu);},renderer.adapter());initial.feed(frames[0]);}
+            renderer.draw_prepared(pixels,nullptr,nullptr,nullptr,nullptr,{},true);
+            Gate present;renderer.set_present_for_test([&]{present.block();return S_OK;});
+            auto showing=std::async(std::launch::async,[&]{return renderer.retry_present();});
+            const bool entered=present.await();std::atomic<bool> mapped=false;
+            Decoder decoder({},renderer.adapter(),true,{},renderer.graphics_gate());Decoder::AsyncOutput output;
+            output.prepare=[&](uint64_t yuv,size_t pitch,uint32_t w,uint32_t h,HiveGpu* gpu){renderer.convert(pixels,yuv,pitch,w,h,gpu);mapped=true;};
+            const bool fed=decoder.feed_async(frames[0],std::move(output));Sleep(30);
+            const bool excluded=!mapped;present.release();const bool shown=showing.get();
+            require(entered&&fed&&excluded&&shown&&decoder.drain_async()&&mapped,"CUDA interop entered while Present owned the device");
+            renderer.set_present_for_test({});renderer.cancel_pending();
+        }
         phase="stop while decoder credits are occupied";
         {
             Gate gate;Decoder decoder({},renderer.adapter(),true);

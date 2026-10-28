@@ -4,6 +4,7 @@
 #include "clipboard.h"
 #include <windows.h>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,6 +55,9 @@ public:
     void quit();
     HWND viewer_window() const;
     std::shared_ptr<const ViewerSurface> viewer_surface() const;
+    // Retry on a new HWND; never wait for a retired swapchain to release the old one.
+    std::future<std::shared_ptr<const ViewerSurface>> renew_viewer_surface(std::shared_ptr<const ViewerSurface> expected);
+    void discard_warm_surface(std::shared_ptr<const ViewerSurface>);
     void update_peers(const std::vector<Peer>&);
     void show_remote(const std::string& peer, const std::wstring& label,uint64_t session=0,HWND surface=nullptr);
     void show_reconnecting(const std::string& peer);
