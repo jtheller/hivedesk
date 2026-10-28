@@ -1315,8 +1315,15 @@ bool Transport::self_test(std::string& result) {
             bool held=true,authenticated=true;
             const auto admission_deadline=Clock::now()+std::chrono::milliseconds(1500);
             for(unsigned i=0;i<count&&held;++i){
-                held=expanded->enqueue(Bytes(packet_size,uint8_t(i+1)),true);
-                while(held&&expanded->video_inflight<i+1&&!expanded->closed&&Clock::now()<admission_deadline)Sleep(1);
+                // Scheduling can legitimately expire an unsent picture before
+                // the writer runs. Match a host's fresh-IDR retry; never resend
+                // an accepted WSASend or weaken the production freshness bound.
+                do{
+                    const auto expired=expanded->video_send.snapshot(transport_us()).queue_expired;
+                    held=expanded->enqueue(Bytes(packet_size,uint8_t(i+1)),true);
+                    while(held&&expanded->video_inflight<i+1&&!expanded->closed&&Clock::now()<admission_deadline&&
+                        expanded->video_send.snapshot(transport_us()).queue_expired==expired)Sleep(1);
+                }while(held&&expanded->video_inflight<i+1&&!expanded->closed&&Clock::now()<admission_deadline);
                 held=held&&expanded->video_inflight==i+1;
             }
             const auto owned=expanded->video_owned_bytes.load();
