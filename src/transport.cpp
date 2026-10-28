@@ -1396,6 +1396,16 @@ bool Transport::self_test(std::string& result) {
             for(uint8_t channel:{uint8_t(1),uint8_t(2)}){control.channel=channel;if(owner.dispatch(control,bytes)){result="Prewarm accepted off control lane";return false;}}
             control.channel=0;
         }
+        Bytes preview{LivePeek};u64(preview,71);preview.push_back(1);
+        control.peer.features|=32768; // Retired 0.7.0 capability must not opt in.
+        if(owner.dispatch(control,preview)){result="Broken legacy live Peek capability accepted";return false;}
+        control.peer.features|=FeatureLivePeek;unsigned previews=0;
+        owner.callbacks.preview=[&](const std::string&,uint64_t session,bool enabled){if(session==71)previews+=enabled?1:10;};
+        if(!owner.dispatch(control,preview)){result="Live Peek resume rejected";return false;}
+        preview.back()=0;
+        if(!owner.dispatch(control,preview)||previews!=11){result="Live Peek pause lost session identity";return false;}
+        preview.back()=2;
+        if(owner.dispatch(control,preview)){result="Invalid live Peek state accepted";return false;}
     }
     {
         InputSendWindow queue;queue.reset(71);
@@ -1891,7 +1901,7 @@ bool Transport::self_test(std::string& result) {
     {
         auto hello=make_hello({"feature-test","Features","Test1234",47980,false},0);
         Peer peer;uint8_t channel=9;
-        if(!parse_hello(hello,peer,channel)||!(peer.features&FeatureDesktopAux)||!(peer.features&FeatureAutomaticStream)||!(peer.features&FeatureHostKick)||!(peer.features&FeatureAutoRate)||!(peer.features&FeatureDedicatedInput)||!(peer.features&FeatureFrameTiming)||!(peer.features&FeatureCursorComposition)){result="Feature negotiation failed";return false;}
+        if(!parse_hello(hello,peer,channel)||!(peer.features&FeatureDesktopAux)||!(peer.features&FeatureAutomaticStream)||!(peer.features&FeatureHostKick)||!(peer.features&FeatureAutoRate)||!(peer.features&FeatureDedicatedInput)||!(peer.features&FeatureFrameTiming)||!(peer.features&FeatureCursorComposition)||!(peer.features&FeatureLivePeek)||(peer.features&32768)){result="Feature negotiation failed";return false;}
         std::fill(hello.end()-32,hello.end(),uint8_t(42));peer={};
         if(!parse_hello(hello,peer,channel)||peer.features){result="Legacy challenge compatibility failed";return false;}
         auto input_hello=make_hello({"feature-test","Features","Test1234",47980,false},2);peer={};

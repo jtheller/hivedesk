@@ -39,7 +39,8 @@ constexpr uint32_t FeatureNativeSnapshot = 2048;
 // Mixed versions must use an ordinary cold start, never a broken warm lease.
 constexpr uint32_t FeatureWarmStream = 8192;
 constexpr uint32_t FeatureRichClipboard = 16384;
-constexpr uint32_t FeatureLivePeek = 32768;
+// 32768 is reserved for 0.7.0, whose SYSTEM pipe rejected Peek messages.
+constexpr uint32_t FeatureLivePeek = 65536;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;
