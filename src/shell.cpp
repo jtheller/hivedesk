@@ -65,6 +65,7 @@ bool number(const std::wstring& s,uint32_t& out) {
 struct Shell::Impl {
     HINSTANCE instance{};HICON app_icon{},app_small_icon{}; HWND owner{},viewer{},panel{},settings{},prior_focus{};
     HANDLE settings_process{};HWND health_badge{},waiting{};
+    bool fallback_settings_ready=false;
     std::atomic<std::shared_ptr<const ViewerSurface>> viewer_surface;
     std::vector<std::shared_ptr<const ViewerSurface>> retired_viewers;
     std::map<std::string,std::shared_ptr<const ViewerSurface>> warm_surfaces;
@@ -845,6 +846,7 @@ struct Shell::Impl {
         local(true);if(launch_settings())return;
         if(settings&&IsWindow(settings)){ShowWindow(settings,SW_SHOWNORMAL);SetForegroundWindow(settings);return;}
         int w=px(530),h=px(450);
+        fallback_settings_ready=false;
         settings=CreateWindowExW(WS_EX_APPWINDOW,L"HiveDesk.Settings",L"HiveDesk settings",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,(GetSystemMetrics(SM_CXSCREEN)-w)/2,(GetSystemMetrics(SM_CYSCREEN)-h)/2,w,h,nullptr,nullptr,instance,this);
         if(!settings){settings_restart.close();return;}
         child(L"STATIC",L"Computer name",0,0,24,24,450,22);
@@ -859,19 +861,22 @@ struct Shell::Impl {
         HWND debug=child(L"BUTTON",L"Debug overlay",BS_AUTOCHECKBOX|WS_TABSTOP,DebugOverlay,24,302,200,26);SendMessageW(debug,BM_SETCHECK,config.desktop.debug_overlay?BST_CHECKED:BST_UNCHECKED,0);
         HWND relative=child(L"BUTTON",L"Relative mouse",BS_AUTOCHECKBOX|WS_TABSTOP,RelativeMouse,244,302,230,26);SendMessageW(relative,BM_SETCHECK,config.desktop.relative_mouse?BST_CHECKED:BST_UNCHECKED,0);EnableWindow(relative,raw_mouse_available);
         HWND cadence=child(L"BUTTON",L"Steady display cadence (experimental)",BS_AUTOCHECKBOX|WS_TABSTOP,DisplayCadence,24,330,450,18);SendMessageW(cadence,BM_SETCHECK,config.desktop.display_cadence?BST_CHECKED:BST_UNCHECKED,0);
-        child(L"BUTTON",L"Save",BS_PUSHBUTTON|WS_TABSTOP,Save,24,350,120,32);
-        child(L"STATIC",wide(HIVEDESK_VERSION).c_str(),0,0,164,355,185,24);
+        child(L"STATIC",L"Saved automatically",0,Save,24,350,320,22);
+        child(L"STATIC",wide(HIVEDESK_VERSION).c_str(),0,0,24,379,185,24);
         child(L"BUTTON",L"Close",BS_PUSHBUTTON|WS_TABSTOP,Close,354,350,120,32);
+        fallback_settings_ready=true;
         ShowWindow(settings,SW_SHOW);SetForegroundWindow(settings);SetFocus(GetDlgItem(settings,Name));
     }
-    void save_settings() {
+    bool save_settings() {
+        KillTimer(settings,6);
         auto desktop=config.desktop;desktop.startup=SendDlgItemMessageW(settings,Startup,BM_GETCHECK,0,0)==BST_CHECKED;desktop.tray_icon=SendDlgItemMessageW(settings,TrayIcon,BM_GETCHECK,0,0)==BST_CHECKED;
         desktop.debug_overlay=SendDlgItemMessageW(settings,DebugOverlay,BM_GETCHECK,0,0)==BST_CHECKED;
         desktop.relative_mouse=SendDlgItemMessageW(settings,RelativeMouse,BM_GETCHECK,0,0)==BST_CHECKED;
         desktop.display_cadence=SendDlgItemMessageW(settings,DisplayCadence,BM_GETCHECK,0,0)==BST_CHECKED;
         const auto selected=SendDlgItemMessageW(settings,Hotkey,CB_GETCURSEL,0,0);
         if(selected>=1&&selected<=3){desktop.hotkey_key='H';desktop.hotkey_modifiers=selected==1?3:selected==2?6:9;}
-        if(!apply_preferences(control_text(GetDlgItem(settings,Name)),desktop))MessageBoxW(settings,L"Could not save. Check the name and choose an available shortcut.",L"HiveDesk",MB_OK|MB_ICONINFORMATION);
+        const bool saved=apply_preferences(control_text(GetDlgItem(settings,Name)),desktop);
+        SetDlgItemTextW(settings,Save,saved?L"Saved automatically":L"Not saved. Check name / shortcut.");return saved;
     }
     static LRESULT CALLBACK window_proc(HWND window,UINT message,WPARAM w,LPARAM l) {
         Impl* s=reinterpret_cast<Impl*>(GetWindowLongPtrW(window,GWLP_USERDATA));
@@ -975,15 +980,21 @@ struct Shell::Impl {
         }
         if(window==s->settings) {
             switch(message) {
-            case WM_CLOSE:DestroyWindow(window);return 0;
-            case WM_DESTROY:s->settings=nullptr;s->settings_restart.close();s->publish_input();return 0;
+            case WM_CLOSE:
+                if(s->fallback_settings_ready&&!s->save_settings()&&MessageBoxW(window,L"Changes could not be saved. Close without saving?",L"HiveDesk",MB_YESNO|MB_ICONWARNING)!=IDYES)return 0;
+                DestroyWindow(window);return 0;
+            case WM_DESTROY:s->fallback_settings_ready=false;s->settings=nullptr;s->settings_restart.close();s->publish_input();return 0;
+            case WM_TIMER:if(w==6&&s->fallback_settings_ready)s->save_settings();return 0;
             case WM_ERASEBKGND:{RECT r{};GetClientRect(window,&r);FillRect(reinterpret_cast<HDC>(w),&r,s->background_brush);return 1;}
             case WM_CTLCOLORSTATIC:case WM_CTLCOLORBTN:SetTextColor(reinterpret_cast<HDC>(w),Text);SetBkColor(reinterpret_cast<HDC>(w),Background);return reinterpret_cast<LRESULT>(s->background_brush);
             case WM_CTLCOLOREDIT:SetTextColor(reinterpret_cast<HDC>(w),Text);SetBkColor(reinterpret_cast<HDC>(w),Card);return reinterpret_cast<LRESULT>(s->edit_brush);
             case WM_COMMAND:
                 switch(LOWORD(w)) {
-                case Save:s->save_settings();return 0;
-                case Close:DestroyWindow(window);return 0;
+                case Close:SendMessageW(window,WM_CLOSE,0,0);return 0;
+                case Name:if(s->fallback_settings_ready&&HIWORD(w)==EN_CHANGE){SetDlgItemTextW(window,Save,L"Saving...");SetTimer(window,6,350,nullptr);}return 0;
+                case Startup:case TrayIcon:case DebugOverlay:case RelativeMouse:case DisplayCadence:
+                    if(s->fallback_settings_ready&&HIWORD(w)==BN_CLICKED)s->save_settings();return 0;
+                case Hotkey:if(s->fallback_settings_ready&&HIWORD(w)==CBN_SELCHANGE)s->save_settings();return 0;
                 }break;
             }
         }

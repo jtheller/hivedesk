@@ -54,7 +54,7 @@ internal sealed class AgentBridge(bool preview)
     internal async Task Save(Preferences value)
     {
         if (preview) { demo = value; return; }
-        Send("preferences", value.Name, value.Startup ? "1" : "0", value.TrayIcon ? "1" : "0", value.HotkeyModifiers.ToString(CultureInfo.InvariantCulture), value.HotkeyKey.ToString(CultureInfo.InvariantCulture), value.DebugOverlay ? "1" : "0", value.RelativeMouse ? "1" : "0", value.DisplayCadence ? "1" : "0");
+        await Task.Run(() => Send("preferences", value.Name, value.Startup ? "1" : "0", value.TrayIcon ? "1" : "0", value.HotkeyModifiers.ToString(CultureInfo.InvariantCulture), value.HotkeyKey.ToString(CultureInfo.InvariantCulture), value.DebugOverlay ? "1" : "0", value.RelativeMouse ? "1" : "0", value.DisplayCadence ? "1" : "0"));
         for (int attempt = 0; attempt < 40; ++attempt)
         {
             await Task.Delay(100); var saved = Load();
