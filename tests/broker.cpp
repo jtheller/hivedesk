@@ -138,6 +138,11 @@ int main(){try{
     {Pipe p;broker::Kind kind;broker::Bytes payload;
         require(broker::send(p.client,broker::Activate)&&broker::receive(p.server,kind,payload)&&kind==broker::Activate&&payload.empty(),"Warm activation rejected by broker wire");
         require(broker::send(p.server,broker::Activated)&&broker::receive(p.client,kind,payload)&&kind==broker::Activated&&payload.empty(),"Warm activation acknowledgement rejected by bridge wire");
+        for(const uint32_t enabled:{1u,0u,1u}){
+            broker::Bytes preview;broker::u32(preview,enabled);
+            require(broker::send(p.client,broker::Preview,preview)&&broker::receive(p.server,kind,payload)&&kind==broker::Preview&&payload==preview,
+                "Live preview resume/pause rejected by actual broker pipe framing");
+        }
     }
     readiness_check();rate_extension_check();frame_composition_check();
     std::puts("PASS broker: framing, cursor ownership/provenance, mixed-version rejection, invalid input/headers, I/O cancellation, bounded frame credit, readiness wake races, and blocked-credit cancellation.");return 0;

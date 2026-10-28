@@ -24,7 +24,7 @@ debug overlay 顶部显示 **Viewer (this PC)** 和 **Host (remote)** 两端版�
 直接运行新版 Setup.exe 覆盖安装，不用先卸载。设备名、自启、托盘和快捷键设置会保留。
 安装会短暂停止 HiveDesk，完成后重新启动。正常使用请分发安装包；解压文件版不负责安装被控端所需的系统服务。
 
-首次请手动安装 0.7.0（已有 alpha.27 或更新版本可等待自动升级），设置标题应显示 **0.7.0**。此后系统服务会自动从 [GitHub Releases](https://github.com/jtheller/hivedesk/releases/latest) 获取新版：启动约 60–90 秒后首次检查，之后每 15 分钟检查一次。后台下载并验证发布签名、文件大小和 SHA256；没有更新或检查失败时继续正常使用。
+首次请手动安装 0.7.1（已有 alpha.27 或更新版本可等待自动升级），设置标题应显示 **0.7.1**。此后系统服务会自动从 [GitHub Releases](https://github.com/jtheller/hivedesk/releases/latest) 获取新版：启动约 60–90 秒后首次检查，之后每 15 分钟检查一次。后台下载并验证发布签名、文件大小和 SHA256；没有更新或检查失败时继续正常使用。
 
 ### Hive 卡片与窗口模式（0.3.2）
 
