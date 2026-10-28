@@ -1,4 +1,4 @@
-#define AppVersion "0.7.10"
+#define AppVersion "0.7.11"
 #define RepoRoot SourcePath + ".."
 [Setup]
 AppId={{DFA5DE34-4EA9-4ECC-B99A-8F79EE9357C8}
@@ -6,7 +6,7 @@ AppName=HiveDesk
 AppVersion={#AppVersion}
 AppPublisher=HiveDesk
 AppComments=Personal LAN desktop switching
-VersionInfoVersion=0.7.10.0
+VersionInfoVersion=0.7.11.0
 VersionInfoDescription=HiveDesk Setup
 VersionInfoProductName=HiveDesk
 SetupIconFile={#RepoRoot}\resources\HiveDesk.ico
@@ -33,6 +33,8 @@ Source: "{#RepoRoot}\build\HiveDeskUpdater.exe"; DestDir: "{app}"; Flags: ignore
 Source: "{#RepoRoot}\build\HiveDeskGpuPolicy.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskHost.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskCheck.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\build\HiveDeskPathCheck.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\build\HiveDeskRemoteVideoCheck.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskMediaProbe.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\third_party\onevpl\LICENSE"; DestDir: "{app}\licenses"; DestName: "Intel-oneVPL-LICENSE.txt"; Flags: ignoreversion
 Source: "{#RepoRoot}\third_party\amf\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "AMD-AMF-LICENSE.txt"; Flags: ignoreversion

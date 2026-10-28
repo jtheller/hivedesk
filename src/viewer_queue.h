@@ -83,14 +83,18 @@ public:
     }
 };
 
-// No playback/jitter buffer: consume immediately, with a hard bound on both
-// pending compressed pictures and their age. Removing a reference picture
-// invalidates the whole dependent chain until a fresh IDR arrives.
+// Decode intact references immediately, including bounded late references.
+// Presentation has its own tighter deadline and latest-ready replacement.
+// Only missing references, ownership overflow or severe backlog reset the chain.
 // All methods are called while the MediaViewer mutex is held.
 class ViewerQueue {
 public:
     static constexpr size_t MaxPending = 4;
+    // 50 ms is a local presentation deadline, not a reason to destroy a
+    // valid predictive chain. Decode catch-up remains bounded by both count
+    // and a one-second excess-transit/local-work ceiling.
     static constexpr uint64_t MaxAgeUs = 50000;
+    static constexpr uint64_t MaxReferenceAgeUs = 1000000;
     static constexpr uint64_t RecoveryTimeoutUs = SessionStallUs;
     static constexpr uint64_t BacklogEvidenceUs = 250000;
     struct Pending {
@@ -197,11 +201,11 @@ public:
         transit_.observe(origin,arrived);
         transit_extra_=transit_.extra_age(origin,arrived);
         Pending pending{std::move(frame),completed,epoch_};
-        if (age(pending,now) > MaxAgeUs) {
+        if (age(pending,now) > MaxReferenceAgeUs) {
             invalidate(now,RecoveryReason::Age); ++discarded_; return false;
         }
         if (frames_.size() >= MaxPending) invalidate(now,RecoveryReason::Overflow);
-        else if (!frames_.empty() && age(frames_.front(),now) > MaxAgeUs) invalidate(now,RecoveryReason::Age);
+        else if (!frames_.empty() && age(frames_.front(),now) > MaxReferenceAgeUs) invalidate(now,RecoveryReason::Age);
         if (pending.frame.keyframe) {
             // An IDR supersedes any queued reference chain. Invalidate a decode
             // already in flight too, so its late output cannot flash afterward.
@@ -215,12 +219,12 @@ public:
     std::optional<Pending> pop(uint64_t now) {
         if (frames_.empty()) return {};
         remember_backlog(now);
-        if (age(frames_.front(),now) > MaxAgeUs) { invalidate(now,RecoveryReason::Age); return {}; }
+        if (age(frames_.front(),now) > MaxReferenceAgeUs) { invalidate(now,RecoveryReason::Age); return {}; }
         auto pending = std::move(frames_.front()); frames_.pop_front(); return pending;
     }
     bool fresh(const Pending& pending, uint64_t now) {
         if (pending.epoch != epoch_ || waiting_keyframe_) return false;
-        if (age(pending,now) > MaxAgeUs) { invalidate(now,RecoveryReason::Age); return false; }
+        if (age(pending,now) > MaxReferenceAgeUs) { invalidate(now,RecoveryReason::Age); return false; }
         return true;
     }
     bool admit(const Pending& pending,uint64_t now) {
@@ -233,7 +237,7 @@ public:
     }
     bool output_fresh(const Pending& pending, uint64_t now) {
         if (pending.epoch != epoch_ || waiting_keyframe_) return false;
-        if (age(pending,now) > MaxAgeUs) {
+        if (age(pending,now) > MaxReferenceAgeUs || (now>=pending.arrival && now-pending.arrival>MaxAgeUs)) {
             // Mapping and presentation run independently. A late old Present
             // retry cannot re-arm recovery after the mapper has already made a
             // newer picture ready. That newer output still enforces its own age.
@@ -251,10 +255,10 @@ public:
         // Skip conversion while newer compressed pictures still need decoding.
         // Once conversion has started, an arriving packet is not a replacement
         // picture yet: presentation only needs the freshness/epoch guard above.
-        return fresh(pending,now) && frames_.empty();
+        return output_fresh(pending,now) && frames_.empty();
     }
     bool mark_ready(const Pending& pending,uint64_t now) {
-        if(!fresh(pending,now))return false;
+        if(!output_fresh(pending,now))return false;
         remember_ready(pending);
         presentation_refresh_=recover_=recovery_pending_=false;recovery_since_=0;return true;
     }

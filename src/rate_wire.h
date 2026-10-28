@@ -6,18 +6,20 @@ namespace hive::rate_wire {
 // channel and local desktop broker. Callers still validate their final length.
 template<class W32,class W64>
 void write_feedback(const StreamFeedback& f,W32 word,W64 wide) {
-    word(1);wide(f.feedback_sequence);wide(f.received_bytes);wide(f.received_frames);
+    word(f.transport_details?2:1);wide(f.feedback_sequence);wide(f.received_bytes);wide(f.received_frames);
     word(f.received_kbps);word(f.received_millihz);word(f.receive_sample_age_us);
     word(f.service_sample_age_us);word(f.transit_extra_us);
     wide(f.sequence_gaps);wide(f.age_expired);wide(f.queue_overflows);
+    if(f.transport_details){wide(f.transport_bytes);wide(f.transport_sample_us);}
 }
 template<class R32,class R64>
 bool read_feedback(StreamFeedback& f,R32 word,R64 wide) {
-    if(word()!=1)return false;f.rate_details=true;
+    const auto version=word();if(version!=1&&version!=2)return false;f.rate_details=true;f.transport_details=version==2;
     f.feedback_sequence=wide();f.received_bytes=wide();f.received_frames=wide();
     f.received_kbps=word();f.received_millihz=word();f.receive_sample_age_us=word();
     f.service_sample_age_us=word();f.transit_extra_us=word();
-    f.sequence_gaps=wide();f.age_expired=wide();f.queue_overflows=wide();return true;
+    f.sequence_gaps=wide();f.age_expired=wide();f.queue_overflows=wide();
+    if(f.transport_details){f.transport_bytes=wide();f.transport_sample_us=wide();}return true;
 }
 template<class W32,class W64>
 void write_diagnostics(const SourceDiagnostics& d,W32 word,W64 wide) {

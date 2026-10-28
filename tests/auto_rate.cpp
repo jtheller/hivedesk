@@ -160,6 +160,24 @@ int main(){
         Simulation recovery;
         for(int i=0;i<20;++i)recovery.step(30,75000,22,20,500000,true);
         require(recovery.controller.bitrate()==original&&recovery.controller.decision().rate_limit_millihz==60000,"IDR recovery alone must not start a bitrate/FPS collapse");
+        // A single IDR is still being received: no complete picture or QP
+        // sample is available, but byte feedback must learn the busy path.
+        Simulation wire;
+        wire.sample.transport_details=true;wire.sample.recovering=true;
+        for(int i=0;i<10;++i){
+            wire.now+=1000000;wire.sample.transport_bytes+=125000;wire.sample.transport_sample_us+=1000000;
+            ++wire.sample.receiver_report_id;wire.sample.send_wait_us+=900000;
+            wire.controller.observe(wire.now,wire.sample);
+        }
+        require(wire.controller.bitrate()<original/2,"Incomplete recovery frame hid sustained transport pressure");
+        require(wire.controller.decision().rate_limit_millihz==60000,"No QP evidence must not invent a quality FPS limit");
+        const auto wire_rate=wire.controller.bitrate();
+        for(int i=0;i<10;++i){wire.now+=1000000;wire.sample.send_wait_us+=900000;wire.controller.observe(wire.now,wire.sample);}
+        require(wire.controller.bitrate()==wire_rate,"Frozen wire report kept reducing bitrate");
+        Simulation wire_idle;wire_idle.sample.transport_details=true;
+        for(int i=0;i<10;++i){wire_idle.now+=1000000;wire_idle.sample.transport_bytes+=5000;wire_idle.sample.transport_sample_us+=1000000;
+            ++wire_idle.sample.receiver_report_id;wire_idle.controller.observe(wire_idle.now,wire_idle.sample);}
+        require(wire_idle.controller.bitrate()==original,"Idle byte traffic became path capacity");
         Simulation decoder;
         decoder.sample.receiver_queue_us=30000;
         for(int i=0;i<20;++i)decoder.step(30,75000,22,20,500000);

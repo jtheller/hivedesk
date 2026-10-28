@@ -43,6 +43,8 @@ constexpr uint32_t FeatureWarmStream = 8192;
 constexpr uint32_t FeatureRichClipboard = 16384;
 // 32768 is reserved for 0.7.0, whose SYSTEM pipe rejected Peek messages.
 constexpr uint32_t FeatureLivePeek = 65536;
+constexpr uint32_t FeatureByteFeedback = 131072;
+constexpr uint32_t FeaturePathProbe = 262144;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;
@@ -86,6 +88,10 @@ struct StreamFeedback {
     uint32_t received_kbps=0,received_millihz=0;
     uint32_t receive_sample_age_us=UINT32_MAX,service_sample_age_us=UINT32_MAX,transit_extra_us=0;
     uint64_t sequence_gaps=0,age_expired=0,queue_overflows=0;
+    // Session-local wire progress, including incomplete authenticated packets.
+    // Used for congestion estimation only, never image/input authorization.
+    bool transport_details=false;
+    uint64_t transport_bytes=0,transport_sample_us=0;
 };
 struct StreamHealth {
     uint64_t session=0;
@@ -118,6 +124,7 @@ struct ViewerDiagnostics {
     uint32_t decode_us=0,render_us=0,present_us=0,service_p90_us=0,queue_us=0,queue_depth=0;
     uint32_t nvdec_map_us=0,convert_us=0,draw_us=0;
     uint32_t present_gap_p95_us=0,present_gap_max_us=0;
+    uint32_t wire_assembly_us=0; // Last complete frame, local receiver clock; not playback queue age.
     bool recovering=false;
     uint32_t service_sample_age_us=UINT32_MAX,receive_sample_age_us=UINT32_MAX,transit_extra_us=0;
     uint64_t sequence_gaps=0,age_expired=0,queue_overflows=0;

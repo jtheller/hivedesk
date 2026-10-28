@@ -52,6 +52,11 @@ struct TransportCallbacks {
     std::function<void(const std::string&, const InputPacket&)> input_packet;
     std::function<void(const std::string&, const InputAck&)> input_ack;
 };
+// Explicit developer diagnostic: generated data only, bounded duration/rate.
+struct PathProbeResult {
+    uint64_t sent_packets=0,received_packets=0,received_bytes=0;
+    uint64_t source_elapsed_us=0,receive_span_us=0;
+};
 class Transport {
 public:
     Transport(); ~Transport();
@@ -101,6 +106,7 @@ public:
     // Read-only socket counters for explicit startup diagnostics; no payloads.
     std::string tcp_diagnostics(const std::string& peer) const;
     uint64_t received_video_bytes(const std::string& peer) const;
+    bool measure_path(const std::string& peer,bool udp,uint32_t bitrate_bps,uint32_t duration_ms,PathProbeResult& result,std::string& error);
     static std::string generate_group_key();
     static bool self_test(std::string& result);
     static bool discovery_self_test(std::string& result);

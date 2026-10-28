@@ -47,68 +47,6 @@ void normal_and_idle() {
     require(active&&queue.presentable(*active,Local+1000001000),"Idle resume considered stale");
     require(!queue.recovering()&&queue.discarded()==0,"Healthy stream requested recovery");
 }
-void prepared_picture_survives_new_compressed_arrival() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Initial prepared picture missing");
-    auto prepared=queue.pop(Local);
-    require(prepared&&queue.presentable(*prepared,Local),"Initial conversion could not start");
-    // The stream is healthy, but each next packet arrives during conversion.
-    // It is worth skipping conversion of superseded work; cancelling an already
-    // prepared picture here would instead suppress every visible update.
-    for(uint64_t i=1;i<=100;++i){
-        const auto now=Local+i*5000;
-        require(queue.push(picture(i,Source+i*5000),now),"New compressed picture rejected");
-        require(!queue.presentable(*prepared,now),"Obsolete conversion was not skipped");
-        require(queue.fresh(*prepared,now),"Fresh prepared pixels lost to an undecoded packet");
-        require(queue.mark_ready(*prepared,now),"Prepared display could not mark fresh progress");
-        prepared=queue.pop(now);
-        require(prepared&&queue.presentable(*prepared,now),"Newest picture could not start conversion");
-    }
-    require(!queue.recovering()&&queue.discarded()==0,"Healthy prepared pictures triggered reference recovery");
-    // Keeping prepared output eligible must never bypass the original age or
-    // epoch bounds, even when the queue contains a newer independent picture.
-    require(queue.push(picture(101,Source+505000,true),Local+505000),"Replacement IDR rejected");
-    require(!queue.fresh(*prepared,Local+505000),"Prepared pixels crossed an IDR epoch");
-    prepared=queue.pop(Local+505000);
-    require(prepared&&!queue.fresh(*prepared,Local+555001),"Prepared pixels escaped the hard age bound");
-    require(queue.recovering(),"Expired prepared pixels did not request reference recovery");
-}
-void worker_and_decoder_stalls() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Initial IDR missing");
-    require(!queue.pop(Local+50001),"Expired queued frame escaped dequeue guard");
-    require(queue.empty()&&queue.recovering(),"Worker stall failed to request IDR");
-    require(queue.age_expired()==1&&queue.sequence_gaps()==0&&queue.queue_overflows()==0,"Worker expiry reason misclassified");
-    require(!queue.push(picture(1,Source+60000),Local+60000),"Reference accepted after dropped chain");
-    require(queue.push(picture(2,Source+70000,true),Local+70000),"Fresh recovery IDR rejected");
-    auto active=queue.pop(Local+70000);require(bool(active),"Recovery IDR missing");
-    require(!queue.presentable(*active,Local+120001),"Decoder stall produced stale presentation");
-    require(queue.recovering(),"Decoder stall failed to request fresh IDR");
-}
-void decoded_expiry_preserves_references() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Decoded expiry baseline rejected");
-    auto decoded=queue.pop(Local);require(decoded&&queue.fresh(*decoded,Local),"Initial decode admission failed");
-    require(queue.push(picture(1,Source+60000),Local+60000),"Fresh P after slow decoded output rejected");
-    require(!queue.output_fresh(*decoded,Local+60000),"Expired decoded output was presentable");
-    require(queue.size()==1&&queue.recovering()&&queue.recovery_pending(),"Decoded expiry discarded a valid queued reference or omitted refresh");
-    require(queue.age_expired()==1&&queue.discarded()==0&&queue.sequence_gaps()==0,"Display-only expiry was treated as reference loss");
-    require(!queue.output_fresh(*decoded,Local+61000)&&queue.age_expired()==1,"Repeated presentation polling inflated expiry count");
-    auto next=queue.pop(Local+61000);
-    require(next&&next->epoch==decoded->epoch&&queue.fresh(*next,Local+61000),"Decoded expiry changed the reference epoch");
-    require(queue.mark_output_ready(*next,Local+62000),"Fresh dependent P could not finish display recovery");
-    require(!queue.recovering()&&!queue.recovery_pending()&&!queue.recovery_expired(Local+5000000),"Fresh P left a spurious IDR request or deadline armed");
-
-    // The display-only exemption never applies to compressed pictures waiting
-    // for admission: missing one of those still invalidates the entire chain.
-    require(queue.push(picture(2,Source+70000),Local+70000),"Pre-expiry dependent picture rejected");
-    require(!queue.output_fresh(*next,Local+111001),"Old decoded P unexpectedly remained fresh");
-    require(!queue.pop(Local+120001)&&queue.empty()&&queue.recovering(),"Expired encoded queue survived display refresh state");
-    require(!queue.push(picture(3,Source+130000),Local+130000),"P picture accepted after a real compressed reference loss");
-    require(queue.push(picture(4,Source+140000,true),Local+140000),"Fresh IDR could not recover a real compressed expiry");
-    auto recovery=queue.pop(Local+140000);
-    require(recovery&&recovery->epoch!=next->epoch&&queue.mark_output_ready(*recovery,Local+141000),"Real encoded expiry failed to advance/recover epoch");
-}
 void decoded_expiry_static_refresh_and_epochs() {
     hive::ViewerQueue queue;
     require(queue.push(picture(0,Source,true),Local),"Static decoded baseline rejected");
@@ -153,20 +91,6 @@ void older_presenter_cannot_rearm_newer_ready_output() {
     auto reopened=queue.pop(Local+200000);require(bool(reopened),"New session picture missing");
     require(!queue.output_fresh(*reopened,Local+250001)&&queue.recovering(),"New session inherited a larger ready sequence watermark");
 }
-void tcp_stall_and_burst() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Initial IDR rejected");
-    auto initial=queue.pop(Local);require(initial&&queue.presentable(*initial,Local),"Initial presentation failed");
-    // The receive thread wakes 200 ms late. Arrival timestamps all look new;
-    // capture intervals prove this batch is old, including its periodic IDRs.
-    for(uint64_t i=1;i<=15;++i)
-        require(!queue.push(picture(i,Source+i*10000,i%5==0),Local+210000+i*100),"Old TCP burst accepted");
-    require(queue.recovering()&&queue.empty(),"Stale IDR incorrectly cleared recovery");
-    require(queue.push(picture(16,Source+220000,true),Local+222000),"Fresh IDR after TCP drain rejected");
-    auto fresh=queue.pop(Local+222000);
-    require(fresh&&queue.presentable(*fresh,Local+223000),"Fresh recovery frame suppressed");
-    require(!queue.recovering(),"Recovery remained latched after fresh IDR");
-}
 void epochs_and_reference_gaps() {
     hive::ViewerQueue queue;
     require(queue.push(picture(0,Source,true),Local),"Initial IDR rejected");
@@ -208,205 +132,95 @@ void session_and_legacy() {
     auto legacy=queue.pop(Local);require(legacy&&queue.presentable(*legacy,Local+1000),"Legacy presentation failed");
     require(!queue.presentable(*legacy,Local+50001),"Legacy local queue age not enforced");
 }
-void slow_replay_and_clock_drift() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Initial IDR rejected");
-    queue.pop(Local);bool rejected=false;
-    for(uint64_t i=1;i<=20;++i){
-        const auto local=Local+i*10000;
-        if(!queue.push(picture(i,Source+i*1000,i%5==0),local)){rejected=true;continue;}
-        auto frame=queue.pop(local);
-        require(frame&&queue.presentable(*frame,local),"Unexpected accepted replay state");
-        require(!rejected,"Old slow replay resumed without a fresh IDR");
-    }
-    require(rejected&&queue.recovering(),"Progressively delayed replay was not bounded");
-    hive::ViewerTransitClock clock;
-    // An hour at 100 Hz with 100 ppm relative oscillator drift should not be
-    // mistaken for a growing network queue. No sleeps or wall-clock dependency.
-    for(uint64_t i=0;i<360000;++i){
-        const auto source=Source+i*10000,local=Local+i*10001;
-        clock.observe(source,local);
-        require(clock.extra_age(source,local)<10000,"Ordinary clock drift accumulated as backlog");
-    }
-}
-void bounded_recovery_requires_new_session() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Initial recovery baseline rejected");
-    auto first=queue.pop(Local);require(first&&queue.mark_ready(*first,Local),"Initial recovery baseline not ready");
-    // A true latency increase and a still-buffered stream are indistinguishable
-    // here. Never silently rebase within this session, even on repeated IDRs.
-    for(uint64_t i=1;i<=7;++i){
-        const auto time=i*300000;
-        require(!queue.push(picture(i,Source+time,true),Local+time+60000),"Stale IDR silently rebased transit floor");
-    }
-    const auto began=Local+360000;
-    require(!queue.recovery_expired(began+hive::ViewerQueue::RecoveryTimeoutUs-1),"Recovery timeout fired early");
-    require(queue.recovery_expired(began+hive::ViewerQueue::RecoveryTimeoutUs),"Repeated stale IDRs deferred recovery timeout");
-    // The selected-stream restart supplies a new session ID and newly captured
-    // frame. Old wire packets cannot establish the baseline for this new epoch.
-    queue.reset();
-    require(queue.push(picture(0,Source+3000000,true,8),Local+3060000),"New-session IDR failed to establish baseline");
-    require(!queue.push(picture(8,Source+3000000,true,7),Local+3060001),"Old-session packet crossed restart barrier");
-    auto fresh=queue.pop(Local+3060000);
-    require(fresh&&queue.mark_ready(*fresh,Local+3061000),"New-session recovery frame not ready");
-    require(!queue.recovery_expired(Local+10000000),"New session retained expired recovery timer");
 
-    queue.reset();queue.push(picture(0,Source,true),Local);queue.pop(Local);
-    require(!queue.push(picture(1,Source+10000),Local+70000),"Stale reference accepted");
-    require(queue.push(picture(2,Source+80000,true),Local+80000),"Fresh pending IDR rejected");
-    require(queue.recovery_pending(),"An unrendered IDR prematurely cleared recovery deadline");
-    auto ready=queue.pop(Local+80000);
-    require(ready&&queue.mark_ready(*ready,Local+81000),"Fresh IDR could not finish recovery");
-    require(!queue.recovery_pending()&&!queue.recovery_expired(Local+10000000),"Completed fresh recovery left timeout armed");
-}
-void source_work_is_not_transport_backlog() {
-    hive::ViewerQueue queue;
-    require(queue.push(completed_picture(0,Source,Source+4000,true),Local+4000),"Timed initial IDR rejected");
-    auto first=queue.pop(Local+4000);require(first&&queue.mark_ready(*first,Local+5000),"Timed initial IDR missing");
-    // An 80 ms GPU job after a 4 ms job is completed work, not 76 ms of TCP
-    // backlog. Later fast frames must keep the same reference chain intact.
-    require(queue.push(completed_picture(1,Source+10000,Source+90000),Local+90000),"Slow intrinsic encoding was mistaken for queued video");
-    auto slow=queue.pop(Local+90000);require(slow&&queue.mark_ready(*slow,Local+91000),"Freshly completed slow picture suppressed");
-    require(queue.transit_extra_us()==0&&!queue.recovering(),"Encode duration polluted timed transport excess");
-    require(queue.push(completed_picture(2,Source+100000,Source+104000),Local+104000),"Fast frame following slow encoding rejected");
-    auto fast=queue.pop(Local+104000);require(fast&&queue.mark_ready(*fast,Local+105000),"Fast frame failed after slow encoding");
-    require(queue.discarded()==0&&queue.age_expired()==0,"Valid source work caused reference recovery");
-    require(!queue.fresh(*fast,Local+154001)&&queue.recovering(),"Timed frame bypassed the 50 ms local residence limit");
-
-    // A slow FIRST frame cannot teach an artificially low capture baseline that
-    // makes ordinary following frames look stale or undercount actual transit.
-    queue.reset();
-    require(queue.push(completed_picture(0,Source,Source+300000,true),Local+300000),"Slow first timed IDR rejected");
-    auto initial=queue.pop(Local+300000);require(initial&&queue.mark_ready(*initial,Local+301000),"Slow first timed IDR not usable");
-    require(queue.push(completed_picture(1,Source+310000,Source+314000),Local+314000),"First-frame work poisoned later freshness");
-    queue.pop(Local+314000);
-    require(!queue.push(completed_picture(2,Source+320000,Source+324000,true),Local+384001),"Slow initial encode hid subsequent TCP backlog");
-    require(queue.recovering()&&queue.age_expired()==1,"Timed TCP expiry failed to preserve reference recovery");
-}
-void timed_transport_and_reference_guards() {
-    hive::ViewerQueue queue;
-    require(queue.push(completed_picture(0,Source,Source+4000,true),Local+4000),"Timed TCP baseline rejected");
-    queue.pop(Local+4000);
-    for(uint64_t i=1;i<=15;++i)
-        require(!queue.push(completed_picture(i,Source+i*10000,Source+i*10000+4000,i%5==0),Local+214000+i*100),"Timed stale TCP burst accepted");
-    require(queue.recovering()&&queue.empty(),"Timed stale IDR reset transit floor");
-    require(queue.push(completed_picture(16,Source+220000,Source+224000,true),Local+226000),"Timed fresh IDR rejected after TCP drain");
-    auto fresh=queue.pop(Local+226000);require(fresh&&queue.mark_ready(*fresh,Local+227000),"Timed recovery did not finish");
-    require(!queue.push(completed_picture(18,Source+230000,Source+234000),Local+236000),"Timed provenance bypassed a lost reference");
-    require(queue.sequence_gaps()==1&&queue.recovering(),"Timed lost reference did not require IDR");
-    // New source timestamps must not let a stream of stale recovery IDRs keep
-    // a selected connection alive forever or reset its old transit baseline.
-    for(uint64_t i=19;i<=26;++i){
-        const auto at=300000+(i-19)*300000;
-        require(!queue.push(completed_picture(i,Source+at,Source+at+4000,true),Local+at+64000),"Timed stale recovery IDR became fresh");
-    }
-    require(queue.recovery_expired(Local+236000+hive::ViewerQueue::RecoveryTimeoutUs),"Timed recovery lost the two-second session barrier");
-}
-void malformed_or_unbounded_source_work() {
-    hive::ViewerQueue queue;
-    require(queue.push(completed_picture(0,Source,Source+4000,true),Local+4000),"Provenance baseline rejected");queue.pop(Local+4000);
-    require(!queue.push(completed_picture(1,Source+10000,Source+9999),Local+14000),"Completion before capture accepted");
-    require(!queue.push(picture(2,Source+20000,true),Local+24000),"Missing provenance switched a timed stream to a new clock basis");
-    require(!queue.push(completed_picture(3,Source+1000,Source+3000,true),Local+25000),"Backward completion timestamp accepted");
-    require(!queue.push(completed_picture(4,Source+30000,Source+30000+hive::MaxSourceWorkUs+1,true),Local+1040000),"Unbounded intrinsic source work accepted");
-    require(queue.push(completed_picture(5,Source+1050000,Source+1054000,true),Local+1054000),"Invalid source timing poisoned recovery baseline");
-    auto recovered=queue.pop(Local+1054000);require(recovered&&queue.mark_ready(*recovered,Local+1055000),"Provenance rejection prevented fresh recovery");
-    // Exactly the finite source-work ceiling is admissible, without enlarging
-    // either the compressed queue or the post-arrival lifetime.
-    queue.reset();
-    require(queue.push(completed_picture(0,Source,Source+hive::MaxSourceWorkUs,true),Local+hive::MaxSourceWorkUs),"Finite source-work boundary rejected");
-    require(!queue.pop(Local+hive::MaxSourceWorkUs+hive::ViewerQueue::MaxAgeUs+1),"Source-work allowance leaked into local queue age");
-
-    queue.reset();require(queue.push(picture(0,Source,true),Local),"Legacy mixed-version baseline failed");queue.pop(Local);
-    require(!queue.push(completed_picture(1,Source+10000,Source+90000),Local+90000),"Mid-session provenance changed a legacy clock baseline");
-}
-void recent_compressed_backlog_feedback() {
-    hive::ViewerQueue queue;
-    require(queue.push(picture(0,Source,true),Local),"Backlog baseline rejected");
-    auto first=queue.pop(Local+25000);
-    require(first&&queue.mark_ready(*first,Local+26000),"A bounded queued picture could not recover");
-    require(queue.queue_age(Local+30000)==0&&queue.feedback_queue_age(Local+30000)==25000,
-        "Dequeue erased real local backlog before the next feedback report");
-    for(uint64_t at=Local+35000;at<Local+275000;at+=5000)
-        require(queue.feedback_queue_age(at)==25000,"Recent queue evidence vanished too early");
-    require(queue.feedback_queue_age(Local+275000)==0,"Polling kept idle queue evidence alive past 250ms");
-    require(queue.push(picture(1,Source+300000),Local+300000),"New work failed after backlog evidence expired");
-    auto current=queue.pop(Local+301000);
-    require(current&&queue.mark_ready(*current,Local+302000)&&queue.feedback_queue_age(Local+302000)==0,
-        "Healthy work inherited an expired backlog ceiling");
-
-    queue.reset();
-    for(uint64_t i=0;i<4;++i)
-        require(queue.push(picture(i,Source+i*10000,i==0),Local+i*10000),"Overflow evidence setup failed");
-    require(!queue.push(picture(4,Source+40000),Local+40000)&&queue.queue_overflows()==1,
-        "Compressed queue ownership bound changed");
-    require(queue.empty()&&queue.feedback_queue_age(Local+100000)==40000,
-        "Overflow flushed the local backlog signal before feedback");
-    require(queue.feedback_queue_age(Local+290000)==0,"Overflow evidence never expired");
-
-    queue.reset();require(queue.push(picture(0,Source,true),Local),"Expiry evidence setup failed");
-    require(!queue.pop(Local+50001)&&queue.age_expired()==1&&queue.feedback_queue_age(Local+60000)==50001,
-        "Encoded freshness expiry hid queued work or admitted an old picture");
-    queue.reset();require(queue.feedback_queue_age(Local+60000)==0,"Session reset retained old queue pressure");
-
-    require(queue.push(picture(0,Source,true),Local),"Admission backlog baseline rejected");
-    auto reserved=queue.pop(Local);require(bool(reserved),"Admission backlog fixture could not remove its compressed picture");
-    require(queue.empty()&&queue.admit(*reserved,Local+25000)&&queue.feedback_queue_age(Local+30000)==25000,
-        "Compressed picture waiting outside the queue lost its decoder-credit backlog");
-    require(!queue.admit(*reserved,Local+50001)&&queue.feedback_queue_age(Local+60000)==50001,
-        "Expired decoder-credit reservation bypassed strict admission or erased pressure");
-    require(!queue.admit(*reserved,Local+200000)&&queue.feedback_queue_age(Local+300001)==0,
-        "Retired reservation renewed stale backlog evidence");
-    queue.reset();
-
-    // Long source work and display-only age do not imply local compressed
-    // backlog. Neither is allowed to recreate the old latency-derived cap.
-    require(queue.push(completed_picture(0,Source,Source+80000,true),Local+80000),"Slow source work rejected");
-    auto decoded=queue.pop(Local+80000);require(decoded&&queue.feedback_queue_age(Local+80000)==0,"Source work became local backlog");
-    require(!queue.output_fresh(*decoded,Local+140000)&&queue.feedback_queue_age(Local+140000)==0,
-        "Presentation-only expiry became compressed backlog evidence");
-    queue.reset();require(queue.push(picture(0,Source,true),Local),"Transport-only baseline rejected");queue.pop(Local);
-    require(!queue.push(picture(1,Source+10000,true),Local+90000)&&queue.feedback_queue_age(Local+90000)==0,
-        "Stale TCP transit without local queued work became decoder capacity pressure");
-}
-void slow_packet_assembly_and_progress(){
+void intact_references_and_latest_presentation(){
     hive::ViewerQueue q;
-    auto wire=[](uint64_t seq,uint64_t source,uint64_t start,uint64_t end,bool key){
-        auto f=completed_picture(seq,source,source+1000,key);
-        f.receive_started_us=start;f.receive_completed_us=end;return f;
+    require(q.push(picture(0,Source,true),Local),"Initial IDR rejected");
+    auto initial=q.pop(Local);require(initial&&q.mark_output_ready(*initial,Local),"Initial ready missing");
+    // Simulated 180 ms transport jitter: valid P references are not corruption.
+    // Catch up by decoding each; only the latest completed picture is displayed.
+    for(uint64_t i=1;i<=18;++i){
+        const auto arrival=Local+190000+i*1000;
+        require(q.push(picture(i,Source+i*10000),arrival),"Jitter destroyed an intact reference chain");
+        auto p=q.pop(arrival);require(p&&q.admit(*p,arrival+1000),"Bounded reference catch-up refused");
+        require(p->epoch==initial->epoch,"Jitter changed the decoder epoch");
+        require(q.mark_output_ready(*p,arrival+2000),"Latest complete jittered picture was suppressed");
+    }
+    require(!q.recovering()&&!q.discarded()&&!q.age_expired(),"Jitter requested an unnecessary IDR");
+    // A local worker stalls beyond display budget. Decode the reference, but
+    // never present it late; a following P picture completes recovery.
+    require(q.push(picture(19,Source+300000),Local+300000),"Catch-up reference rejected");
+    auto late=q.pop(Local+380000);require(late&&q.admit(*late,Local+381000),"Late intact reference not decoded");
+    require(!q.output_fresh(*late,Local+382000),"Local stale output reached presentation");
+    require(q.push(picture(20,Source+390000),Local+390000),"P after decode-only reference rejected");
+    auto fresh=q.pop(Local+390000);
+    require(fresh&&fresh->epoch==late->epoch&&q.mark_output_ready(*fresh,Local+391000),"Fresh P could not restore presentation");
+    require(!q.recovery_pending()&&!q.recovering(),"Fresh P left recovery latched");
+}
+void severe_backlog_and_queue_budget(){
+    hive::ViewerQueue q;
+    require(q.push(picture(0,Source,true),Local),"Baseline rejected");q.pop(Local);
+    require(!q.push(picture(1,Source+10000),Local+1010001),"Over-one-second TCP tail accepted");
+    require(q.recovering()&&q.age_expired()==1,"Severe backlog omitted reference recovery");
+    require(!q.push(picture(2,Source+20000,true),Local+1020001),"Old IDR reset transit baseline");
+    require(q.push(picture(3,Source+1100000,true),Local+1100000),"Fresh IDR after severe backlog refused");
+    auto ready=q.pop(Local+1100000);require(ready&&q.mark_output_ready(*ready,Local+1101000),"Fresh recovery failed");
+    require(!q.recovery_pending(),"Recovery deadline was not cleared by actual ready output");
+    q.reset();require(q.push(picture(0,Source,true),Local),"Worker baseline rejected");
+    require(!q.pop(Local+hive::ViewerQueue::MaxReferenceAgeUs+1),"Unbounded worker stall accepted");
+    require(q.recovering()&&q.feedback_queue_age(Local+1000002)==1000001,"Severe queued work lost capacity evidence");
+    require(q.feedback_queue_age(Local+1250001)==0,"Old overload evidence did not expire");
+    q.reset();require(q.push(picture(0,Source,true),Local),"Admission baseline rejected");
+    auto p=q.pop(Local);require(p&&q.admit(*p,Local+80000),"Decoder-credit wait reset valid chain");
+    require(q.feedback_queue_age(Local+81000)==80000,"Decoder-credit wait not reported");
+    require(!q.admit(*p,Local+1000001),"Unbounded decoder-credit wait accepted");
+    require(!q.admit(*p,Local+1300000)&&q.feedback_queue_age(Local+1300000)==0,"Invalidated reservation renewed stale pressure");
+}
+void source_timing_and_session_integrity(){
+    hive::ViewerQueue q;
+    require(q.push(completed_picture(0,Source,Source+4000,true),Local+4000),"Timed baseline rejected");q.pop(Local+4000);
+    require(q.push(completed_picture(1,Source+10000,Source+90000),Local+90000),"Intrinsic source work became network delay");
+    auto p=q.pop(Local+90000);require(p&&q.mark_output_ready(*p,Local+91000)&&q.transit_extra_us()==0,"Timed work failed");
+    require(!q.push(completed_picture(2,Source+100000,Source+99999),Local+100000),"Negative source work accepted");
+    require(!q.push(picture(3,Source+110000,true),Local+110000),"Missing provenance changed clock basis");
+    require(!q.push(completed_picture(4,Source,Source+4000,true),Local+120000),"Backward completion accepted");
+    require(!q.push(completed_picture(5,Source+130000,Source+130000+hive::MaxSourceWorkUs+1,true),Local+1130001),"Unbounded GPU work accepted");
+    require(q.push(completed_picture(6,Source+1200000,Source+1204000,true),Local+1204000),"Malformed timing poisoned later recovery");
+    p=q.pop(Local+1204000);require(p&&q.mark_output_ready(*p,Local+1205000),"Recovery timing failed");
+    require(!q.push(completed_picture(7,Source+1210000,Source+1214000,false,99),Local+1214000),"Wrong session accepted");
+    require(!q.push(completed_picture(6,Source+1210000,Source+1214000,true),Local+1214000),"Duplicate IDR accepted");
+}
+void slow_assembly_watchdog_and_clocks(){
+    auto wire=[](uint64_t seq,uint64_t source,uint64_t first,uint64_t last,bool key){
+        auto f=completed_picture(seq,source,source+1000,key);f.receive_started_us=first;f.receive_completed_us=last;return f;
     };
-    require(q.push(wire(0,Source,Local,Local+10000000,true),Local+10000000),"Initial large IDR assembly rejected");
-    auto first=q.pop(Local+10000000);require(first&&q.mark_output_ready(*first,Local+10001000),"Large IDR never became ready");
-    require(q.push(wire(1,Source+11000000,Local+11000000,Local+11600000,false),Local+11600000),"Fresh slow-serialized P picture mistaken for queued playback");
-    auto next=q.pop(Local+11600000);require(next&&q.mark_output_ready(*next,Local+11601000),"Slow P picture did not render");
-    require(!q.output_fresh(*next,Local+11650001),"Wire timing excused a slow local decoder/Present");
-    // Assembly does not forgive time waiting BEHIND a previous packet.
-    require(!q.push(wire(2,Source+11020000,Local+11600000,Local+12200000,false),Local+12200000),"Wire timing hid an already-old TCP tail");
-    q.network_progress(7,100,Local+12200000);
-    q.network_progress(99,200,Local+12500000);
-    require(q.recovery_expired(Local+13650001),"Another session renewed recovery");
-    q.network_progress(7,200,Local+13000000);
-    require(!q.recovery_expired(Local+14000000),"New video bytes did not renew recovery");
-    q.network_progress(7,200,Local+14500000);
-    require(q.recovery_expired(Local+15000000),"Repeated counter poll renewed recovery without bytes");
-    q.network_progress(7,50,Local+15500000);
-    require(q.recovery_expired(Local+15500000),"Counter reset invented receive progress");
-    q.network_progress(7,100,Local+41000000);
-    require(q.recovery_expired(Local+41650001),"Trickling peer bypassed finite recovery ceiling");
-    q.reset();auto invalid=wire(0,Source,Local+1,Local,true);
-    require(!q.push(invalid,Local),"Reversed receiver timing accepted");
-    q.reset();invalid=wire(0,Source,Local,Local+100,true);
-    require(!q.push(invalid,Local),"Future receive completion accepted");
-    q.reset();invalid=wire(0,Source,0,Local,true);
-    require(!q.push(invalid,Local),"Partial receive timing accepted");
+    hive::ViewerQueue q;
+    require(q.push(wire(0,Source,Local,Local+10000000,true),Local+10000000),"Large initial packet cannot complete");
+    auto first=q.pop(Local+10000000);require(first&&q.mark_output_ready(*first,Local+10001000),"Initial packet cannot become ready");
+    require(q.push(wire(1,Source+11000000,Local+11000000,Local+11600000,false),Local+11600000),"Slow P serialization invalidated chain");
+    auto p=q.pop(Local+11600000);require(p&&q.mark_output_ready(*p,Local+11601000),"Slow P not renderable");
+    require(!q.output_fresh(*p,Local+11650001),"Wire timing excused local display stall");
+    q.network_progress(7,100,Local+12200000);q.network_progress(99,200,Local+12500000);
+    require(q.recovery_expired(Local+13650001),"Wrong session renewed deadline");
+    q.network_progress(7,200,Local+13000000);require(!q.recovery_expired(Local+14000000),"Actual byte progress ignored");
+    q.network_progress(7,200,Local+14500000);require(q.recovery_expired(Local+15000000),"Repeated counter invented progress");
+    q.network_progress(7,100,Local+15500000);require(q.recovery_expired(Local+15500000),"Counter reset invented progress");
+    q.network_progress(7,300,Local+41000000);require(q.recovery_expired(Local+41650001),"Trickling bytes bypassed finite deadline");
+    q.reset();require(!q.push(wire(0,Source,Local+1,Local,true),Local),"Reversed receive timing accepted");
+    q.reset();require(!q.push(wire(0,Source,Local,Local+100,true),Local),"Future receive timing accepted");
+    q.reset();require(!q.push(wire(0,Source,0,Local,true),Local),"Partial receive timing accepted");
+    hive::ViewerTransitClock clock;
+    for(uint64_t i=0;i<360000;++i){clock.observe(Source+i*10000,Local+i*10001);require(clock.extra_age(Source+i*10000,Local+i*10001)<10000,"Clock drift accumulated as backlog");}
+    // Replay falls progressively behind; no receive timestamp can excuse it.
+    q.reset();bool rejected=false;
+    for(uint64_t i=0;i<300;++i){const auto at=Local+i*14000;
+        if(!q.push(picture(i,Source+i*10000,i%10==0),at)){rejected=true;continue;}
+        require(!rejected,"Old IDR silently rebased delayed replay");auto frame=q.pop(at);require(frame&&q.mark_output_ready(*frame,at),"Accepted replay fixture failed");}
+    require(rejected&&q.recovering(),"Unbounded slow replay accepted");
 }
 }
 int main(){try{
-    slow_packet_assembly_and_progress();
-    service_samples_expire();present_gap_samples();normal_and_idle();prepared_picture_survives_new_compressed_arrival();worker_and_decoder_stalls();
-    decoded_expiry_preserves_references();decoded_expiry_static_refresh_and_epochs();older_presenter_cannot_rearm_newer_ready_output();tcp_stall_and_burst();
-    epochs_and_reference_gaps();session_and_legacy();slow_replay_and_clock_drift();bounded_recovery_requires_new_session();
-    source_work_is_not_transport_backlog();timed_transport_and_reference_guards();malformed_or_unbounded_source_work();recent_compressed_backlog_feedback();
-    std::puts("PASS viewer freshness: bounded queue/age; source completion provenance separates intrinsic GPU work from TCP backlog; malformed/nonmonotonic timing and finite work bound; legacy policy preserved; decoded output expiry retains references and requests bounded static refresh; stalled worker and decode; stale TCP burst/IDRs; reference recovery; epoch/session isolation; slow replay; unrelated clocks and drift; two-second recovery session barrier.");
-    return 0;
-}catch(const std::exception& problem){std::printf("FAIL viewer freshness: %s\n",problem.what());return 1;}}
+service_samples_expire();present_gap_samples();normal_and_idle();decoded_expiry_static_refresh_and_epochs();older_presenter_cannot_rearm_newer_ready_output();epochs_and_reference_gaps();session_and_legacy();
+intact_references_and_latest_presentation();severe_backlog_and_queue_budget();source_timing_and_session_integrity();slow_assembly_watchdog_and_clocks();
+std::puts("PASS viewer: intact late references, latest local presentation deadline, bounded decode catch-up, severe backlog/overflow recovery, session/epoch isolation, source/wire provenance, watchdog progress and clock drift.");return 0;
+}catch(const std::exception& e){std::printf("FAIL viewer: %s\n",e.what());return 1;}}

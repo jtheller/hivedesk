@@ -147,6 +147,8 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                             rate_sample.receive_sample_age_us=bitrate_feedback?uint32_t(std::min<uint64_t>(UINT32_MAX,uint64_t(report.receive_sample_age_us)+feedback_age)):UINT32_MAX;
                             rate_sample.receiver_queue_us=report.queue_us;rate_sample.pacing_millihz=pacer.rate();
                             rate_sample.recovering=report.recover;
+                            rate_sample.transport_details=bitrate_feedback&&report.transport_details;
+                            rate_sample.transport_bytes=report.transport_bytes;rate_sample.transport_sample_us=report.transport_sample_us;
                             pacer.set_external_limit(rate_control.observe(now,rate_sample).rate_limit_millihz);
                         }
                         const auto service=fresh&&(!report.rate_details||uint64_t(report.service_sample_age_us)+feedback_age<=1000000)?report.service_us:0;

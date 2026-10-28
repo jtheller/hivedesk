@@ -122,7 +122,8 @@ public:
                 });
             }
             const auto peer=active_.load();if(!peer||closing_)return;
-            const auto report=viewer_.load()->feedback();if(report.session&&report.session==active_session_)transport_.send_feedback(*peer,report);
+            auto report=viewer_.load()->feedback();if(!report.session)report.session=active_session_;
+            if(report.session&&report.session==active_session_)transport_.send_feedback(*peer,report);
             if(shell_.debug_enabled()&&GetTickCount64()-last_debug_tick_>=250){
                 last_debug_tick_=GetTickCount64();const auto size=remote_size_.load();
                 const auto stats=viewer_.load()->diagnostics();const auto input=transport_.input_diagnostics(*peer);
@@ -378,7 +379,7 @@ private:
                     warm->requested=true;
                 }
                 if(warm->done&&!warm->failed&&warm->requested&&now-warm->last_feedback>=250){
-                    const auto feedback=warm->viewer->feedback();
+                    auto feedback=warm->viewer->feedback();if(!feedback.session)feedback.session=warm->settings.session;
                     if(feedback.session){transport_.send_feedback(surface->peer,feedback);warm->last_feedback=now;}
                 }
                 continue;

@@ -15,6 +15,7 @@
 #include "hivedesk/experience_trace.h"
 #include "hivedesk/network_key.h"
 #include "rate_wire.h"
+#include "frame_timer.h"
 #include "video_send_window.h"
 #include "video_send_budget.h"
 #include "video_write_progress.h"
@@ -50,7 +51,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -176,8 +177,8 @@ bool send_all(SOCKET s, const uint8_t* p, size_t n) {
     return true;
 }
 bool recv_all(SOCKET s, uint8_t* p, size_t n,std::atomic<uint64_t>* progress=nullptr,uint64_t* first_byte=nullptr) {
-    // Bound progress-observed reads. A large outstanding receive can absorb
-    // arriving TCP payload without returning application credit for seconds.
+    // Bound per-call accounting work. recv(flags=0) returns available bytes;
+    // a requested buffer size is not a promise to wait for that many bytes.
     while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, progress?size_t(16*1024):size_t(INT_MAX))), 0); if (received <= 0) return false; if(first_byte&&!*first_byte)*first_byte=transport_us(); p += received; n -= received; if(progress)progress->fetch_add(received,std::memory_order_relaxed); }
     return true;
 }
@@ -212,7 +213,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -231,6 +232,14 @@ bool signed_part(const Key& key, const Bytes& transcript, uint8_t label, Key& si
 
 struct Transport::Impl {
     struct Conn {
+        struct ProbeReceiver {
+            uint64_t id=0;Key key{};bool ready=false,done=false;uint16_t port=0;
+            PathProbeResult result;uint64_t first_us=0,last_us=0;
+            std::vector<bool> seen=std::vector<bool>(25000,false);
+            ~ProbeReceiver(){SecureZeroMemory(key.data(),key.size());}
+        };
+        std::mutex probe_mutex;std::shared_ptr<ProbeReceiver> probe_receiver;
+        std::thread probe_worker;std::atomic<bool> probe_finished=true;
         bool outbound=false;Impl* owner; std::atomic<SOCKET> socket{INVALID_SOCKET}; Peer peer; std::atomic<uint8_t> channel{0};
         std::atomic<bool> ready{false}, closed{false}, reader_done{false}, writer_done{true}; Cipher tx, rx; uint64_t tx_seq = 0, rx_seq = 0;
         Key confirmation{},pair_key{};uint64_t token=0,bound_control_token=0;
@@ -243,6 +252,7 @@ struct Transport::Impl {
         std::atomic<unsigned> video_inflight{0};
         std::atomic<uint64_t> video_owned_bytes{0};
         std::shared_ptr<std::atomic<uint64_t>> received_bytes=std::make_shared<std::atomic<uint64_t>>(0);
+        uint64_t feedback_session=0,feedback_connection=0,feedback_origin_bytes=0,feedback_origin_us=0,feedback_sequence=0;
         bool video_credit=true; // queue_mutex; published after WSASend ownership.
         uint64_t packet_started_us=0,packet_completed_us=0; // reader thread only
         VideoSendWindow video_send;
@@ -250,7 +260,7 @@ struct Transport::Impl {
         uint64_t input_receive_session=0,input_receive_sequence=0;
         bool input_enabled=false,input_ending=false;
         explicit Conn(Impl* p, SOCKET s) : owner(p), socket(s) {}
-        ~Conn() { close(); if (reader.joinable()) reader.join(); if (writer.joinable()) writer.join(); if(send_complete!=WSA_INVALID_EVENT)WSACloseEvent(send_complete); if(video_wake)CloseHandle(video_wake); SecureZeroMemory(pair_key.data(),pair_key.size()); }
+        ~Conn() { close(); if (reader.joinable()) reader.join(); if (writer.joinable()) writer.join(); if(probe_worker.joinable())probe_worker.join(); if(send_complete!=WSA_INVALID_EVENT)WSACloseEvent(send_complete); if(video_wake)CloseHandle(video_wake); SecureZeroMemory(pair_key.data(),pair_key.size()); }
         void close(bool abortive = false) {
             // Publish while holding the same mutex used by queue_cv.wait(). An
             // atomic flag alone cannot prevent a notify-before-wait lost wake.
@@ -759,14 +769,16 @@ struct Transport::Impl {
         if(control->peer.features&FeatureRichClipboard){std::string clipboard_error;auto lane=dial(address,port,3,clipboard_error);if(!lane||lane->peer.id!=control->peer.id){if(lane)lane->close();status("Clipboard channel unavailable; desktop remains usable.");}}
         id = control->peer.id; status("Connected: " + control->peer.name); return true;
     }
+#include "path_probe.inl"
     bool dispatch(Conn& c, const Bytes& b) {
         Reader r{b}; uint8_t type = r.byte();
         if((c.channel==3)!=(type==ClipboardData))return false;
         if(type==ClipboardData){if(b.size()<2||b.size()>ClipboardChunk+64)return false;if(callbacks.clipboard_packet)callbacks.clipboard_packet(c.peer.id,Bytes(b.begin()+1,b.end()));return true;}
         if(type==RichClipboard){ClipboardOffer offer;if(c.channel!=0||!(c.peer.features&FeatureRichClipboard)||!decode_clipboard_offer(Bytes(b.begin()+1,b.end()),offer))return false;if(callbacks.clipboard_offer)callbacks.clipboard_offer(c.peer.id,offer);else if(callbacks.clipboard)callbacks.clipboard(c.peer.id,offer.text);return true;}
-        if ((c.channel == 1) != (type == Frame||type==AutoFrame||type==AutoFrameTimed||type==FrameCursor)) return false;
+        if ((c.channel == 1) != (type == Frame||type==AutoFrame||type==AutoFrameTimed||type==FrameCursor||type==ProbePayload)) return false;
         const bool input_message=type==InputReady||type==InputData||type==InputComplete||type==InputRevoke;
         if((c.channel==2)!=input_message)return false;
+        if(type==ProbeStart||type==ProbeReady||type==ProbeDone||type==ProbePayload)return dispatch_probe(c,type,r);
         switch (type) {
         case InputEnable: {
             const auto session=r.qword();if(!(c.peer.features&FeatureDedicatedInput)||!session||!r.end())return false;
@@ -837,7 +849,7 @@ struct Transport::Impl {
         case Feedback: {
             StreamFeedback f;f.session=r.qword();f.capture_time_us=r.qword();f.arrival_age_us=r.dword();f.service_us=r.dword();f.queue_us=r.dword();const auto recover=r.byte();f.recover=recover!=0;
             if(!r.end()&&(!(c.peer.features&FeatureAutoRate)||!rate_wire::read_feedback(f,[&]{return r.dword();},[&]{return r.qword();})))return false;
-            if(!(c.peer.features&FeatureAutomaticStream)||!valid_feedback(f)||recover>1||!r.end())return false;
+            if(!(c.peer.features&FeatureAutomaticStream)||!valid_feedback(f)||recover>1||!r.end()||(f.transport_details&&!(c.peer.features&FeatureByteFeedback)))return false;
             if(callbacks.feedback)callbacks.feedback(c.peer.id,f);return true;
         }
         case Health: {
@@ -1091,8 +1103,69 @@ std::string Transport::tcp_diagnostics(const std::string& peer)const{
 uint64_t Transport::received_video_bytes(const std::string& peer)const{
     const auto c=impl_->find(peer,true);return c?c->received_bytes->load(std::memory_order_relaxed):0;
 }
-bool Transport::send_feedback(const std::string& peer,const StreamFeedback& f) {
-    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||!valid_feedback(f))return false;
+
+bool Transport::measure_path(const std::string& peer,bool udp,uint32_t bitrate,uint32_t duration,PathProbeResult& result,std::string& error){
+    result={};auto c=impl_->find(peer);
+    if(!c||!(c->peer.features&FeaturePathProbe)){error="Peer does not support generated path measurements.";return false;}
+    if(bitrate<100000||bitrate>20000000||duration<1000||duration>10000){error="Probe bounds: 0.1-20 Mbps, 1-10 seconds.";return false;}
+    auto receiver=std::make_shared<Impl::Conn::ProbeReceiver>();
+    if(!random_bytes(reinterpret_cast<uint8_t*>(&receiver->id),sizeof(receiver->id))||!receiver->id||!random_bytes(receiver->key.data(),receiver->key.size())){error="Probe nonce generation failed.";return false;}
+    struct SocketOwner{SOCKET s=INVALID_SOCKET;~SocketOwner(){if(s!=INVALID_SOCKET)closesocket(s);}} socket;
+    uint16_t port=0;sockaddr_in remote{};remote.sin_family=AF_INET;
+    if(inet_pton(AF_INET,c->peer.address.c_str(),&remote.sin_addr)!=1){error="Probe requires the authenticated IPv4 peer address.";return false;}
+    if(udp){
+        socket.s=::socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);sockaddr_in local{};local.sin_family=AF_INET;
+        int length=sizeof(local);DWORD timeout=30;int buffer=1024*1024;
+        if(socket.s==INVALID_SOCKET||bind(socket.s,reinterpret_cast<sockaddr*>(&local),sizeof(local))||getsockname(socket.s,reinterpret_cast<sockaddr*>(&local),&length)){error="Cannot bind UDP probe receiver.";return false;}
+        setsockopt(socket.s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<char*>(&timeout),sizeof(timeout));
+        setsockopt(socket.s,SOL_SOCKET,SO_RCVBUF,reinterpret_cast<char*>(&buffer),sizeof(buffer));port=ntohs(local.sin_port);
+    }
+    {std::lock_guard lock(c->probe_mutex);if(c->probe_receiver){error="A path measurement is already running.";return false;}c->probe_receiver=receiver;}
+    struct Clear{std::shared_ptr<Impl::Conn> c;~Clear(){std::lock_guard lock(c->probe_mutex);c->probe_receiver.reset();}} clear{c};
+    Bytes request{ProbeStart};u64(request,receiver->id);request.push_back(udp?1:0);u16(request,port);u32(request,bitrate);u32(request,duration);request.insert(request.end(),receiver->key.begin(),receiver->key.end());
+    if(!c->enqueue(std::move(request))){error="Cannot queue path measurement.";return false;}
+    const auto deadline=Clock::now()+std::chrono::milliseconds(duration+10000);
+    bool punched=false;uint64_t done_at=0;Bytes packet(1600);
+    while(impl_->running&&!c->closed&&Clock::now()<deadline){
+        bool ready=false,done=false;uint64_t sent=0,count=0;
+        {std::lock_guard lock(c->probe_mutex);ready=receiver->ready;done=receiver->done;remote.sin_port=htons(receiver->port);sent=receiver->result.sent_packets;count=receiver->result.received_packets;}
+        if(done&&!done_at)done_at=transport_us();
+        if(done&&(count>=sent||transport_us()-done_at>=2000000))break;
+        if(udp&&ready&&!punched){
+            // Only the authenticated peer's address is used. Reciprocal UDP
+            // traffic establishes ordinary stateful firewall/NAT permission.
+            for(int i=0;i<3;++i)sendto(socket.s,reinterpret_cast<const char*>(receiver->key.data()),int(receiver->key.size()),0,reinterpret_cast<sockaddr*>(&remote),sizeof(remote));punched=true;
+        }
+        if(udp&&ready){
+            sockaddr_in from{};int size=sizeof(from);const int n=recvfrom(socket.s,reinterpret_cast<char*>(packet.data()),int(packet.size()),0,reinterpret_cast<sockaddr*>(&from),&size);
+            if(n!=1244||from.sin_addr.s_addr!=remote.sin_addr.s_addr||from.sin_port!=remote.sin_port)continue;
+            Bytes body(packet.begin(),packet.begin()+n-32);Key tag{},expected{};std::copy_n(packet.begin()+n-32,32,tag.begin());
+            if(!hmac(receiver->key,body,expected)||!equal_key(tag,expected))continue;
+            Reader read{body};if(read.qword()!=receiver->id)continue;const auto sequence=read.dword();
+            std::lock_guard lock(c->probe_mutex);Impl::record_probe(*receiver,sequence,1200);
+        }else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    {std::lock_guard lock(c->probe_mutex);result=receiver->result;
+        result.receive_span_us=receiver->last_us>=receiver->first_us?receiver->last_us-receiver->first_us:0;
+        if(!receiver->ready||!receiver->done){error="Path measurement did not finish within its deadline.";return false;}}
+    return true;
+}
+bool Transport::send_feedback(const std::string& peer,const StreamFeedback& input) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||!valid_feedback(input))return false;
+    auto f=input;f.transport_details=false;
+    if((c->peer.features&FeatureByteFeedback)&&(c->peer.features&FeatureAutoRate)){
+        if(auto video=impl_->find(peer,true)){
+            const auto now=transport_us(),bytes=video->received_bytes->load(std::memory_order_relaxed);
+            std::lock_guard lock(c->queue_mutex);
+            if(c->feedback_session!=f.session||c->feedback_connection!=video->token||bytes<c->feedback_origin_bytes){
+                c->feedback_session=f.session;c->feedback_connection=video->token;
+                c->feedback_origin_bytes=bytes;c->feedback_origin_us=now;c->feedback_sequence=0;
+            }
+            f.rate_details=f.transport_details=true;
+            f.feedback_sequence=++c->feedback_sequence;
+            f.transport_bytes=bytes-c->feedback_origin_bytes;f.transport_sample_us=now-c->feedback_origin_us;
+        }
+    }
     Bytes b{Feedback};u64(b,f.session);u64(b,f.capture_time_us);u32(b,f.arrival_age_us);u32(b,f.service_us);u32(b,f.queue_us);b.push_back(f.recover?1:0);
     if(f.rate_details&&(c->peer.features&FeatureAutoRate))rate_wire::write_feedback(f,[&](uint32_t n){u32(b,n);},[&](uint64_t n){u64(b,n);});
     return c->enqueue(std::move(b));
@@ -1660,6 +1733,31 @@ bool Transport::self_test(std::string& result) {
         if(measured.submitted_packets!=3||measured.completed_packets!=2||measured.completed_bytes!=200||measured.failed_packets!=1||measured.queue_expired!=2||measured.send_max_us!=150000){
             result="Failed/expired video send accounting hid a stall or counted delivered bytes";return false;
         }
+    }
+    {
+        Transport sender;auto& owner=*sender.impl_;
+        auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        auto video=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        control->ready=video->ready=true;control->peer.id="byte-peer";
+        control->peer.features=FeatureAutomaticStream|FeatureAutoRate|FeatureByteFeedback;
+        video->token=21;video->received_bytes->store(9000);
+        owner.connected["byte-peer"]={control,video};StreamFeedback received;
+        owner.callbacks.feedback=[&](const std::string&,const StreamFeedback& f){received=f;};
+        StreamFeedback report;report.session=700;
+        if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||
+           !received.transport_details||received.transport_bytes||received.received_frames){result="Pre-frame byte feedback baseline failed";return false;}
+        video->received_bytes->fetch_add(120000);
+        if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||
+           received.transport_bytes!=120000||received.feedback_sequence!=2||received.received_frames){result="Incomplete packet progress requires a complete picture";return false;}
+        const auto extended=control->control.back();auto short_packet=extended;short_packet.pop_back();
+        if(owner.dispatch(*control,short_packet)){result="Truncated byte feedback accepted";return false;}
+        control->peer.features&=~FeatureByteFeedback;
+        if(owner.dispatch(*control,extended)||!sender.send_feedback("byte-peer",report)||
+           control->control.back().size()!=30||!owner.dispatch(*control,control->control.back())||received.transport_details){result="Byte feedback capability fallback failed";return false;}
+        control->peer.features|=FeatureByteFeedback;report.session=701;
+        if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||received.transport_bytes){result="New viewing session inherited old bytes";return false;}
+        video->token=22;video->received_bytes->store(77);
+        if(!sender.send_feedback("byte-peer",report)||!owner.dispatch(*control,control->control.back())||received.transport_bytes||received.feedback_sequence!=1){result="Reconnected video inherited old progress";return false;}
     }
     {
         Transport sender;auto& owner=*sender.impl_;

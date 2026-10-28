@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
-project(HiveDesk VERSION 0.7.10 LANGUAGES CXX)
-set(HIVEDESK_VERSION "0.7.10")
+project(HiveDesk VERSION 0.7.11 LANGUAGES CXX)
+set(HIVEDESK_VERSION "0.7.11")
 add_compile_definitions(HIVEDESK_VERSION="${HIVEDESK_VERSION}")
 enable_language(RC)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -232,3 +232,13 @@ add_test(NAME taskbar_peek COMMAND HiveDeskTaskbarPeekCheck)
 set_tests_properties(taskbar_peek PROPERTIES TIMEOUT 25)
 add_executable(HiveDeskTaskbarPresentationCheck tests/taskbar_presentation.cpp)
 target_link_libraries(HiveDeskTaskbarPresentationCheck PRIVATE user32 gdi32 dwmapi)
+
+# Manual, bounded real-peer video measurement; never injects desktop input.
+add_executable(HiveDeskRemoteVideoCheck tests/remote_video.cpp)
+target_link_libraries(HiveDeskRemoteVideoCheck PRIVATE hive_core)
+
+add_executable(HiveDeskPathCheck tests/path_probe.cpp)
+target_link_libraries(HiveDeskPathCheck PRIVATE hive_core)
+add_test(NAME path_probe COMMAND HiveDeskPathCheck --self-test)
+set_tests_properties(path_probe PROPERTIES TIMEOUT 30)
+install(TARGETS HiveDeskPathCheck HiveDeskRemoteVideoCheck RUNTIME DESTINATION .)

@@ -1336,6 +1336,8 @@ void MediaViewer::submit(EncodedFrame frame) {
     impl_->diagnostics.session=frame.session;++impl_->received_count;++impl_->live_totals[0];impl_->live_totals[3]+=frame.data.size();impl_->received_bytes+=frame.data.size();
     ++impl_->feedback.received_frames;impl_->feedback.received_bytes+=frame.data.size();
     impl_->network_progress=frame.receive_progress;
+    impl_->diagnostics.wire_assembly_us=frame.receive_started_us&&frame.receive_completed_us>=frame.receive_started_us?
+        uint32_t(std::min<uint64_t>(UINT32_MAX,frame.receive_completed_us-frame.receive_started_us)):0;
     const bool queued=impl_->frames.push(std::move(frame),now);impl_->sync_queue();
     if(queued||impl_->frames.recovery_pending())impl_->changed.notify_one();
 }

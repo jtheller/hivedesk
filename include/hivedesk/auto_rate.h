@@ -35,7 +35,8 @@ struct AutoRateSample {
     // Actual current pacing, including a hardware limit. This avoids raising
     // the bitrate for hypothetical frames the encoder cannot currently make.
     uint32_t pacing_millihz=0;
-    bool recovering=false;
+    bool recovering=false,transport_details=false;
+    uint64_t transport_bytes=0,transport_sample_us=0;
 };
 struct AutoRateDecision {
     uint32_t bitrate_bps=0,rate_limit_millihz=0;
@@ -81,6 +82,11 @@ public:
         const uint64_t received=delta(sample.received_frames,previous_.received_frames);
         const uint64_t received_bytes=delta(sample.received_bytes,previous_.received_bytes);
         const uint64_t wait=std::min(elapsed,delta(sample.send_wait_us,previous_.send_wait_us));
+        const auto wire_bytes=delta(sample.transport_bytes,previous_.transport_bytes);
+        const auto wire_elapsed=delta(sample.transport_sample_us,previous_.transport_sample_us);
+        const bool wire_fresh=sample.transport_details&&previous_.transport_details&&
+            sample.receiver_report_id&&sample.receiver_report_id!=previous_.receiver_report_id&&
+            sample.transport_bytes>=previous_.transport_bytes&&wire_elapsed>=500000&&wire_elapsed<=3000000;
         const bool fresh=sample.receiver_report_id&&sample.receiver_report_id!=previous_.receiver_report_id&&sample.receive_sample_age_us<=WindowUs;
         previous_=sample;last_window_=now;
         const uint32_t pacing=std::clamp(sample.pacing_millihz?sample.pacing_millihz:target_,1000u,target_);
@@ -102,19 +108,23 @@ public:
         // Receiver decode queues and IDR recovery are not bandwidth evidence.
         // Require two active windows of actual local send-credit blocking and
         // advancing receiver delivery before learning a network budget.
-        const bool network_pressure=fresh&&active&&received>=minimum_progress&&received_bytes&&wait>elapsed*15/100&&
-            sample.receiver_queue_us<20000&&!sample.recovering;
+        // Transport progress is independent of complete pictures and decoder
+        // recovery. Require sustained producer pressure plus actual bytes;
+        // silence, stale reports and decode overload are never capacity evidence.
+        const bool wire_pressure=wire_fresh&&wire_bytes>=32768&&wait>elapsed*15/100&&sample.receiver_queue_us<20000;
+        const bool network_pressure=wire_pressure||(!sample.transport_details&&fresh&&active&&received>=minimum_progress&&received_bytes&&wait>elapsed*15/100&&
+            sample.receiver_queue_us<20000&&!sample.recovering);
         if(network_pressure)++pressure_windows_;else pressure_windows_=0;
         if(network_pressure)last_pressure_=now;
         if(pressure_windows_>=2){
-            const double goodput=double(received_bytes)*8000000.0/double(elapsed);
+            const double goodput=wire_pressure?double(wire_bytes)*8000000.0/double(wire_elapsed):double(received_bytes)*8000000.0/double(elapsed);
             const auto budget=uint32_t(std::clamp(goodput*0.90,double(AutoRateMinBitrate),double(AutoRateMaxBitrate)));
             // Bound each decrease. Receiver bytes are windowed feedback and
             // may be bursty even when the sender itself is well paced.
             const auto bounded_drop=uint32_t(uint64_t(decision_.bitrate_bps)*75/100);
             network_budget_=std::min(network_budget_,std::max(budget,bounded_drop));
             decision_.bitrate_bps=std::min(decision_.bitrate_bps,network_budget_);
-            decision_.rate_limit_millihz=std::min(decision_.rate_limit_millihz,quality_ceiling());
+            if(have_quality_)decision_.rate_limit_millihz=std::min(decision_.rate_limit_millihz,quality_ceiling());
             decision_.reason=decision_.rate_limit_millihz<target_?AutoRateReason::QualityFloor:AutoRateReason::Network;
             last_probe_=now;
             return decision_;

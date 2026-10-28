@@ -89,7 +89,7 @@ struct Telemetry::Impl {
                 <<",\"recovering\":"<<(v.recovering?"true":"false")<<",\"service_sample_age_ms\":";
             if(v.service_sample_age_us==UINT32_MAX)out<<"null";else out<<v.service_sample_age_us/1000.0;
             out<<",\"receive_sample_age_ms\":";if(v.receive_sample_age_us==UINT32_MAX)out<<"null";else out<<v.receive_sample_age_us/1000.0;
-            out<<",\"transit_excess_ms\":"<<v.transit_extra_us/1000.0<<",\"sequence_gaps\":"<<v.sequence_gaps
+            out<<",\"transit_excess_ms\":"<<v.transit_extra_us/1000.0<<",\"wire_assembly_ms\":"<<v.wire_assembly_us/1000.0<<",\"sequence_gaps\":"<<v.sequence_gaps
                <<",\"age_expired\":"<<v.age_expired<<",\"queue_overflows\":"<<v.queue_overflows
                <<",\"nvdec_map_ms\":"<<v.nvdec_map_us/1000.0<<",\"convert_ms\":"<<v.convert_us/1000.0<<",\"draw_ms\":"<<v.draw_us/1000.0
                <<",\"present_gap_p95_ms\":"<<v.present_gap_p95_us/1000.0<<",\"present_gap_max_ms\":"<<v.present_gap_max_us/1000.0<<",\"repeated_presentations\":"<<v.repeated_presentations<<'}';
