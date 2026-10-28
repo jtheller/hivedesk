@@ -643,11 +643,15 @@ struct Shell::Impl {
         else{show_panel(2,true);panel_summoned=panel_mode!=0;}
         publish_input();
     }
-    int card_at(POINT p) const {
+    int click_card_at(POINT p) const {
         // The compact hot-corner preview owns the top/left screen edges too.
-        // Its visual inset must not force a diagonal move before quick swap.
+        // This extension is click-only: Peek requires the actual inset card.
         if(panel_mode==1)return p.x>=0&&p.x<panel_width-px(12)&&p.y>=0&&p.y<px(12)+tile_height()?preview_index():-1;
+        return card_at(p);
+    }
+    int card_at(POINT p) const {
         if(p.x<px(12)||p.x>=panel_width-px(12)||p.y<px(12))return -1;
+        if(panel_mode==1)return p.y<px(12)+tile_height()?preview_index():-1;
         const int row=(p.y-px(12))/tile_stride();
         if(row>=visible_tiles()||(p.y-px(12))%tile_stride()>=tile_height())return -1;
         const int index=row+scroll;return index<=static_cast<int>(peers.size())?index:-1;
@@ -940,7 +944,7 @@ struct Shell::Impl {
             case WM_ERASEBKGND:return 1;
             case WM_PAINT:s->paint_panel();return 0;
             case WM_LBUTTONDOWN:{
-                POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};s->cancel_drag();s->pressed_card=s->card_at(p);s->drag_origin=p;
+                POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};s->cancel_drag();s->pressed_card=s->click_card_at(p);s->drag_origin=p;
                 if(s->pressed_card>0)s->dragged_peer=s->peers[s->pressed_card-1].id;
                 if(s->pressed_card>=0){
                     const int top=s->px(12)+(s->panel_mode==1?0:s->pressed_card-s->scroll)*s->tile_stride();
@@ -963,7 +967,7 @@ struct Shell::Impl {
             }
             case WM_LBUTTONUP:{
                 POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};const bool dragged=s->dragging;const auto id=s->dragged_peer;const int slot=std::clamp(int((p.y-s->px(12)+s->tile_stride()/2)/s->tile_stride())+s->scroll-1,0,int(s->peers.size()));
-                const int pressed=s->pressed_card,index=s->card_at(p);
+                const int pressed=s->pressed_card,index=s->click_card_at(p);
                 const bool opening=(dragged&&p.x>=s->panel_width)||(!dragged&&pressed>0&&pressed==index&&index<=int(s->peers.size())&&s->peers[index-1].id==id);
                 if(opening&&s->drag_focus&&s->drag_focus!=s->viewer)s->prior_focus=s->drag_focus;
                 s->cancel_drag(!opening,false);

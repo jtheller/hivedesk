@@ -8,7 +8,9 @@ void Shell::quick_swap_interaction_self_test() {
     require(s.peers.size()>=2,"Corner fixture needs two computers");
     const auto first=s.peers[0].id,second=s.peers[1].id;
     const auto saved_callbacks=s.callbacks;const auto saved_dpi=s.dpi;
-    struct Restore {Impl& s;ShellCallbacks callbacks;int dpi;~Restore(){s.callbacks=std::move(callbacks);s.dpi=dpi;}} restore{s,saved_callbacks,saved_dpi};
+    const auto saved_peers=s.peers;
+    struct Restore {Impl& s;ShellCallbacks callbacks;int dpi;std::vector<Peer> peers;~Restore(){s.callbacks=std::move(callbacks);s.dpi=dpi;s.peers=std::move(peers);}} restore{s,saved_callbacks,saved_dpi,saved_peers};
+    s.peers[0].features|=FeatureLivePeek;
     unsigned selections=0,returns=0;std::string selected;
     s.callbacks.select_peer=[&](const std::string& id){++selections;selected=id;};
     s.callbacks.return_local=[&]{++returns;};
@@ -17,8 +19,25 @@ void Shell::quick_swap_interaction_self_test() {
         s.local(false);s.previous_id.clear();s.dpi=dpi;
         const auto before=selections,local_before=returns;
         s.update_panel_pointer({0,0},GetTickCount64());
-        require(s.panel_mode==1&&s.card_at({0,0})==1,"Exact screen corner does not target the compact preview");
-        require(s.card_at({-1,0})==-1&&s.card_at({0,-1})==-1,"Corner hit target escaped primary-screen bounds");
+        require(s.panel_mode==1&&s.click_card_at({0,0})==1,"Exact screen corner does not target the compact preview");
+        require(s.click_card_at({-1,0})==-1&&s.click_card_at({0,-1})==-1,"Corner hit target escaped primary-screen bounds");
+        s.update_panel_pointer({0,0},GetTickCount64()+1000);
+        SendMessageW(s.panel,WM_MOUSEMOVE,0,0);
+        require(s.peek_id.empty(),"Stationary hot corner triggered Peek");
+        for(const POINT inset: {POINT{s.px(11),s.px(12)},POINT{s.px(12),s.px(11)}}){
+            s.update_panel_pointer(inset,GetTickCount64());
+            SendMessageW(s.panel,WM_MOUSEMOVE,0,MAKELPARAM(inset.x,inset.y));
+            require(s.peek_id.empty(),"Card padding triggered Peek");
+        }
+        const POINT card{s.px(13),s.px(13)};
+        s.update_panel_pointer(card,GetTickCount64());
+        require(s.peek_id==first,"Timer hover inside the actual card did not enable Peek");
+        SendMessageW(s.panel,WM_MOUSEMOVE,0,0);
+        require(s.peek_id.empty(),"Moving back to the corner retained Peek");
+        SendMessageW(s.panel,WM_MOUSEMOVE,0,MAKELPARAM(card.x,card.y));
+        require(s.peek_id==first,"Mouse hover inside the actual card did not enable Peek");
+        s.update_panel_pointer({0,0},GetTickCount64());
+        require(s.peek_id.empty(),"Corner timer retained the card's previous Peek");
         click(0,0); // No pointer move into the inset card, no animation wait.
         require(selections==before+1&&selected==first,"Corner click did not select the previewed computer exactly once");
         s.show_remote_ui(first,L"Corner first",1);
