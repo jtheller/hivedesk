@@ -66,3 +66,26 @@ wrapper observed datagrams arriving from its primary address. Targeting that
 primary address instead delivered 417/417 packets at 2 Mbps. This isolated the
 wildcard source-address selection corrected in 0.8.2; no endpoint validation was
 relaxed. Different-address loopback tests validate explicit local binding.
+
+### Final 0.8.2 deployment confirmation
+
+DEVG, DEVR and VI subsequently installed 0.8.2 through the idle-update path.
+DEVG's nine native executable hashes matched the release build. With both ends
+on 0.8.2, a bounded DEVR preview received 593 frames in 20 seconds over
+authenticated UDP. VI's previously failing secondary address delivered 417/417
+generated packets at 2.000 Mbps; its real read-only video check also negotiated
+UDP and displayed the desktop (93 received frames over 10 seconds of uncontrolled
+desktop activity). No endpoint authentication checks were relaxed.
+
+An additional 90-second run with the installed 0.8.2 client and the then-0.8.1
+DEVR source received 2354 frames, with a 125 ms largest observed change gap and
+47 ms p95. It reported no sequence gaps, queue overflows, age expirations,
+source discards, media errors or TCP fallback. Connection establishment took
+2250 ms; the first observed picture arrived 1250 ms after the stream request.
+These are live observations with the same measurement limitations above.
+
+Final validation passed all 43 native tests, managed checks and WinUI light/dark
+checks. The strengthened address-specific datagram, transport and path-probe
+tests also passed, and a delayed-feedback HEVC444 hardware loopback delivered
+535/535 encoded frames. Sustained full-refresh motion and end-to-end USB-like
+input latency still require their own controlled acceptance measurements.
