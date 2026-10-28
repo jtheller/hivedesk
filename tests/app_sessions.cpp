@@ -37,8 +37,15 @@ int probe(){
             SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&,index]{const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),px(12)+index*(tile+px(16))+tile/2));})));
             Sleep(700);
         }
-        SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&]{SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(0,0));})));
-        Sleep(300);PostMessageW(owner,WM_HOTKEY,81,0);Sleep(250);
+        // Promote while Hive still owns the hovered warm lease. Closing Hive,
+        // waiting and reopening before this assertion can legitimately expire
+        // every warm lease and exercise only cold starts in the rapid loop.
+        SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&]{
+            const auto px=[&](int x){return MulDiv(x,int(GetDpiForWindow(panel)),96);};const int tile=(px(200)-2*px(12))*9/16;
+            const auto point=MAKELPARAM(px(100),px(12)+2*(tile+px(16))+tile/2);
+            SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,point);SendMessageW(panel,WM_LBUTTONUP,0,point);
+        })));
+        for(unsigned attempt=0;attempt<200&&!promotions&&!stop;++attempt)Sleep(10);
         for(unsigned n=0;n<24&&!stop;++n){
             PostMessageW(owner,WM_HOTKEY,81,0);Sleep(n%6==0?1500:350);
             auto hover=new std::function<void()>([&,n]{
