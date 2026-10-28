@@ -216,6 +216,57 @@ struct InputCapture::Impl {
     }
 };
 thread_local InputCapture::Impl* InputCapture::Impl::hooks=nullptr;
+bool InputCapture::routing_self_test(std::string& result){
+    try{
+        const auto require=[](bool ok,const char* why){if(!ok)throw std::runtime_error(why);};
+        USEROBJECTFLAGS flags{};DWORD bytes=0;
+        require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),
+            "Input routing test requires a noninteractive window station");
+        InputCapture capture;auto& s=*capture.impl_;
+        s.owner=CreateWindowExW(0,L"STATIC",L"Routing fixture",0,0,0,0,0,HWND_MESSAGE,nullptr,GetModuleHandleW(nullptr),nullptr);
+        require(s.owner!=nullptr,"Create routing message sink");s.action_message=WM_APP+81;
+        struct Cleanup{HWND window;Impl* prior;~Cleanup(){Impl::hooks=prior;DestroyWindow(window);}} cleanup{s.owner,Impl::hooks};
+        Impl::hooks=&s; // Direct callbacks only; no SetWindowsHookEx or SendInput.
+        InputCaptureState state;state.generation=42;state.session=17;state.peer="fixture";state.remote=true;state.local_shell=true;
+        state.panel_visible=state.panel_summoned=true;state.panel=s.owner;state.panel_rect={0,0,200,600};state.screen_width=1920;state.screen_height=1080;
+        const auto set=[&]{capture.update(state);s.queue.clear();};set();
+        const auto action=[&](CaptureAction expected){MSG m{};require(PeekMessageW(&m,s.owner,s.action_message,s.action_message,PM_REMOVE)&&
+            m.wParam==WPARAM(expected)&&uint64_t(m.lParam)==state.generation,"Hook posted the wrong UI action or generation");};
+        const auto quiet=[&]{MSG m{};require(!PeekMessageW(&m,s.owner,s.action_message,s.action_message,PM_REMOVE),"Unexpected UI action");};
+        const auto mouse=[&](WPARAM message,POINT point,DWORD injected=0){MSLLHOOKSTRUCT m{};m.pt=point;m.flags=injected;return Impl::mouse_proc(HC_ACTION,message,reinterpret_cast<LPARAM>(&m));};
+        const auto key=[&](DWORD vk,DWORD scan,bool up=false,DWORD injected=0){KBDLLHOOKSTRUCT k{};k.vkCode=vk;k.scanCode=scan;k.flags=(up?LLKHF_UP:0)|injected;return Impl::keyboard_proc(HC_ACTION,up?WM_KEYUP:WM_KEYDOWN,reinterpret_cast<LPARAM>(&k));};
+        for(auto button:{WM_LBUTTONDOWN,WM_RBUTTONDOWN}){
+            require(mouse(button,{400,400})==0,"Taskbar click was consumed");action(CaptureAction::HidePanelAnimated);
+            require(s.queue.size()==0,"Taskbar click leaked to remote input");
+        }
+        mouse(WM_LBUTTONDOWN,{100,100});quiet();
+        state.panel_dragging=true;set();mouse(WM_LBUTTONDOWN,{400,400});quiet();state.panel_dragging=false;set();
+        require(key(VK_ESCAPE,1)==0,"Local Escape was swallowed before Explorer");action(CaptureAction::HidePanelAnimated);
+        require(key(VK_ESCAPE,1,true)==0,"Local Escape key-up was swallowed");quiet();
+        mouse(WM_LBUTTONDOWN,{400,400},LLMHF_INJECTED);key(VK_ESCAPE,1,false,LLKHF_INJECTED);quiet();
+        require(s.queue.size()==0,"Injected input was echoed to a remote");
+        state.local_shell=false;set();
+        require(key(VK_ESCAPE,1)==1,"Remote Hive Escape was not intercepted");action(CaptureAction::HidePanel);
+        require(key(VK_ESCAPE,1,true)==1&&s.queue.size()==0,"Hive Escape key-up leaked to remote");quiet();
+        state.panel_visible=state.panel_summoned=false;set();
+        require(key('A',0x1e)==1&&key('A',0x1e,true)==1,"Remote key edges were not intercepted");
+        const auto down=s.queue.pop(),up=s.queue.pop();
+        require(down&&up&&down->event.kind==InputKind::Key&&up->event.kind==InputKind::Key&&down->event.a==0x1e&&
+            down->event.b==0&&up->event.b==1&&down->generation==up->generation,"Remote key down/up ordering changed");
+        state.relative=true;set();
+        require(mouse(WM_LBUTTONDOWN,{400,400})==1&&mouse(WM_LBUTTONUP,{400,400})==1,"Remote button edges were not intercepted");
+        const auto press=s.queue.pop(),release=s.queue.pop();
+        require(press&&release&&press->event.kind==InputKind::Button&&release->event.kind==InputKind::Button&&
+            press->event.b==0&&release->event.b==1,"Remote mouse button edges changed");
+        key(VK_CONTROL,0x1d);key(VK_MENU,0x38);key(VK_SHIFT,0x2a);
+        require(key(VK_OEM_3,0x29)==1,"Kick chord was not intercepted");action(CaptureAction::KickController);
+        key(VK_OEM_3,0x29,true);key(VK_SHIFT,0x2a,true);
+        require(key(VK_OEM_3,0x29)==1,"Escape chord was not intercepted");action(CaptureAction::ReturnLocal);
+        require(!s.snapshot().enabled&&s.queue.size()==1&&s.queue.pop()->event.kind==InputKind::ReleaseAll,"Escape failed to revoke and release remote input immediately");
+        key(VK_OEM_3,0x29,true);key(VK_MENU,0x38,true);key(VK_CONTROL,0x1d,true);quiet();
+        result="actual hook callbacks: taskbar local pass-through, outside dismissal, drag exclusion, Escape down/up, injected-event exclusion, remote key/button edges, kick and emergency release";return true;
+    }catch(const std::exception& e){result=e.what();return false;}
+}
 InputCapture::InputCapture():impl_(std::make_unique<Impl>()){}
 InputCapture::~InputCapture(){stop();}
 bool InputCapture::start(HINSTANCE instance,HWND owner,UINT message,Send send,std::string& error){

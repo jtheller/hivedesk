@@ -2,6 +2,7 @@
 #include "../src/main.cpp"
 #include <cstdio>
 #include <future>
+#include <utility>
 namespace hive {EncodedFrame media_generated_test_frame();}
 void require(bool v,const char* m){if(!v)throw std::runtime_error(m);}
 int probe(){
@@ -9,10 +10,11 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic events on interactive station");
     const auto profile=std::filesystem::temp_directory_path()/(L"HiveDesk-AppSessions-"+std::to_wstring(GetCurrentProcessId()));std::filesystem::create_directories(profile);SetEnvironmentVariableW(L"LOCALAPPDATA",profile.c_str());
     auto encoded=hive::media_generated_test_frame();
-    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;};
-    std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0;
+    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;};
+    std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0;std::atomic<bool> bad_handoff=false;
     for(unsigned i=0;i<3;++i){auto& p=peers[i];hive::TransportCallbacks cb;
-        cb.start_stream=[&p,&starts,&promotions,&warms](const std::string& id,const hive::StreamSettings& s){std::lock_guard lock(p.mutex);if(s.warm)++warms;else{++starts;if(p.warm&&p.session==s.session)++promotions;}p.client=id;if(p.session!=s.session)p.sequence=0;p.session=s.session;p.warm=s.warm;p.remaining=s.warm?1:10000;};
+        cb.clipboard=[&p](const std::string&,const std::wstring&){std::lock_guard lock(p.mutex);p.handoff=true;};
+        cb.start_stream=[&p,&starts,&promotions,&warms,&bad_handoff](const std::string& id,const hive::StreamSettings& s){std::lock_guard lock(p.mutex);if(s.warm)++warms;else{++starts;if(!std::exchange(p.handoff,false))bad_handoff=true;if(p.warm&&p.session==s.session)++promotions;}p.client=id;if(p.session!=s.session)p.sequence=0;p.session=s.session;p.warm=s.warm;p.remaining=s.warm?1:10000;};
         cb.stop_stream=[&p](const std::string&){p.remaining=0;};
         cb.cancel_warm=[&p](const std::string&,uint64_t s){if(p.session==s&&p.warm)p.remaining=0;};
         cb.input_begin=[](const std::string&,uint64_t){return true;};
@@ -45,6 +47,7 @@ int probe(){
     const int result=app.run(GetModuleHandleW(nullptr),false);stop=true;driver.join();producer.join();for(auto& p:peers)p.net.stop();
     std::printf("session counts: starts=%u warm=%u promotions=%u\n",starts.load(),warms.load(),promotions.load());
     require(starts>=8&&warms>=3&&promotions>=1,"Stress did not exercise actual warm promotion and repeated Start");
+    require(!bad_handoff,"A selected stream started before its clipboard handoff");
     std::puts("PASS isolated actual App: three encrypted generated peers, prewarm, rapid selection, windowed drops, cancellation and shutdown");return result;
 }
 int wmain(int argc,wchar_t**){

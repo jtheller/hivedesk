@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <future>
 
 namespace {
 void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
@@ -27,8 +29,10 @@ int probe(){
     wchar_t station[256]{};DWORD size=0;
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_NAME,station,sizeof(station),&size)!=FALSE,"Read test station");
     USEROBJECTFLAGS flags{};require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)!=FALSE&&!(flags.dwFlags&WSF_VISIBLE),"Refuse UI probe on an interactive window station");
+    std::atomic<unsigned> clipboard_echoes=0;
     hive::Shell shell;hive::ShellConfig config;config.device_name=L"Waiting test";config.desktop.tray_icon=false;
     hive::ShellCallbacks callbacks;unsigned selected=0;std::vector<std::string> saved_order;std::string last_selected;bool allow_save=true;
+    callbacks.clipboard_changed=[&](const std::wstring&){++clipboard_echoes;};
     callbacks.select_peer=[&](const std::string& id){++selected;last_selected=id;};
     callbacks.save_order=[&](const std::vector<std::string>& order){if(!allow_save)return false;saved_order=order;return true;};
     std::string error;require(shell.create(GetModuleHandleW(nullptr),config,std::move(callbacks),error),error.c_str());
@@ -46,6 +50,18 @@ int probe(){
         waiting=find(L"HiveDesk.Waiting");
     };
     shell.taskbar_interaction_self_test();
+    // This station owns its own clipboard; the user's clipboard is untouched.
+    for(const std::wstring value:{L"First desktop\n\u4e2d\u6587 \U0001f642",L"",L"Second desktop\r\nUS keyboard"}){
+        auto apply=std::async(std::launch::async,[&]{shell.apply_clipboard(value);});
+        while(apply.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(1);
+        apply.get();require(shell.cached_clipboard()==value,"Clipboard handoff returned before updating the cache");
+        require(OpenClipboard(owner)!=FALSE,"Open isolated clipboard");
+        const HANDLE memory=GetClipboardData(CF_UNICODETEXT);const auto* text=memory?static_cast<const wchar_t*>(GlobalLock(memory)):nullptr;
+        const bool same=text&&std::wstring(text)==value;if(text)GlobalUnlock(memory);CloseClipboard();
+        require(same,"Clipboard handoff did not replace native Unicode text");
+        SendMessageW(owner,WM_CLIPBOARDUPDATE,0,0);pump(10);
+        require(clipboard_echoes==0,"Remote clipboard handoff echoed back through the listener");
+    }
     shell.update_thumbnail("a",image(80));select(1);
     const auto initial_revision=GetPropW(waiting,L"HiveDesk.SurfaceRevision");
     SendMessageW(shell.viewer_window(),WM_SIZE,SIZE_RESTORED,0);

@@ -45,6 +45,8 @@ public:
     // Headless regression: exercises the real worker and routing snapshots
     // with an in-memory sink; installs no hooks and never injects OS input.
     static bool worker_self_test(std::string& result);
+    // Direct hook callbacks on an isolated station; never injects OS input.
+    static bool routing_self_test(std::string& result);
 private:struct Impl;std::unique_ptr<Impl> impl_;
 };
 }
