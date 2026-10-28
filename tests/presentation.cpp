@@ -8,12 +8,20 @@
 namespace hive { EncodedFrame media_generated_test_frame(); }
 static void pump(DWORD ms){const auto end=GetTickCount64()+ms;do{MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(1);}while(GetTickCount64()<end);}
 static LRESULT CALLBACK proc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_NCHITTEST)return HTTRANSPARENT;if(m==WM_MOUSEACTIVATE)return MA_NOACTIVATE;return DefWindowProcW(h,m,w,l);}
+static bool took_foreground=false;
+static void CALLBACK foreground_event(HWINEVENTHOOK,DWORD,HWND window,LONG,LONG,DWORD,DWORD){
+    DWORD process=0;GetWindowThreadProcessId(window,&process);if(process==GetCurrentProcessId())took_foreground=true;
+}
 int main(int argc,char** argv){
     // Explicit generated-content probe. Never inject input, activate a window,
-    // capture desktop content, or register hooks. Not part of normal CTest.
+    // capture desktop content, or register input hooks. Not part of normal CTest.
     const auto foreground=GetForegroundWindow();HWND video=nullptr,cover=nullptr;int result=1;
+    // Observe only this probe's focus events. The user may change applications
+    // during verification; that is not evidence that a generated window activated.
+    const auto focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,foreground_event,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
     const bool warm_only=argc==2&&std::strcmp(argv[1],"--warm-only")==0;
     try{
+        if(!focus_hook)throw std::runtime_error("Cannot observe probe foreground events");
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         WNDCLASSW c{};c.lpfnWndProc=proc;c.hInstance=GetModuleHandleW(nullptr);c.lpszClassName=L"HiveDeskGeneratedPresentation";RegisterClassW(&c);
         const int x=GetSystemMetrics(SM_CXSCREEN)-330,y=80,w=320,h=180;
@@ -68,8 +76,10 @@ int main(int argc,char** argv){
         std::printf("Cadence: %llu repeats with no additional encoded frames; live disable passed\n",static_cast<unsigned long long>(repeats));
         auto close=std::async(std::launch::async,[&]{viewer.close();});while(close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);close.get();
         if(!presented)throw std::runtime_error("No real first Present under cover");
-        if(GetForegroundWindow()!=foreground)throw std::runtime_error("Probe changed foreground window");
+        pump(1);DWORD foreground_process=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground_process);
+        if(took_foreground||foreground_process==GetCurrentProcessId())throw std::runtime_error("Generated probe window took foreground");
+        if(GetForegroundWindow()!=foreground)std::puts("External foreground changed; no probe activation observed.");
         result=0;
     }catch(const std::exception& e){std::printf("FAIL generated presentation: %s\n",e.what());}
-    if(cover)DestroyWindow(cover);if(video)DestroyWindow(video);std::printf("%s generated presentation (no input)\n",result?"FAIL":"PASS");return result;
+    if(cover)DestroyWindow(cover);if(video)DestroyWindow(video);if(focus_hook)UnhookWinEvent(focus_hook);std::printf("%s generated presentation (no input)\n",result?"FAIL":"PASS");return result;
 }
