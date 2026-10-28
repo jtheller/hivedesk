@@ -32,7 +32,7 @@
 
 namespace hive {
 namespace {
-constexpr UINT UiTask=WM_APP+41, TrayMessage=WM_APP+42, ClipboardApply=WM_APP+43, KickControllerMessage=WM_APP+47, CaptureActionMessage=WM_APP+48, ViewerLayoutMessage=WM_APP+50;
+constexpr UINT UiTask=WM_APP+41, TrayMessage=WM_APP+42, KickControllerMessage=WM_APP+47, CaptureActionMessage=WM_APP+48, ViewerLayoutMessage=WM_APP+50;
 constexpr ULONG_PTR InputMarker=0x48495645;
 constexpr COLORREF Background=RGB(19,22,29), Card=RGB(34,39,49), Selected=RGB(37,66,80);
 constexpr COLORREF Accent=RGB(94,217,213), Text=RGB(240,243,247), Muted=RGB(162,172,188);
@@ -221,11 +221,10 @@ struct Shell::Impl {
     bool panel_closing=false,panel_summoned=false,tray_present=false,recording_hotkey=false,hotkey_registered=false;
     int hotkey_id=81;
     ULONGLONG outside_since=0;
-    mutable std::mutex cache_mutex; std::wstring clipboard_cache;
+    ClipboardDesktop clipboard_desktop;
     std::atomic<uint64_t> generation{0};
     std::mutex work_mutex; std::condition_variable work_ready; std::deque<std::function<void()>> work; bool stop_worker=false; std::thread worker;
-    struct ClipboardJob { std::mutex mutex; std::wstring value; std::string error; bool done=false; };
-    std::mutex jobs_mutex; std::map<uint64_t,std::shared_ptr<ClipboardJob>> jobs; std::atomic<uint64_t> next_job{1};
+
     int px(int v) const { return MulDiv(v,dpi,96); }
     void enqueue(std::function<void()> f) { { std::lock_guard lock(work_mutex);if(stop_worker)return;work.push_back(std::move(f)); }work_ready.notify_one(); }
     void dispatch(std::function<void()> f) {
@@ -706,37 +705,9 @@ struct Shell::Impl {
         return rendered;
     }
 
-    void read_clipboard(bool notify) {
-        if(!IsClipboardFormatAvailable(CF_UNICODETEXT)||!OpenClipboard(owner))return;
-        HANDLE data=GetClipboardData(CF_UNICODETEXT);std::wstring value;bool valid=false;
-        if(data){SIZE_T bytes=GlobalSize(data);const wchar_t* ptr=static_cast<const wchar_t*>(GlobalLock(data));
-            if(ptr&&bytes>=sizeof(wchar_t)&&bytes<=16*1024*1024){size_t count=bytes/sizeof(wchar_t),len=0;while(len<count&&ptr[len])++len;if(len<count){value.assign(ptr,len);valid=true;}}
-            if(ptr)GlobalUnlock(data);
-        }
-        CloseClipboard();if(!valid)return;
-        {std::lock_guard lock(cache_mutex);if(value==clipboard_cache)return;clipboard_cache=value;}
-        if(notify)enqueue([this,value]{{std::lock_guard lock(cache_mutex);if(value!=clipboard_cache)return;}if(callbacks.clipboard_changed)callbacks.clipboard_changed(value);});
-    }
-    void write_clipboard(const std::wstring& value) {
-        if(value.size()>8*1024*1024)throw std::runtime_error("Clipboard text exceeds 16 MiB.");
-        size_t bytes=(value.size()+1)*sizeof(wchar_t);HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
-        if(!memory)throw std::runtime_error("Cannot allocate clipboard text.");
-        void* ptr=GlobalLock(memory);if(!ptr){GlobalFree(memory);throw std::runtime_error("Cannot lock clipboard storage.");}
-        memcpy(ptr,value.c_str(),bytes);GlobalUnlock(memory);
-        if(!OpenClipboard(owner)){GlobalFree(memory);throw std::runtime_error("Clipboard is busy; handoff refused.");}
-        bool success=EmptyClipboard()&&SetClipboardData(CF_UNICODETEXT,memory);CloseClipboard();
-        if(!success){GlobalFree(memory);throw std::runtime_error("Could not replace the text clipboard.");}
-        {std::lock_guard lock(cache_mutex);clipboard_cache=value;}
-    }
-    void apply_sync(const std::wstring& value) {
-        if(GetCurrentThreadId()==ui_thread){write_clipboard(value);return;}
-        auto job=std::make_shared<ClipboardJob>();job->value=value;uint64_t token=next_job.fetch_add(1);
-        {std::lock_guard lock(jobs_mutex);jobs.emplace(token,job);}
-        DWORD_PTR result=0;bool sent=SendMessageTimeoutW(owner,ClipboardApply,static_cast<WPARAM>(token),0,SMTO_ABORTIFHUNG|SMTO_BLOCK,2000,&result)!=0;
-        {std::lock_guard lock(jobs_mutex);jobs.erase(token);}
-        if(!sent)throw std::runtime_error("Clipboard UI handoff timed out.");
-        std::lock_guard result_lock(job->mutex);if(!job->done)throw std::runtime_error(job->error.empty()?"Clipboard UI handoff failed.":job->error);
-    }
+    void read_clipboard(bool) {clipboard_desktop.refresh();}
+    void write_clipboard(const std::wstring& value) {clipboard_desktop.apply(text_clipboard(value));}
+    void apply_sync(const std::wstring& value) {write_clipboard(value);}
     HWND child(const wchar_t* type,const wchar_t* label,DWORD style,int id,int x,int y,int w,int h) {
         HWND control=CreateWindowExW(wcscmp(type,L"EDIT")==0?WS_EX_CLIENTEDGE:0,type,label,WS_CHILD|WS_VISIBLE|style,px(x),px(y),px(w),px(h),settings,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),instance,nullptr);
         SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);return control;
@@ -862,10 +833,6 @@ struct Shell::Impl {
             case WM_APP+46:return s->hotkey_registered?1:0;
             case WM_APP+49:return s->raw_mouse_available?1:0;
             case UiTask:{std::unique_ptr<std::function<void()>> task(reinterpret_cast<std::function<void()>*>(l));if(task&&!s->shutting_down)(*task)();return 0;}
-            case ClipboardApply:{
-                std::shared_ptr<ClipboardJob> job;{std::lock_guard lock(s->jobs_mutex);auto it=s->jobs.find(static_cast<uint64_t>(w));if(it!=s->jobs.end())job=it->second;}
-                if(job){std::lock_guard lock(job->mutex);try{s->write_clipboard(job->value);job->done=true;}catch(const std::exception& e){job->error=e.what();}return job->done?1:0;}return 0;
-            }
             case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel(false,s->taskbar_peek.active());else if(w==3){KillTimer(window,3);s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
             case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:case WM_SETTINGCHANGE:s->system_color();return 0;
             case WM_CLIPBOARDUPDATE:s->read_clipboard(true);return 0;
@@ -1019,7 +986,12 @@ struct Shell::Impl {
         },error))return false;
         raw_mouse_available=input_capture.raw_mouse_available();
         relative_mode=config.desktop.relative_mouse&&raw_mouse_available;publish_input();
-        if(!AddClipboardFormatListener(owner)){error="Could not listen for clipboard text changes.";return false;}
+        if(!clipboard_desktop.start([this](Clipboard content){
+            enqueue([this,content]{if(clipboard_desktop.cached()!=content)return;
+                if(callbacks.rich_clipboard_changed)callbacks.rich_clipboard_changed(content);
+                else if(callbacks.clipboard_changed)callbacks.clipboard_changed(content->offer.text);
+            });
+        },error))return false;
         hotkey_registered=RegisterHotKey(owner,hotkey_id,config.desktop.hotkey_modifiers|MOD_NOREPEAT,config.desktop.hotkey_key)!=FALSE;
         if(!hotkey_registered)log_hotkey_conflict();
         taskbar_created=RegisterWindowMessageW(L"TaskbarCreated");tray();SetTimer(owner,1,16,nullptr);read_clipboard(false);
@@ -1030,9 +1002,10 @@ struct Shell::Impl {
     }
     ~Impl() {
         taskbar_peek.reset();
+        clipboard_desktop.stop();
         shutting_down=true;++generation;publish_input();input_capture.stop();ReleaseCapture();ClipCursor(nullptr);
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
-        if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);RemoveClipboardFormatListener(owner);tray(true);}
+        if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
         if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
         for(const auto& surface:retired_viewers)DestroyWindow(surface->window);
@@ -1070,7 +1043,10 @@ void Shell::quit(){impl_->dispatch([s=impl_]{PostMessageW(s->owner,WM_CLOSE,0,0)
 void Shell::set_status(const std::wstring& status){impl_->dispatch([s=impl_,status]{s->status=status;InvalidateRect(s->panel,nullptr,FALSE);});}
 void Shell::show_error(const std::wstring& message){impl_->dispatch([s=impl_,message]{s->local(true);s->status=message;MessageBoxW(s->owner,message.c_str(),L"HiveDesk - Could not open desktop",MB_OK|MB_ICONERROR);});}
 void Shell::apply_clipboard(const std::wstring& value){impl_->apply_sync(value);}
-std::wstring Shell::cached_clipboard()const{std::lock_guard lock(impl_->cache_mutex);return impl_->clipboard_cache;}
+std::wstring Shell::cached_clipboard()const{return impl_->clipboard_desktop.cached()->offer.text;}
+void Shell::apply_clipboard(Clipboard content){impl_->clipboard_desktop.apply(std::move(content));}
+Clipboard Shell::cached_rich_clipboard()const{return impl_->clipboard_desktop.cached();}
+bool Shell::clipboard_busy()const{return impl_->clipboard_desktop.busy();}
 void Shell::show_settings(){impl_->dispatch([s=impl_]{s->settings_ui();});}
 bool Shell::prepare_video_restart(){return impl_->settings_restart.prepare();}
 void Shell::cancel_video_restart(){impl_->settings_restart.cancel();}

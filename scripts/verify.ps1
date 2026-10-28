@@ -49,7 +49,7 @@ if(-not $SkipBuild){
 # Repeat the actual isolated UI/network processes. No installed process is driven.
 $ctest=[regex]::Match([IO.File]::ReadAllText((Join-Path $build 'CMakeCache.txt')),'(?m)^CMAKE_CTEST_COMMAND:INTERNAL=(.+)$').Groups[1].Value.Trim()
 if(-not (Test-Path -LiteralPath $ctest)){throw 'Configured CTest executable is missing; run the build first.'}
-Check 'repeat-ui-input-lifecycle' $ctest @('--test-dir',('"'+$build+'"'),'-R','"^(waiting_screen|shell_video|app_sessions|input_capture_worker|input_routing|host_input|recovery|taskbar_peek|reconnect|session_control)$"','--repeat',('until-fail:'+$Repeat),'--output-on-failure') (120*$Repeat)
+Check 'repeat-ui-input-lifecycle' $ctest @('--test-dir',('"'+$build+'"'),'-R','"^(clipboard|waiting_screen|shell_video|app_sessions|input_capture_worker|input_routing|host_input|recovery|taskbar_peek|reconnect|session_control)$"','--repeat',('until-fail:'+$Repeat),'--output-on-failure') (120*$Repeat)
 if($Hardware){
     # Serial GPU checks avoid creating artificial cross-test encoder contention.
     foreach($mode in @('capture','snapshot','render','throughput','pipeline','auto-quality','motion','lan')){

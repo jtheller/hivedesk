@@ -47,9 +47,9 @@ constexpr size_t kMaxConnections = 128;
 // Unsent freshness is tuning; the seconds-long write watchdog is session failure
 // policy. TCP cannot skip an already submitted packet halfway through.
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
-enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, Clipboard = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
+enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -209,17 +209,18 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard;
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(features>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
     Reader r{b}; if (r.byte() != 'H' || r.byte() != 'I' || r.byte() != 'V' || r.byte() != 'E' || r.byte() != (automatic?2:1)) return false;
     channel = r.byte(); peer.id = r.string(128); peer.name = r.string(256); peer.port = r.word();
-    if(!r.good || channel>2 || !peer.port || !text_ok(peer.id,128) || !text_ok(peer.name,256) || b.size()-r.at!=32)return false;
+    if(!r.good || channel>3 || !peer.port || !text_ok(peer.id,128) || !text_ok(peer.name,256) || b.size()-r.at!=32)return false;
     if(std::equal(feature_marker.begin(),feature_marker.end(),b.begin()+r.at)){
         r.at+=feature_marker.size();peer.features=r.dword();
     }
     if(channel==2&&!(peer.features&FeatureDedicatedInput))return false;
+    if(channel==3&&!(peer.features&FeatureRichClipboard))return false;
     return true;
 }
 bool signed_part(const Key& key, const Bytes& transcript, uint8_t label, Key& signature) { Bytes b = transcript; b.push_back(label); return hmac(key,b,signature); }
@@ -227,7 +228,7 @@ bool signed_part(const Key& key, const Bytes& transcript, uint8_t label, Key& si
 
 struct Transport::Impl {
     struct Conn {
-        Impl* owner; std::atomic<SOCKET> socket{INVALID_SOCKET}; Peer peer; std::atomic<uint8_t> channel{0};
+        bool outbound=false;Impl* owner; std::atomic<SOCKET> socket{INVALID_SOCKET}; Peer peer; std::atomic<uint8_t> channel{0};
         std::atomic<bool> ready{false}, closed{false}, reader_done{false}, writer_done{true}; Cipher tx, rx; uint64_t tx_seq = 0, rx_seq = 0;
         Key confirmation{},pair_key{};uint64_t token=0,bound_control_token=0;
         std::thread reader, writer; std::mutex queue_mutex, socket_mutex; std::condition_variable queue_cv;
@@ -491,7 +492,7 @@ struct Transport::Impl {
             SOCKET s = socket.load();auto* progress=channel==1?&received_bytes:nullptr;
             Bytes head(12); if (!recv_all(s,head.data(),head.size(),progress)) return false;
             Reader r{head}; uint32_t n = r.dword(); uint64_t seq = r.qword();
-            if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:MaxNativeSnapshotBytes + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
+            if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:channel==3?ClipboardChunk+64:MaxNativeSnapshotBytes + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
             Bytes encrypted(n); std::array<uint8_t,16> tag{};
             if (!recv_all(s,encrypted.data(),encrypted.size(),progress) || !recv_all(s,tag.data(),tag.size(),progress) || !rx.crypt(false,head,encrypted,b,tag)) return false;
             rx_seq = seq; return true;
@@ -535,12 +536,12 @@ struct Transport::Impl {
             close(); owner->ended(*this);
         }
     };
-    struct Pair { std::shared_ptr<Conn> control, video, input; };
+    struct Pair { std::shared_ptr<Conn> control, video, input, clipboard; };
     TransportConfig cfg; TransportCallbacks callbacks; Key group{};
     std::atomic<bool> running{false}; bool winsock = false;std::atomic<uint64_t> connection_sequence{0};
     std::atomic<SOCKET> listener{INVALID_SOCKET}, discovery{INVALID_SOCKET};
     std::thread accept_thread, discovery_thread;
-    mutable std::mutex mutex; std::mutex thread_mutex, connect_mutex,config_mutex; std::vector<std::shared_ptr<Conn>> connections;
+    mutable std::mutex mutex; std::mutex thread_mutex, connect_mutex,clipboard_connect_mutex,config_mutex; std::vector<std::shared_ptr<Conn>> connections;
     std::map<std::string,Pair> connected;
     std::map<std::string,std::chrono::steady_clock::time_point> next_attempt;
     std::mutex sleep_mutex; std::condition_variable sleep_cv;
@@ -548,10 +549,12 @@ struct Transport::Impl {
     void status(const std::string& s) { if (callbacks.status) { try { callbacks.status(s); } catch (...) {} } }
     void ended(Conn& c) {
         if (!running) return;
+        if(c.channel==3){std::lock_guard lock(mutex);auto it=connected.find(c.peer.id);if(it!=connected.end()&&it->second.clipboard.get()==&c)it->second.clipboard.reset();return;}
         bool notify = false;Peer ended_peer; {
             std::lock_guard lock(mutex); auto it = connected.find(c.peer.id);
             if(it!=connected.end()&&(it->second.control.get()==&c||it->second.video.get()==&c||it->second.input.get()==&c)) {
                 if(it->second.control)it->second.control->close();
+                if(it->second.clipboard)it->second.clipboard->close();
                 if(it->second.video)it->second.video->close();
                 if(it->second.input)it->second.input->close();
                 ended_peer=c.peer;connected.erase(it);notify=true;
@@ -560,6 +563,7 @@ struct Transport::Impl {
         if (notify) { ended_peer.authenticated = false; if (callbacks.peer) { try { callbacks.peer(ended_peer); } catch (...) {} } status("Connection closed: " + ended_peer.name); }
     }
     bool handshake(Conn& c, bool client, uint8_t requested) {
+        c.outbound=client;
         if(cfg.automatic_lan&&!on_link(c.peer.address))return false;
         SOCKET s = c.socket.load(); socket_options(s);
         // TCP probes detect a vanished cable/peer without mistaking an idle
@@ -582,10 +586,11 @@ struct Transport::Impl {
             const auto& a=client?local_public:remote_public;const auto& b=client?remote_public:local_public;
             transcript.insert(transcript.end(),a.begin(),a.end());transcript.insert(transcript.end(),b.begin(),b.end());
         }
-        if((cfg.automatic_lan&&channel==1)||channel==2){
+        if((cfg.automatic_lan&&channel==1)||channel>=2){
             Key binding{};{std::lock_guard lock(mutex);auto existing=connected.find(peer.id);
                 if(existing==connected.end()||!existing->second.control||!existing->second.control->ready||existing->second.control->closed||
-                    (channel==2&&!(existing->second.control->peer.features&FeatureDedicatedInput)))return false;
+                    (channel==2&&!(existing->second.control->peer.features&FeatureDedicatedInput))||
+                    (channel==3&&!(existing->second.control->peer.features&FeatureRichClipboard)))return false;
                 binding=existing->second.control->pair_key;c.bound_control_token=existing->second.control->token;}
             Key combined{};const bool ok=hmac(binding,Bytes(material.begin(),material.end()),combined);SecureZeroMemory(binding.data(),binding.size());if(!ok)return false;material=combined;SecureZeroMemory(combined.data(),combined.size());
         }
@@ -607,11 +612,16 @@ struct Transport::Impl {
     bool activate(const std::shared_ptr<Conn>& c) {
         {
             std::lock_guard lock(mutex); if (!running) return false;
-            auto& pair = connected[c->peer.id]; auto& slot = c->channel == 0 ? pair.control : c->channel==1?pair.video:pair.input;
-            if (slot && !slot->closed) return false;
+            auto& pair = connected[c->peer.id]; auto& slot = c->channel == 0 ? pair.control : c->channel==1?pair.video:c->channel==2?pair.input:pair.clipboard;
+            if(slot&&!slot->closed){
+                // Simultaneous clipboard-lane repairs converge on the lower
+                // device ID's outbound connection without disturbing desktop lanes.
+                if(c->channel!=3||c->outbound!=(cfg.device_id<c->peer.id)||slot->outbound==c->outbound)return false;
+                slot->close();
+            }
             if (c->channel != 0 && (!pair.control || pair.control->closed)) return false;
             if(c->bound_control_token&&c->bound_control_token!=pair.control->token)return false;
-            if(c->channel==0){if(pair.video){pair.video->close();pair.video.reset();}if(pair.input){pair.input->close();pair.input.reset();}}
+            if(c->channel==0){if(pair.clipboard){pair.clipboard->close();pair.clipboard.reset();}if(pair.video){pair.video->close();pair.video.reset();}if(pair.input){pair.input->close();pair.input.reset();}}
             slot = c; c->ready = true;
         }
         if (!c->channel && callbacks.peer) { try { callbacks.peer(c->peer); } catch (...) {} }
@@ -666,7 +676,7 @@ struct Transport::Impl {
         }
         nonblocking = 0; ioctlsocket(s,FIONBIO,&nonblocking);
         if (rc != 0 || !handshake(*c,true,channel)) {
-            const char* lane=channel==0?"control":channel==1?"video":"input";
+            const char* lane=channel==0?"control":channel==1?"video":channel==2?"input":"clipboard";
             error=std::string(lane)+" channel "+address+":"+std::to_string(port)+
                 (rc!=0?" TCP connection failed or timed out; check reachability and Private/Domain LocalSubnet firewall scope.":
                  cfg.automatic_lan?" automatic LAN handshake failed; check both endpoints' subnet, version and logs.":" Network Key handshake failed.");
@@ -712,10 +722,14 @@ struct Transport::Impl {
             auto input=dial(address,port,2,error);
             if(!input||input->peer.id!=control->peer.id){control->close();video->close();if(input)input->close();return false;}
         }
+        if(control->peer.features&FeatureRichClipboard){std::string clipboard_error;auto lane=dial(address,port,3,clipboard_error);if(!lane||lane->peer.id!=control->peer.id){if(lane)lane->close();status("Clipboard channel unavailable; desktop remains usable.");}}
         id = control->peer.id; status("Connected: " + control->peer.name); return true;
     }
     bool dispatch(Conn& c, const Bytes& b) {
         Reader r{b}; uint8_t type = r.byte();
+        if((c.channel==3)!=(type==ClipboardData))return false;
+        if(type==ClipboardData){if(b.size()<2||b.size()>ClipboardChunk+64)return false;if(callbacks.clipboard_packet)callbacks.clipboard_packet(c.peer.id,Bytes(b.begin()+1,b.end()));return true;}
+        if(type==RichClipboard){ClipboardOffer offer;if(c.channel!=0||!(c.peer.features&FeatureRichClipboard)||!decode_clipboard_offer(Bytes(b.begin()+1,b.end()),offer))return false;if(callbacks.clipboard_offer)callbacks.clipboard_offer(c.peer.id,offer);else if(callbacks.clipboard)callbacks.clipboard(c.peer.id,offer.text);return true;}
         if ((c.channel == 1) != (type == Frame||type==AutoFrame||type==AutoFrameTimed||type==FrameCursor)) return false;
         const bool input_message=type==InputReady||type==InputData||type==InputComplete||type==InputRevoke;
         if((c.channel==2)!=input_message)return false;
@@ -829,7 +843,7 @@ struct Transport::Impl {
             if(callbacks.host_ended)callbacks.host_ended(c.peer.id,session);return true;
         }
         case Input: { InputEvent e; e.kind = InputKind(r.dword()); e.a = int32_t(r.dword()); e.b = int32_t(r.dword()); e.c = int32_t(r.dword()); if (!r.end() || !valid_input(e)) return false; if (callbacks.input) callbacks.input(c.peer.id,e); return true; }
-        case Clipboard: {
+        case ClipboardText: {
             uint32_t count = r.dword(); if (!r.good || count > kMaxClipboard/2 || b.size()-r.at != size_t(count)*2) return false;
             std::wstring value; value.reserve(count); for (uint32_t i = 0; i < count; ++i) value.push_back(wchar_t(r.word())); if (!utf16_ok(value)) return false;
             // Callback must finish the local clipboard write before returning. Input follows on this same thread.
@@ -1100,7 +1114,24 @@ InputDiagnostics Transport::input_diagnostics(const std::string& peer) const {
     std::lock_guard lock(input->queue_mutex);auto result=input->input_send.snapshot(input_now_us());
     result.connection=input->token;result.ready=input->input_enabled&&!input->input_ending;return result;
 }
-bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{Clipboard}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
+bool Transport::send_clipboard_offer(const std::string& peer,const ClipboardOffer& offer) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureRichClipboard))return false;
+    auto b=encode_clipboard_offer(offer);if(b.empty())return false;b.insert(b.begin(),RichClipboard);return c->enqueue(std::move(b));
+}
+bool Transport::send_clipboard_packet(const std::string& peer,const std::vector<uint8_t>& bytes) {
+    if(bytes.empty()||bytes.size()>ClipboardChunk+63)return false;
+    std::shared_ptr<Impl::Conn> c;{std::lock_guard lock(impl_->mutex);auto it=impl_->connected.find(peer);if(it!=impl_->connected.end())c=it->second.clipboard;}
+    if(!c||!c->ready||c->closed){
+        std::lock_guard repairing(impl_->clipboard_connect_mutex);
+        {std::lock_guard lock(impl_->mutex);auto it=impl_->connected.find(peer);if(it!=impl_->connected.end())c=it->second.clipboard;}
+        if(!c||!c->ready||c->closed){auto control=impl_->find(peer);if(!control||!(control->peer.features&FeatureRichClipboard))return false;
+            std::string error;c=impl_->dial(control->peer.address,control->peer.port,3,error);
+            if(!c){std::lock_guard lock(impl_->mutex);auto it=impl_->connected.find(peer);if(it!=impl_->connected.end())c=it->second.clipboard;}
+        }
+    }
+    if(!c)return false;Bytes b{ClipboardData};b.insert(b.end(),bytes.begin(),bytes.end());return c->enqueue(std::move(b));
+}
+bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{ClipboardText}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
 bool Transport::request_snapshot(const std::string& peer,uint64_t request) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!request)return false;
     Bytes b{uint8_t((c->peer.features&FeatureNativeSnapshot)?NativeSnapshotRequest:SnapshotRequest)};u64(b,request);return c->enqueue(std::move(b));
@@ -1945,6 +1976,13 @@ bool Transport::self_test(std::string& result) {
     ok = ok && !a.send_clipboard("test-b",oversized) && !a.send_clipboard("test-b",malformed) && !a.send_input("test-b",{InputKind(999),0,0,0});
     frame.data.resize(kMaxFrame+1); ok = ok && !a.send_frame("test-b",frame);
     cursor.width=257;ok=ok&&!b.send_cursor("test-a",cursor)&&!a.request_snapshot("test-b",0)&&!b.send_snapshot("test-a",{901,Bytes(MaxSnapshotBytes+1)});
+    {
+        std::shared_ptr<Impl::Conn> lane;{std::lock_guard lock(a.impl_->mutex);lane=a.impl_->connected.at("test-b").clipboard;}
+        if(!lane){result="Missing negotiated clipboard lane";return false;}const auto connection=a.connection_token("test-b");lane->close();
+        const auto deadline=Clock::now()+std::chrono::seconds(2);
+        while(Clock::now()<deadline){bool gone=false;{std::lock_guard lock(b.impl_->mutex);const auto& pair=b.impl_->connected.at("test-a");gone=!pair.clipboard||pair.clipboard->closed;}if(gone)break;Sleep(1);}
+        if(!a.send_clipboard_packet("test-b",Bytes{99})||a.connection_token("test-b")!=connection){result="Clipboard lane repair disrupted desktop connection";return false;}
+    }
     auto before = std::chrono::steady_clock::now(); wrong.stop(); ok = a.send_input("test-b",{InputKind::ReleaseAll}) && ok; a.stop();
     { std::unique_lock lock(mutex); ok = cv.wait_for(lock,std::chrono::milliseconds(500),[&] { return got_release; }) && ok; }
     b.stop();

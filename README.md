@@ -94,7 +94,13 @@ impersonator. No universal shared password is embedded in the application.
   DWM's clock. Background bounds stay fixed; hotkey cards additionally slide/fade
   in with staggered starts, all finishing by 300 ms. Re-entry
   reverses from the current opacity. Escape and desktop selection dismiss immediately.
-- US keyboard scan codes, remote-side IME, Unicode text clipboard handoff.
+- US keyboard scan codes and remote-side IME. Version 0.6.0 adds bidirectional
+  clipboard images (PNG/DIB/DIBV5), Explorer files and folders alongside Unicode
+  text. The native OLE virtual-file adapter uses asynchronous Shell extraction
+  and seekable 64-bit streams: file bytes travel only when pasted, on a fourth,
+  independent authenticated connection. No whole-file buffering or source deletion.
+  Both endpoints need 0.6.0 for images/files; older peers continue text-only handoff.
+  See [clipboard behavior and limits](docs/CLIPBOARD.md).
 - Alpha.25 moves physical keyboard/mouse capture and dispatch onto dedicated
   workers, independent of the switcher, clipboard, decoder and renderer. Input
   uses its own AES-GCM TCP connection with TCP_NODELAY and an independent local
@@ -106,8 +112,8 @@ impersonator. No universal shared password is embedded in the application.
   button, wheel or release boundary. A 2 s input stall/expiry closes the input
   session and releases held keys/buttons instead of replaying stale input.
   Clipboard handoff completes before input is enabled on a newly selected
-  computer. Later clipboard work stays on the control path and does not block
-  the input reader; no cross-channel ordering guarantee is added for live paste.
+  computer. Clipboard metadata stays on control; image/file bytes use the separate
+  clipboard lane and do not block the input reader; no cross-channel ordering guarantee is added for live paste.
   Upgrade both endpoints for this path. Older peers retain control-channel input.
 - Alpha.12 adds a local SYSTEM desktop broker for capture and input on the
   signed-in console session, including its lock screen. The network agent and

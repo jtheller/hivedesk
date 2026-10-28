@@ -113,11 +113,12 @@ public:
                 transport_.send_input(peer,packet);
             }else transport_.send_input(peer,input);
         };
-        callbacks.clipboard_changed=[this](const std::wstring& text) {
+        callbacks.rich_clipboard_changed=[this](hive::Clipboard text) {
+            if(closing_||updating_)return;
             const auto viewing=active_.load();
             const auto hosting=hosting_.load();
-            if(viewing) transport_.send_clipboard(*viewing,text);
-            else if(hosting&&!hosting->revoked&&!hosting->warming) transport_.send_clipboard(hosting->peer,text);
+            if(viewing) clipboard_transfer_.send(*viewing,text);
+            else if(hosting&&!hosting->revoked&&!hosting->warming) clipboard_transfer_.send(hosting->peer,text);
         };
         callbacks.save_preferences=[this](const std::wstring& name,const hive::DesktopPreferences& desktop) {
             const std::lock_guard lock(config_mutex_);
@@ -310,6 +311,7 @@ private:
             const std::scoped_lock lock(host_mutex_,view_intent_mutex_);
             const std::lock_guard queue_lock(queue_mutex_);
             const auto host=hosting_.load();
+            if(clipboard_transfer_.busy()||shell_.clipboard_busy())return;
             if(!hive::update::idle_for_update(bool(active_.load()),bool(host),reconnect_.current(generation_),!queue_.empty(),host&&host->warming))return;
             if(!update_pending){
                 if(!shell_.prepare_video_restart())return;
@@ -551,7 +553,7 @@ private:
                 if(!host_.input(event)&&!input_error_reported_){input_error_reported_=true;status("Desktop service input connection failed.");}
             }
         };
-        callbacks.clipboard=[this](const std::string& peer,const std::wstring& text) {
+        auto receive_clipboard=[this](const std::string& peer,hive::Clipboard text) {
             if(closing_)return;
             const std::lock_guard lock(host_mutex_);
             if(closing_)return;
@@ -571,6 +573,9 @@ private:
                 catch(const std::exception& error) {status(std::string("Remote clipboard update failed: ")+error.what());}
             }
         };
+        callbacks.clipboard=[receive_clipboard](const std::string& peer,const std::wstring& text){receive_clipboard(peer,hive::text_clipboard(text));};
+        callbacks.clipboard_offer=[this,receive_clipboard](const std::string& peer,const hive::ClipboardOffer& offer){receive_clipboard(peer,clipboard_transfer_.receive(peer,offer));};
+        callbacks.clipboard_packet=[this](const std::string& peer,const std::vector<uint8_t>& bytes){clipboard_transfer_.packet(peer,bytes);};
         std::string error;
         // The isolated full-App regression uses generated loopback peers only.
 #ifdef HIVEDESK_APP_SESSION_TEST
@@ -667,7 +672,7 @@ private:
         if(epoch!=generation_||closing_) {go_local(nullptr,false,false);return;}
         // The control stream delivers clipboard before Start/InputEnable. The
         // separate input lane is armed only after that handoff has completed.
-        if(!transport_.send_clipboard(peer,shell_.cached_clipboard())) {go_local(nullptr,false,false);status("Could not send clipboard handoff.");return;}
+        if(!clipboard_transfer_.send(peer,shell_.cached_rich_clipboard())) {go_local(nullptr,false,false);status("Could not send clipboard handoff.");return;}
         hive::StreamSettings stream;
         if(automatic){stream.session=warm?warm->settings.session:++session_sequence_;stream.receiver_millihz=refresh;}
         else {stream.fps=std::max(1u,refresh/1000);stream.bitrate_mbps=80;status("Peer uses legacy streaming. Update both computers for automatic quality.");}
@@ -766,7 +771,7 @@ private:
         {const std::lock_guard lock(warm_mutex_);warm.swap(warm_views_);warm_visible_.clear();}
         for(const auto& item:warm)retire_warm(item.second);
         prepare_lane_.stop();retire_lane_.stop();
-        transport_.stop();hive::release_injected_input();
+        clipboard_transfer_.stop();transport_.stop();hive::release_injected_input();
         telemetry_.clear(MonitorSide::View);telemetry_.clear(MonitorSide::Host);
     }
     void shutdown() {
@@ -808,6 +813,7 @@ private:
     hive::AppConfig config_;
     hive::Shell shell_;
     hive::Transport transport_;
+    hive::ClipboardTransfer clipboard_transfer_{transport_};
     hive::HostBridge host_;
     std::shared_ptr<const hive::ViewerSurface> view_surface_;
     std::atomic<std::shared_ptr<hive::MediaViewer>> viewer_{std::make_shared<hive::MediaViewer>()};
@@ -829,7 +835,7 @@ private:
     bool input_error_reported_=false;
     std::atomic<bool> clipboard_pending_=false;ULONGLONG last_clipboard_retry_=0;
     ULONGLONG last_debug_tick_=0;
-    std::map<std::string,std::wstring> staged_clipboards_; // Protected by host_mutex_.
+    std::map<std::string,hive::Clipboard> staged_clipboards_; // Protected by host_mutex_.
     std::atomic<uint64_t> generation_=0;
     std::atomic<uint64_t> remote_size_=0;
     std::atomic<uint64_t> received_frames_=0;

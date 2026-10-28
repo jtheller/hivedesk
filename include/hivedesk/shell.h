@@ -1,6 +1,7 @@
 #pragma once
 #include "types.h"
 #include "input_diagnostics.h"
+#include "clipboard.h"
 #include <windows.h>
 #include <functional>
 #include <memory>
@@ -28,6 +29,7 @@ struct ShellCallbacks {
     // sending an already captured event to the next peer/session.
     std::function<void(const std::string&,uint64_t,const InputEvent&,uint64_t)> captured_input;
     std::function<void(const std::wstring&)> clipboard_changed;
+    std::function<void(Clipboard)> rich_clipboard_changed;
     std::function<void(const std::wstring&, const std::string&, const StreamSettings&)> save_settings;
     std::function<void(const std::string&)> connect_address;
     std::function<void()> panel_opened;
@@ -58,6 +60,9 @@ public:
     // Synchronously marshal to UI, complete the write before returning, deduplicate listener events.
     void apply_clipboard(const std::wstring&);
     std::wstring cached_clipboard() const;
+    void apply_clipboard(Clipboard);
+    Clipboard cached_rich_clipboard() const;
+    bool clipboard_busy() const;
     void show_settings();
     void update_thumbnail(const std::string& peer, Thumbnail);
     // JPEG decoding uses the shell worker, independent of connection startup.

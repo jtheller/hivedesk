@@ -3,6 +3,7 @@
 #include "video_send_diagnostics.h"
 #include "input_channel.h"
 #include "input_diagnostics.h"
+#include "clipboard.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -26,6 +27,8 @@ struct TransportCallbacks {
     std::function<void(const std::string&, EncodedFrame)> frame;
     std::function<void(const std::string&, const InputEvent&)> input;
     std::function<void(const std::string&, const std::wstring&)> clipboard;
+    std::function<void(const std::string&, const ClipboardOffer&)> clipboard_offer;
+    std::function<void(const std::string&, const std::vector<uint8_t>&)> clipboard_packet;
     std::function<void(const std::string&)> status;
     std::function<void(const std::string&, uint64_t,bool)> snapshot_request;
     std::function<void(const std::string&, Snapshot)> snapshot;
@@ -81,6 +84,8 @@ public:
     bool send_input_ack(const std::string& peer, const InputAck&);
     InputDiagnostics input_diagnostics(const std::string& peer) const;
     bool send_clipboard(const std::string& peer, const std::wstring&);
+    bool send_clipboard_offer(const std::string&,const ClipboardOffer&);
+    bool send_clipboard_packet(const std::string&,const std::vector<uint8_t>&);
     bool request_snapshot(const std::string& peer, uint64_t request);
     bool send_snapshot(const std::string& peer, const Snapshot&);
     bool send_cursor(const std::string& peer, const CursorState&);
