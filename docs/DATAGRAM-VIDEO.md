@@ -18,7 +18,10 @@ service, an input lane, or a topology-specific exception.
   Retransmissions have fresh encryption counters and stable logical packet IDs.
 - A bounded 65536-counter replay window permits reordered packets. It advances
   only after successful authentication. The authenticated TCP peer's IP/port is
-  the only permitted UDP endpoint.
+the only permitted UDP endpoint.
+- From 0.8.2, bind UDP to the TCP connection's actual local address. A wildcard
+  socket on a multi-address host can otherwise send from a different source IP;
+  relaxing authentication/endpoint checks would conceal that routing mistake.
 - Bodies: Hello; Data (packet ID, reference epoch, frame ID, total bytes,
   offset, fragment); selective ACK (up to 128 packet IDs); reference Reset.
   Strict size/offset/identity checks precede allocation or copying.

@@ -91,7 +91,9 @@ void socket_test(){
     ha.picture=[&](Bytes b,uint64_t start,uint64_t end){if(b!=content||!start||end<start)damaged=true;++rx_a;};
     hb.picture=[&](Bytes b,uint64_t start,uint64_t end){if(b!=content||!start||end<start)damaged=true;++rx_b;};
     hb.receive_ready=[&](const Bytes&){return consumer_ready.load();};
-    DatagramVideo a("127.0.0.1",key,true,progress_a,ha),b("127.0.0.1",key,false,progress_b,hb);
+    // Distinct local addresses reproduce multi-address hosts: wildcard binding
+    // would select 127.0.0.1 and fail the opposite peer's strict endpoint check.
+    DatagramVideo a("127.0.0.3",key,true,progress_a,ha,"127.0.0.2"),b("127.0.0.2",key,false,progress_b,hb,"127.0.0.3");
     require(a.offer(b.port())&&b.offer(a.port()),"port exchange");a.start();b.start();
     auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);unsigned sent_a=0,sent_b=0;
     while(std::chrono::steady_clock::now()<deadline&&(rx_a<120||rx_b<120)){

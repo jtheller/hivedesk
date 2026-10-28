@@ -265,6 +265,12 @@ struct Transport::Impl {
         uint64_t input_receive_session=0,input_receive_sequence=0;
         bool input_enabled=false,input_ending=false;
         explicit Conn(Impl* p, SOCKET s) : owner(p), socket(s) {}
+        std::string local_ipv4(){
+            std::lock_guard lock(socket_mutex);sockaddr_in local{};int size=sizeof(local);char address[INET_ADDRSTRLEN]{};
+            const auto s=socket.load();if(s==INVALID_SOCKET||getsockname(s,reinterpret_cast<sockaddr*>(&local),&size)||
+                local.sin_family!=AF_INET||!inet_ntop(AF_INET,&local.sin_addr,address,sizeof(address)))return {};
+            return address;
+        }
         ~Conn() { close(); if (reader.joinable()) reader.join(); if (writer.joinable()) writer.join(); if(probe_worker.joinable())probe_worker.join(); if(send_complete!=WSA_INVALID_EVENT)WSACloseEvent(send_complete); if(video_wake)CloseHandle(video_wake); SecureZeroMemory(pair_key.data(),pair_key.size()); }
         void close(bool abortive = false) {
             // Publish while holding the same mutex used by queue_cv.wait(). An
@@ -684,7 +690,7 @@ struct Transport::Impl {
                 hooks.credit=[&c]{if(!c.closed)c.notify_ready();};
                 hooks.keyframe=[&c]{if(!c.closed)c.request_fresh_frame();};
                 hooks.status=[this,&c](const std::string& text){status(c.peer.name+": "+text);};
-                auto datagram=std::make_unique<DatagramVideo>(c.peer.address,c.pair_key,client,c.received_bytes,std::move(hooks));
+                auto datagram=std::make_unique<DatagramVideo>(c.peer.address,c.pair_key,client,c.received_bytes,std::move(hooks),c.local_ipv4());
                 {std::lock_guard lock(c.queue_mutex);if(c.closed)return false;c.datagram=std::move(datagram);}
             }catch(const std::exception& e){status(std::string("Video will use TCP: ")+e.what());}
         }
@@ -1168,6 +1174,7 @@ bool Transport::measure_path(const std::string& peer,bool udp,uint32_t bitrate,u
     if(inet_pton(AF_INET,c->peer.address.c_str(),&remote.sin_addr)!=1){error="Probe requires the authenticated IPv4 peer address.";return false;}
     if(udp){
         socket.s=::socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);sockaddr_in local{};local.sin_family=AF_INET;
+        if(inet_pton(AF_INET,c->local_ipv4().c_str(),&local.sin_addr)!=1){error="Cannot determine the authenticated local endpoint.";return false;}
         int length=sizeof(local);DWORD timeout=30;int buffer=1024*1024;
         if(socket.s==INVALID_SOCKET||bind(socket.s,reinterpret_cast<sockaddr*>(&local),sizeof(local))||getsockname(socket.s,reinterpret_cast<sockaddr*>(&local),&length)){error="Cannot bind UDP probe receiver.";return false;}
         setsockopt(socket.s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<char*>(&timeout),sizeof(timeout));
@@ -2097,10 +2104,12 @@ bool Transport::self_test(std::string& result) {
         received.frame=[&](const std::string&,EncodedFrame value){std::lock_guard lock(guard);frame=value.data==Bytes({1,2,3});changed.notify_all();};
         received.peer=[&](const Peer& peer){std::lock_guard lock(guard);if(peer.name=="Renamed without disconnect")renamed=true;if(peer.version==HIVEDESK_VERSION)version_received=true;changed.notify_all();};
         if(!left.start({"lan-a","LAN A","",0,false,true},sending,error)||!right.start({"lan-b","LAN B","",0,false,true},received,error)||
-            !left.connect("127.0.0.1",right.impl_->cfg.port,id,error)){result="Keyless dual-channel handshake: "+error;return false;}
+            !left.connect("127.0.0.2",right.impl_->cfg.port,id,error)){result="Keyless dual-channel handshake: "+error;return false;}
         left.rename("Renamed without disconnect");EncodedFrame picture;picture.width=2;picture.height=2;picture.keyframe=true;picture.data={1,2,3};
         const auto packet_ready=Clock::now()+std::chrono::seconds(3);
         while(!left.frame_ready(id)&&Clock::now()<packet_ready)Sleep(1);
+        auto packet_lane=left.impl_->find(id,true);
+        if(!packet_lane||!packet_lane->datagram||packet_lane->datagram->route()!=DatagramVideo::Route::Datagram){result="UDP did not preserve the authenticated TCP local address";return false;}
         bool ok=left.send_clipboard(id,L"keyless")&&left.send_frame(id,picture);
         {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(3),[&]{return text&&frame&&renamed&&ready_notified&&version_received&&reverse_version;})&&ok;}
         Transport legacy;const auto old_key=generate_group_key();

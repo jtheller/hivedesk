@@ -22,7 +22,7 @@ public:
     };
     enum class Route { Negotiating, Datagram, Tcp };
     DatagramVideo(const std::string& address,const std::array<uint8_t,32>& pair_key,bool outbound,
-                  std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks);
+                  std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks,const std::string& local_address="0.0.0.0");
     ~DatagramVideo();
     DatagramVideo(const DatagramVideo&)=delete;
     DatagramVideo& operator=(const DatagramVideo&)=delete;

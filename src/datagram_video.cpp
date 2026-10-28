@@ -70,10 +70,12 @@ struct DatagramVideo::Impl {
     mutable std::mutex mutex;std::mutex delivery_mutex;datagram::Window window;
     std::atomic<bool> stopping=false;bool receive_tcp=false,offered=false,tcp_key=false;Route mode=Route::Negotiating;
     std::thread worker;uint64_t started=0,last_hello=0,last_received=0,invalid=0;
-    Impl(const std::string& address,const Key& root,bool outbound,std::shared_ptr<std::atomic<uint64_t>> bytes,Hooks h):hooks(std::move(h)),progress(std::move(bytes)) {
+    Impl(const std::string& address,const Key& root,bool outbound,std::shared_ptr<std::atomic<uint64_t>> bytes,Hooks h,const std::string& local_address):hooks(std::move(h)),progress(std::move(bytes)) {
         remote.sin_family=AF_INET;
         if(inet_pton(AF_INET,address.c_str(),&remote.sin_addr)!=1||!tx.init(root,outbound)||!rx.init(root,!outbound))throw std::runtime_error("UDP video key initialization failed");
-        socket=::socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);readable=WSACreateEvent();sockaddr_in local{};local.sin_family=AF_INET;int length=sizeof(local);
+        sockaddr_in local{};local.sin_family=AF_INET;int length=sizeof(local);
+        if(inet_pton(AF_INET,local_address.c_str(),&local.sin_addr)!=1)throw std::runtime_error("UDP video requires the TCP local address");
+        socket=::socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);readable=WSACreateEvent();
         if(socket==INVALID_SOCKET||readable==WSA_INVALID_EVENT||bind(socket,reinterpret_cast<sockaddr*>(&local),sizeof(local))||
             getsockname(socket,reinterpret_cast<sockaddr*>(&local),&length)||WSAEventSelect(socket,readable,FD_READ)) {
             if(socket!=INVALID_SOCKET)closesocket(socket);socket=INVALID_SOCKET;if(readable!=WSA_INVALID_EVENT)WSACloseEvent(readable);readable=WSA_INVALID_EVENT;
@@ -159,8 +161,8 @@ struct DatagramVideo::Impl {
     }
 };
 
-DatagramVideo::DatagramVideo(const std::string& address,const Key& key,bool outbound,std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks):
-    impl_(std::make_unique<Impl>(address,key,outbound,std::move(progress),std::move(hooks))){}
+DatagramVideo::DatagramVideo(const std::string& address,const Key& key,bool outbound,std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks,const std::string& local_address):
+    impl_(std::make_unique<Impl>(address,key,outbound,std::move(progress),std::move(hooks),local_address)){}
 DatagramVideo::~DatagramVideo()=default;
 uint16_t DatagramVideo::port()const{return impl_->local_port;}
 bool DatagramVideo::offer(uint16_t port){

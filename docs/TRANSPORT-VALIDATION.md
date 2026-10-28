@@ -36,3 +36,33 @@ cancellation), managed/WinUI checks, isolated GPU presentation and source
 freshness checks, then sequential real-peer measurements. Never substitute a
 successful watchdog recovery or a green local queue metric for fresh-picture
 throughput and frame-gap measurements.
+
+## Live observations, 2026-10-28
+
+After 0.8.1 OTA, DEVG's nine installed native executables matched the released
+build hashes and its agent service was running. A read-only DEVR-to-DEVG preview
+used authenticated UDP throughout a 90-second run:
+
+| Observation | 0.7.11 TCP run | 0.8.1 UDP run |
+| --- | ---: | ---: |
+| Received frames / 90 s | 285 | 2467 |
+| Mean received frames/s | 3.17 | 27.41 |
+| First observed picture from tool start | 11.797 s | 3.750 s |
+| Largest observed change-to-change gap | 9.031 s | 0.094 s |
+
+These runs used uncontrolled live desktop content at different times, not an
+identical-motion A/B benchmark. Presentation changes are polled by a developer
+tool; their counts and gaps are not direct physical-scanout instrumentation.
+0.8.1 reported zero sequence gaps, queue overflows, age expirations, source
+discards or media errors. A separate source-only receiver confirmed a 60 Hz
+negotiated cap with no pressure and zero send-credit waiting; actual acquisition
+and encoding were producing roughly 25-31 fps on that desktop. This does not
+prove sustained 60 Hz motion, local-USB latency, or loss-free behavior forever.
+Installed localhost read-only delivery received 1180 frames in 20 s (59 fps).
+
+VI initially fell back to TCP. An authenticated generated UDP measurement to its
+secondary address received zero accepted packets, while a local diagnostic
+wrapper observed datagrams arriving from its primary address. Targeting that
+primary address instead delivered 417/417 packets at 2 Mbps. This isolated the
+wildcard source-address selection corrected in 0.8.2; no endpoint validation was
+relaxed. Different-address loopback tests validate explicit local binding.

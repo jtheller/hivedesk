@@ -12,7 +12,7 @@ int self_test(){
     int size=sizeof(address);if(bind(probe,reinterpret_cast<sockaddr*>(&address),sizeof(address))||getsockname(probe,reinterpret_cast<sockaddr*>(&address),&size)){closesocket(probe);WSACleanup();return 1;}
     const auto port=ntohs(address.sin_port);closesocket(probe);WSACleanup();
     hive::Transport server,client;std::string error,peer;const auto key=hive::Transport::generate_group_key();
-    if(!server.start({"path-server","Path server",key,port,false,true}, {},error)||!client.start({"path-client","Path client",key,0,false,true},{},error)||!client.connect("127.0.0.1",port,peer,error)){std::printf("FAIL setup %s\n",error.c_str());return 1;}
+    if(!server.start({"path-server","Path server",key,port,false,true}, {},error)||!client.start({"path-client","Path client",key,0,false,true},{},error)||!client.connect("127.0.0.2",port,peer,error)){std::printf("FAIL setup %s\n",error.c_str());return 1;}
     for(bool udp:{false,true}){
         hive::PathProbeResult result;
         if(!client.measure_path(peer,udp,2000000,1000,result,error)||result.received_packets<150||result.received_packets>result.sent_packets||result.source_elapsed_us<900000){std::printf("FAIL %s %s sent=%llu received=%llu\n",udp?"UDP":"TCP",error.c_str(),result.sent_packets,result.received_packets);return 1;}

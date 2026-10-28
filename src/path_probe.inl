@@ -44,6 +44,7 @@ bool dispatch_probe(Conn& c,uint8_t type,Reader& r){
             uint16_t local_port=0;
             if(mode){
                 udp.s=::socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);sockaddr_in local{};local.sin_family=AF_INET;int size=sizeof(local);DWORD timeout=100;
+                if(inet_pton(AF_INET,c.local_ipv4().c_str(),&local.sin_addr)!=1)return;
                 if(udp.s==INVALID_SOCKET||bind(udp.s,reinterpret_cast<sockaddr*>(&local),sizeof(local))||getsockname(udp.s,reinterpret_cast<sockaddr*>(&local),&size))return;
                 setsockopt(udp.s,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<char*>(&timeout),sizeof(timeout));local_port=ntohs(local.sin_port);
             }
