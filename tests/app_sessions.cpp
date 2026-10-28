@@ -27,7 +27,9 @@ int probe(){
     std::thread producer([&]{while(!stop){for(auto& p:peers){std::lock_guard lock(p.mutex);if(p.remaining&&p.net.frame_ready(p.client)){auto f=encoded;f.session=p.session;f.sequence=p.sequence++;f.capture_time_us=f.source_ready_us=0;if(p.net.send_frame(p.client,f))--p.remaining;}}Sleep(5);}});
     std::thread driver([&]{
         HWND owner=nullptr,panel=nullptr;while(!stop&&!(owner=FindWindowW(L"HiveDesk.Owner",nullptr)))Sleep(5);if(stop)return;
-        panel=FindWindowW(L"HiveDesk.Switcher",nullptr);Sleep(500);
+        // Owner is created before the switcher. Do not keep a null HWND for
+        // the entire run when GPU/window setup yields between those creates.
+        while(!stop&&!(panel=FindWindowW(L"HiveDesk.Switcher",nullptr)))Sleep(5);if(stop)return;Sleep(500);
         SendMessageW(owner,WM_APP+41,0,reinterpret_cast<LPARAM>(new std::function<void()>([&]{KillTimer(owner,1);SendMessageW(owner,WM_APP+48,1,0);})));
         for(auto& p:peers){std::string id,error;for(unsigned attempt=0;attempt<30&&!stop;++attempt){if(p.net.connect("127.0.0.1",48194,id,error))break;Sleep(100);}}
 
