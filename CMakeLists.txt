@@ -191,6 +191,7 @@ add_test(NAME shell_video COMMAND HiveDeskShellVideoCheck)
 set_tests_properties(shell_video PROPERTIES TIMEOUT 35)
 add_executable(HiveDeskAppSessionsCheck tests/app_sessions.cpp src/shell.cpp)
 target_link_libraries(HiveDeskAppSessionsCheck PRIVATE hive_core shell32 dcomp d2d1 msimg32)
+target_link_options(HiveDeskAppSessionsCheck PRIVATE "/MAP:${CMAKE_BINARY_DIR}/HiveDeskAppSessionsCheck.map")
 add_test(NAME app_sessions COMMAND HiveDeskAppSessionsCheck)
 set_tests_properties(app_sessions PROPERTIES TIMEOUT 70)
 # Explicit no-input/no-activation generated-content probe, requires visible DWM.
