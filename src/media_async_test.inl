@@ -132,11 +132,19 @@ bool media_async_decode_self_test(std::string& report){
             live.value=CreateWindowExW(0,name,L"HiveDesk hidden live viewer",WS_POPUP,-32000,-32000,512,384,nullptr,nullptr,cls.hInstance,nullptr);
             require(live.value&&!IsWindowVisible(live.value),"Create independent hidden viewer window");
             MediaViewer viewer;std::string error;if(!viewer.open(live.value,error))throw std::runtime_error(error);
-            auto frame=frames[0];frame.capture_time_us=now_us();frame.source_ready_us=0;frame.session=0;viewer.submit(std::move(frame));
+            auto frame=frames[0];uint64_t sequence=0,last_sent=0;
+            auto source_tick=[&](bool initial=false){
+                const auto now=now_us();const auto feedback=viewer.feedback();
+                // Match the real host's bounded IDR recovery instead of making
+                // a single cold-start frame immortal or weakening freshness.
+                if(initial||(feedback.recover&&now-last_sent>=300000)){
+                    frame.sequence=sequence++;frame.capture_time_us=now;frame.source_ready_us=0;frame.session=0;viewer.submit(frame);last_sent=now;
+                }
+            };source_tick(true);
             const auto deadline=Clock::now()+std::chrono::seconds(2);
-            while(!viewer.has_frame()&&Clock::now()<deadline){MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(2);}
+            while(!viewer.has_frame()&&Clock::now()<deadline){MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}source_tick();Sleep(2);}
             require(viewer.has_frame()&&!IsWindowVisible(live.value),"Hidden viewer failed prepared-pixel handshake");
-            while(!viewer.has_presented_frame()&&Clock::now()<deadline){MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(2);}
+            while(!viewer.has_presented_frame()&&Clock::now()<deadline){MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}source_tick();Sleep(2);}
             require(viewer.has_presented_frame(),"First submitted-image gate depended on revealing the waiting cover");
             const auto began=Clock::now();viewer.close();require(Clock::now()-began<std::chrono::seconds(1),"Viewer shutdown failed to join workers");
             require(!viewer.has_presented_frame(),"Closed viewer retained an eligible first-frame signal");

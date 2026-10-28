@@ -9,6 +9,19 @@ namespace hive { EncodedFrame media_generated_test_frame(); }
 namespace {
 void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 void pump(DWORD ms){const auto end=GetTickCount64()+ms;do{MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(1);}while(GetTickCount64()<end);}
+void prepare_warm(hive::MediaViewer& viewer,hive::EncodedFrame image){
+    // Real hosts answer recovery feedback with a fresh IDR (300 ms debounce).
+    // A one-shot fake source otherwise strands the viewer when cold GPU setup
+    // exceeds the unchanged 50 ms frame-age policy. Keep the 2 s readiness bound.
+    uint64_t sequence=0;ULONGLONG sent=0;
+    auto send=[&]{image.sequence=sequence++;image.capture_time_us=image.source_ready_us=0;viewer.submit(image);sent=GetTickCount64();};send();
+    for(unsigned i=0;i<80&&!viewer.has_frame();++i){
+        pump(25);const auto feedback=viewer.feedback();
+        if(!viewer.has_frame()&&feedback.recover&&GetTickCount64()-sent>=300){
+            std::printf("Generated warm source: responding to recovery; age_expired=%llu\n",static_cast<unsigned long long>(feedback.age_expired));send();
+        }
+    }
+}
 int probe(){
     USEROBJECTFLAGS flags{};DWORD bytes=0;
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic UI events on interactive station");
@@ -31,7 +44,7 @@ int probe(){
     hive::MediaViewer warm_viewer;
     auto warm_open=std::async(std::launch::async,[&]{std::string why;require(warm_viewer.open(warm_surface->window,why,{},true),why.c_str());});
     while(warm_open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);warm_open.get();
-    warm_viewer.submit(encoded);for(unsigned i=0;i<80&&!warm_viewer.has_frame();++i)pump(25);
+    prepare_warm(warm_viewer,encoded);
     if(!warm_viewer.has_frame()){
         const auto d=warm_viewer.diagnostics();const auto f=warm_viewer.feedback();
         std::fprintf(stderr,"Warm failure diagnostics: %s; expired=%llu discarded=%llu skipped=%llu recover=%d map_us=%u convert_us=%u arrival_age_us=%u\n",
@@ -51,7 +64,7 @@ int probe(){
         hive::MediaViewer unselected;
         auto open=std::async(std::launch::async,[&]{std::string why;require(unselected.open(warm_surface->window,why,{},true),why.c_str());});
         while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
-        unselected.submit(encoded);for(unsigned i=0;i<80&&!unselected.has_frame();++i)pump(25);
+        prepare_warm(unselected,encoded);
         require(unselected.has_frame()&&!unselected.has_presented_frame(),"Unselected preparation failed");
         auto close=std::async(std::launch::async,[&]{unselected.close();});
         while(close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);close.get();
