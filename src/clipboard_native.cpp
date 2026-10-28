@@ -191,7 +191,21 @@ bool ClipboardDesktop::start(std::function<void(Clipboard)> changed,std::string&
         if(p.object){if(OleIsCurrentClipboard(p.object)==S_OK){if(p.cache->offer.images.empty()&&p.cache->offer.files.empty())OleFlushClipboard();else OleSetClipboard(nullptr);}p.object->Release();p.object=nullptr;}if(SUCCEEDED(hr))OleUninitialize();
     });std::unique_lock lock(p.mutex);p.ready.wait(lock,[&]{return p.started;});error=p.error;return error.empty();
 }
-void ClipboardDesktop::stop(){auto& p=*impl_;{std::lock_guard lock(p.mutex);if(p.stopped)return;p.stopped=true;if(p.window)PostMessageW(p.window,WM_CLOSE,0,0);}p.ready.notify_all();if(p.thread.joinable())p.thread.join();}
+void ClipboardDesktop::stop(){
+    auto& p=*impl_;{std::lock_guard lock(p.mutex);if(p.stopped)return;p.stopped=true;if(p.window)PostMessageW(p.window,WM_CLOSE,0,0);}p.ready.notify_all();
+    if(p.thread.joinable()){
+        // OLE clipboard teardown can synchronously message another window in
+        // this process. A blind join from the shell thread deadlocks that send.
+        // Dispatch sent messages only; do not restart normal UI/input actions.
+        const HANDLE worker=p.thread.native_handle();
+        while(WaitForSingleObject(worker,0)==WAIT_TIMEOUT){
+            const auto result=MsgWaitForMultipleObjectsEx(1,&worker,100,QS_SENDMESSAGE,MWMO_INPUTAVAILABLE);
+            if(result==WAIT_OBJECT_0)break;
+            MSG message{};PeekMessageW(&message,nullptr,0,0,PM_NOREMOVE);
+        }
+        p.thread.join();
+    }
+}
 bool ClipboardDesktop::busy()const{std::lock_guard lock(impl_->mutex);return *impl_->activity!=0||!impl_->jobs.empty();}
 Clipboard ClipboardDesktop::cached()const{
     auto& p=*impl_;std::unique_lock lock(p.mutex);

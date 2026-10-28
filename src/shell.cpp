@@ -1002,8 +1002,8 @@ struct Shell::Impl {
     }
     ~Impl() {
         taskbar_peek.reset();
-        clipboard_desktop.stop();
         shutting_down=true;++generation;publish_input();input_capture.stop();ReleaseCapture();ClipCursor(nullptr);
+        clipboard_desktop.stop();
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
         if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
