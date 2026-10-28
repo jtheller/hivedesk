@@ -258,9 +258,9 @@ private:
         const bool update_pending=hive::update::pending();
         const auto now=GetTickCount64();
         std::erase_if(retiring_warm_,[](const auto& warm){return warm->retired.load();});
-        if(const auto host=hosting_.load();host&&host->warming&&(update_pending||now>host->warm_until)){
+        if(const auto host=hosting_.load();host&&host->warming&&((update_pending&&!host->previewing)||now>host->warm_until)){
             const std::lock_guard lock(host_mutex_);
-            if(hosting_.load()==host&&host->warming&&(update_pending||now>host->warm_until)){
+            if(hosting_.load()==host&&host->warming&&((update_pending&&!host->previewing)||now>host->warm_until)){
                 host->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(host->peer,host->session);
             }
         }
@@ -273,7 +273,7 @@ private:
                 const bool wanted=std::any_of(visible.begin(),visible.end(),[&](const auto& surface){return surface==warm->surface;});
                 if(wanted)warm->last_visible=now;
                 if(warm->done&&warm->viewer->stats().starts_with("Media error:"))warm->failed=true;
-                if(update_pending||warm->failed||now-warm->last_visible>2000){
+                if((update_pending&&!warm->peeking)||warm->failed||now-warm->last_visible>2000){
                     if(warm->failed)warm_retry_[it->first]=now+2000;
                     expired.push_back(warm);it=warm_views_.erase(it);
                 }else ++it;
@@ -283,7 +283,7 @@ private:
         std::vector<std::shared_ptr<WarmView>> preview_candidates;
         {std::lock_guard lock(warm_mutex_);for(const auto& [id,warm]:warm_views_)preview_candidates.push_back(warm);}
         for(const auto& warm:preview_candidates){
-            const bool wanted=!update_pending&&warm->surface->peer==peek_peer&&!warm->failed&&!warm->abandoned;
+            const bool wanted=(!update_pending||warm->peeking)&&warm->surface->peer==peek_peer&&!warm->failed&&!warm->abandoned;
             if(warm->peeking&&(!wanted||warm->peek_epoch!=peek_epoch)){
                 transport_.preview(warm->surface->peer,warm->settings.session,false);warm->peeking=false;warm->peek_revealed=false;
             }
@@ -303,7 +303,6 @@ private:
                 }
             }
         }
-        if(update_pending)return;
         std::stable_sort(visible.begin(),visible.end(),[&](const auto& a,const auto& b){return (a->peer==peek_peer)>(b->peer==peek_peer);});
         for(const auto& surface:visible){
             {const std::lock_guard lock(queue_mutex_);if(closing_||!queue_.empty())break;}
@@ -324,7 +323,7 @@ private:
                 }
                 continue;
             }
-            if(preparing_||warm_retry_[surface->peer]>now||!hive::media_prewarm_capacity())continue;
+            if(update_pending||preparing_||warm_retry_[surface->peer]>now||!hive::media_prewarm_capacity())continue;
             if(std::any_of(retiring_warm_.begin(),retiring_warm_.end(),[&](const auto& old){return old->surface==surface&&!old->retired;}))continue;
             hive::StreamSettings settings;settings.session=++session_sequence_;
             settings.receiver_millihz=hive::primary_refresh_millihz();settings.warm=true;
@@ -345,7 +344,7 @@ private:
             const std::lock_guard queue_lock(queue_mutex_);
             const auto host=hosting_.load();
             if(clipboard_transfer_.busy()||shell_.clipboard_busy())return;
-            if(!hive::update::idle_for_update(bool(active_.load()),bool(host),reconnect_.current(generation_),!queue_.empty(),host&&host->warming))return;
+            if(!hive::update::idle_for_update(bool(active_.load())||peek_requested_,bool(host),reconnect_.current(generation_),!queue_.empty(),host&&host->warming&&!host->previewing))return;
             if(!update_pending){
                 if(!shell_.prepare_video_restart())return;
                 try {
@@ -466,8 +465,9 @@ private:
             if(closing_)return;
             const std::lock_guard lock(host_mutex_);
             if(closing_)return;
-            if(updating_||(settings.warm&&hive::update::pending())){transport_.end_stream(peer,settings.session);return;}
             const auto old=hosting_.load();
+            const bool preview_renewal=old&&!old->revoked&&old->warming&&old->previewing&&old->peer==peer&&old->session==settings.session&&old->connection==transport_.connection_token(peer);
+            if(updating_||(settings.warm&&hive::update::pending()&&!preview_renewal)){transport_.end_stream(peer,settings.session);return;}
             if(settings.warm){
                 if(old){
                     if(!old->revoked&&old->peer==peer&&old->session==settings.session&&old->connection==transport_.connection_token(peer)){
@@ -478,7 +478,7 @@ private:
                     return;
                 }
             }else if(old&&old->warming&&!old->revoked&&old->peer==peer&&old->session==settings.session){
-                old->warming=false;apply_handoff(peer);
+                old->warming=false;old->previewing=false;apply_handoff(peer);
                 if(!host_.activate()){old->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,settings.session);return;}
                 std::string name=peer;for(const auto& item:transport_.peers())if(item.id==peer)name=item.name;
                 telemetry_.select(MonitorSide::Host,peer,settings.session,name);shell_.observe_cursor(peer);
@@ -530,7 +530,7 @@ private:
             // a host, preempts a controller or grants clipboard/input authority.
             if(closing_||!target||target->revoked||!target->warming||target->peer!=peer||target->session!=session||target->connection!=transport_.connection_token(peer))return;
             if(!host_.preview(enabled)){target->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,session);}
-            else target->warm_until=GetTickCount64()+10000;
+            else {target->previewing=enabled;target->warm_until=GetTickCount64()+10000;}
         };
         callbacks.cancel_warm=[this](const std::string& peer,uint64_t session){
             const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
