@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -139,6 +141,10 @@ struct EncodedFrame {
     // Describes this image, never the newest asynchronously sampled cursor.
     // Unknown preserves the separate-cursor behavior of legacy peers.
     CursorComposition cursor_composition = CursorComposition::Unknown;
+    // Receiver-local observations, never serialized or accepted from the peer.
+    // Packet assembly is wire service time, not a compressed playback queue.
+    uint64_t receive_started_us = 0, receive_completed_us = 0;
+    std::shared_ptr<const std::atomic<uint64_t>> receive_progress;
 };
 // Allow bounded, intrinsic GPU work without confusing it with queued playback.
 // A one-second source job remains an absolute upper bound, never permission to

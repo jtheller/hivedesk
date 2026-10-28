@@ -106,6 +106,8 @@ private:
     uint64_t output_ready_epoch_ = 0, output_ready_sequence_ = 0;
     bool recovery_pending_ = false;
     uint64_t recovery_since_ = 0;
+    uint64_t network_bytes_=0,network_progress_at_=0;
+    bool network_observed_=false;
     uint64_t sequence_gaps_=0,age_expired_=0,queue_overflows_=0,transit_extra_=0;
     uint64_t backlog_at_=0,backlog_us_=0;
     enum class RecoveryReason {Gap,Age,Overflow};
@@ -114,6 +116,12 @@ private:
     }
     uint64_t age(const Pending& pending, uint64_t now) const {
         const auto local = now >= pending.arrival ? now-pending.arrival : 0;
+        if(pending.frame.receive_started_us){
+            // Keep pre-packet transit/backlog evidence; exclude only the
+            // measured assembly of this packet. Local decoder/Present time
+            // still consumes exactly the same 50 ms freshness budget.
+            return transit_.extra_age(transport_origin(pending.frame),pending.frame.receive_started_us)+local;
+        }
         return std::max(local,transit_.extra_age(transport_origin(pending.frame),now));
     }
     void begin_recovery(uint64_t now) {
@@ -149,6 +157,7 @@ public:
         frames_.clear(); transit_ = {}; bound_ = sequenced_ = ready_timing_ = false;
         waiting_keyframe_ = true; recover_ = presentation_refresh_ = false;
         recovery_pending_ = false; recovery_since_ = 0;
+        network_bytes_=network_progress_at_=0;network_observed_=false;
         session_ = last_sequence_ = last_capture_ = last_ready_ = discarded_ = 0; ++epoch_;
         output_ready_epoch_=output_ready_sequence_=0;
         sequence_gaps_=age_expired_=queue_overflows_=transit_extra_=0;
@@ -165,7 +174,9 @@ public:
         // A stream chooses its clock basis once. Do not let missing/changing
         // provenance (or a malformed future completion) re-anchor a stale tail.
         // Legacy sessions keep the original capture-based policy throughout.
-        if (!valid_frame_timing(frame) || (ready_timing_ && !frame.source_ready_us) ||
+        if ((bool(frame.receive_started_us)!=bool(frame.receive_completed_us))||
+            (frame.receive_started_us&&(frame.receive_completed_us<frame.receive_started_us||frame.receive_completed_us>now))||
+            !valid_frame_timing(frame) || (ready_timing_ && !frame.source_ready_us) ||
             (last_ready_ && frame.source_ready_us && frame.source_ready_us < last_ready_)) {
             invalidate(now,RecoveryReason::Age); ++discarded_; return false;
         }
@@ -181,9 +192,11 @@ public:
         // queue budget. A slow valid encode therefore cannot masquerade as an
         // old TCP burst; no timestamps or transit floor are reset on recovery.
         const auto origin=transport_origin(frame);
-        transit_.observe(origin,now);
-        transit_extra_=transit_.extra_age(origin,now);
-        Pending pending{std::move(frame),now,epoch_};
+        const auto arrived=frame.receive_started_us?frame.receive_started_us:now;
+        const auto completed=frame.receive_completed_us?frame.receive_completed_us:now;
+        transit_.observe(origin,arrived);
+        transit_extra_=transit_.extra_age(origin,arrived);
+        Pending pending{std::move(frame),completed,epoch_};
         if (age(pending,now) > MaxAgeUs) {
             invalidate(now,RecoveryReason::Age); ++discarded_; return false;
         }
@@ -253,8 +266,18 @@ public:
         presentation_refresh_=recover_=recovery_pending_=false;recovery_since_=0;return true;
     }
     bool recovery_pending() const{return recovery_pending_;}
+    void network_progress(uint64_t session,uint64_t bytes,uint64_t now){
+        if(!bound_||session!=session_)return;
+        if(network_observed_&&bytes>network_bytes_)network_progress_at_=now;
+        network_bytes_=bytes;network_observed_=true;
+    }
     bool recovery_expired(uint64_t now) const {
-        return recovery_pending_&&now>=recovery_since_&&now-recovery_since_>=RecoveryTimeoutUs;
+        if(!recovery_pending_||now<recovery_since_)return false;
+        // Slow authenticated-frame assembly can outlast two seconds. Renew
+        // only on new bytes for this viewing session, never on control/HUD
+        // traffic or repeated polls. A finite ceiling bounds a trickling peer.
+        const auto progress=std::max(recovery_since_,network_progress_at_);
+        return now-recovery_since_>=30000000||(now>=progress&&now-progress>=RecoveryTimeoutUs);
     }
     bool empty() const { return frames_.empty(); }
     size_t size() const { return frames_.size(); }

@@ -87,11 +87,15 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                                 if(impl_->stop)break;
                                 if(!downstream_ready())continue;
                             }
-                            frame=completed.take(now_us());
+                            frame=completed.begin_delivery(now_us());
                             if(completed.needs_keyframe())request_refresh();
                         }
                         impl_->changed.notify_all();
-                        if(frame&&!impl_->stop){output(std::move(*frame));std::lock_guard lock(impl_->wait_mutex);++sent_frames;}
+                        if(frame){
+                            if(!impl_->stop)output(std::move(*frame));
+                            {std::lock_guard lock(impl_->wait_mutex);completed.finish_delivery();++sent_frames;}
+                            impl_->changed.notify_all();
+                        }
                     }
                 }catch(...){fail(std::current_exception());}});
                 log(std::string("Video pipeline: ")+(encoder.asynchronous()?"NVENC async events":"NVENC synchronous output worker")+", 4 IO slots / 2 in flight, bounded fresh-frame delivery.");
@@ -120,6 +124,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         rate_sample.qp_sum=rate_qp_sum;rate_sample.qp_samples=rate_qp_samples;
                         rate_sample.sent_frames=sent_frames;rate_sample.send_wait_us=total_send_wait;
                         send_ready=downstream_ready();
+                        completed.observe_credit(send_ready,now);
                         const bool recovery=completed.needs_keyframe()||impl_->keyframe.load();
                         slots_ready=completed.can_reserve()&&(!recovery||completed.reserved()==0);
                     }
@@ -230,7 +235,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                     {
                         std::lock_guard lock(impl_->wait_mutex);
                         if(impl_->stop)break;
-                        if((forced&&completed.reserved()!=0)||!completed.reserve_completion()){if(forced)impl_->keyframe=true;continue;}
+                        if(!downstream_ready()||(forced&&completed.reserved()!=0)||!completed.reserve_completion()){if(forced)impl_->keyframe=true;continue;}
                     }
                     bool submitted=false,completion_queued=false;
                     const auto sequence=impl_->sequence.next();

@@ -369,8 +369,40 @@ void recent_compressed_backlog_feedback() {
     require(!queue.push(picture(1,Source+10000,true),Local+90000)&&queue.feedback_queue_age(Local+90000)==0,
         "Stale TCP transit without local queued work became decoder capacity pressure");
 }
+void slow_packet_assembly_and_progress(){
+    hive::ViewerQueue q;
+    auto wire=[](uint64_t seq,uint64_t source,uint64_t start,uint64_t end,bool key){
+        auto f=completed_picture(seq,source,source+1000,key);
+        f.receive_started_us=start;f.receive_completed_us=end;return f;
+    };
+    require(q.push(wire(0,Source,Local,Local+10000000,true),Local+10000000),"Initial large IDR assembly rejected");
+    auto first=q.pop(Local+10000000);require(first&&q.mark_output_ready(*first,Local+10001000),"Large IDR never became ready");
+    require(q.push(wire(1,Source+11000000,Local+11000000,Local+11600000,false),Local+11600000),"Fresh slow-serialized P picture mistaken for queued playback");
+    auto next=q.pop(Local+11600000);require(next&&q.mark_output_ready(*next,Local+11601000),"Slow P picture did not render");
+    require(!q.output_fresh(*next,Local+11650001),"Wire timing excused a slow local decoder/Present");
+    // Assembly does not forgive time waiting BEHIND a previous packet.
+    require(!q.push(wire(2,Source+11020000,Local+11600000,Local+12200000,false),Local+12200000),"Wire timing hid an already-old TCP tail");
+    q.network_progress(7,100,Local+12200000);
+    q.network_progress(99,200,Local+12500000);
+    require(q.recovery_expired(Local+13650001),"Another session renewed recovery");
+    q.network_progress(7,200,Local+13000000);
+    require(!q.recovery_expired(Local+14000000),"New video bytes did not renew recovery");
+    q.network_progress(7,200,Local+14500000);
+    require(q.recovery_expired(Local+15000000),"Repeated counter poll renewed recovery without bytes");
+    q.network_progress(7,50,Local+15500000);
+    require(q.recovery_expired(Local+15500000),"Counter reset invented receive progress");
+    q.network_progress(7,100,Local+41000000);
+    require(q.recovery_expired(Local+41650001),"Trickling peer bypassed finite recovery ceiling");
+    q.reset();auto invalid=wire(0,Source,Local+1,Local,true);
+    require(!q.push(invalid,Local),"Reversed receiver timing accepted");
+    q.reset();invalid=wire(0,Source,Local,Local+100,true);
+    require(!q.push(invalid,Local),"Future receive completion accepted");
+    q.reset();invalid=wire(0,Source,0,Local,true);
+    require(!q.push(invalid,Local),"Partial receive timing accepted");
+}
 }
 int main(){try{
+    slow_packet_assembly_and_progress();
     service_samples_expire();present_gap_samples();normal_and_idle();prepared_picture_survives_new_compressed_arrival();worker_and_decoder_stalls();
     decoded_expiry_preserves_references();decoded_expiry_static_refresh_and_epochs();older_presenter_cannot_rearm_newer_ready_output();tcp_stall_and_burst();
     epochs_and_reference_gaps();session_and_legacy();slow_replay_and_clock_drift();bounded_recovery_requires_new_session();

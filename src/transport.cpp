@@ -175,8 +175,8 @@ bool send_all(SOCKET s, const uint8_t* p, size_t n) {
     while (n) { int sent = ::send(s, reinterpret_cast<const char*>(p), int((std::min)(n, size_t(16*1024))), 0); if (sent <= 0) return false; p += sent; n -= sent; }
     return true;
 }
-bool recv_all(SOCKET s, uint8_t* p, size_t n,std::atomic<uint64_t>* progress=nullptr) {
-    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (received <= 0) return false; p += received; n -= received; if(progress)progress->fetch_add(received,std::memory_order_relaxed); }
+bool recv_all(SOCKET s, uint8_t* p, size_t n,std::atomic<uint64_t>* progress=nullptr,uint64_t* first_byte=nullptr) {
+    while (n) { int received = ::recv(s, reinterpret_cast<char*>(p), int((std::min)(n, size_t(INT_MAX))), 0); if (received <= 0) return false; if(first_byte&&!*first_byte)*first_byte=transport_us(); p += received; n -= received; if(progress)progress->fetch_add(received,std::memory_order_relaxed); }
     return true;
 }
 bool send_blob(SOCKET s, const Bytes& b) { Bytes head; u32(head, uint32_t(b.size())); return send_all(s, head.data(), head.size()) && send_all(s, b.data(), b.size()); }
@@ -240,7 +240,9 @@ struct Transport::Impl {
         HANDLE video_wake = CreateEventW(nullptr,FALSE,FALSE,nullptr);
         std::atomic<unsigned> video_inflight{0};
         std::atomic<uint64_t> video_owned_bytes{0};
-        std::atomic<uint64_t> received_bytes{0};
+        std::shared_ptr<std::atomic<uint64_t>> received_bytes=std::make_shared<std::atomic<uint64_t>>(0);
+        bool video_credit=true; // queue_mutex; published after WSASend ownership.
+        uint64_t packet_started_us=0,packet_completed_us=0; // reader thread only
         VideoSendWindow video_send;
         InputSendWindow input_send;
         uint64_t input_receive_session=0,input_receive_sequence=0;
@@ -425,16 +427,24 @@ struct Transport::Impl {
                         owner->status("Video send made no new TCP payload progress for 2 s; reconnecting for a fresh desktop.");return;
                     }
                 }
+                bool gained_credit=false;
+                {
+                    std::lock_guard lock(queue_mutex);
+                    const bool credit=budget.admits(pending.size(),owned_bytes,1);
+                    gained_credit=credit&&!video_credit;video_credit=credit;
+                }
+                if(gained_credit)notify_ready();
                 if(pending.size()<budget.limit()){
                     std::optional<Bytes> payload;Clock::time_point queued_at{};bool taken=false;
                     {
                         std::lock_guard lock(queue_mutex);
-                        if(video&&budget.admits(pending.size(),owned_bytes,uint64_t(video->payload.size())+28)){taken=true;payload=take_video(Clock::now(),&queued_at);}
+                        if(video&&budget.admits(pending.size(),owned_bytes,uint64_t(video->payload.size())+28)){taken=true;payload=take_video(Clock::now(),&queued_at);video_credit=false;}
                     }
                     if(taken){
-                        if(!payload)request_fresh_frame();
-                        notify_ready();
-                        if(!payload)continue;
+                        if(!payload){
+                            {std::lock_guard lock(queue_mutex);video_credit=budget.admits(pending.size(),owned_bytes,1);}
+                            request_fresh_frame();notify_ready();continue;
+                        }
                         // Allocate the owner before posting: no container growth
                         // or moving OVERLAPPED storage after WSASend accepted it.
                         if(pending.empty())progress.reset(transport_us());
@@ -442,6 +452,8 @@ struct Transport::Impl {
                         if(!submit_video(*pending.back(),*payload,queued_at))return;
                         owned_bytes+=pending.back()->attempt.wire_bytes;video_owned_bytes=owned_bytes;
                         video_inflight=unsigned(pending.size());
+                        {std::lock_guard lock(queue_mutex);video_credit=budget.admits(pending.size(),owned_bytes,1);}
+                        notify_ready();
                         continue;
                     }
                 }
@@ -507,12 +519,14 @@ struct Transport::Impl {
             SOCKET s = socket.load(); return send_all(s,head.data(),head.size()) && send_all(s,cipher.data(),cipher.size()) && send_all(s,tag.data(),tag.size());
         }
         bool read_packet(Bytes& b) {
-            SOCKET s = socket.load();auto* progress=channel==1?&received_bytes:nullptr;
-            Bytes head(12); if (!recv_all(s,head.data(),head.size(),progress)) return false;
+            SOCKET s = socket.load();auto* progress=channel==1?received_bytes.get():nullptr;
+            packet_started_us=packet_completed_us=0;
+            Bytes head(12); if (!recv_all(s,head.data(),head.size(),progress,channel==1?&packet_started_us:nullptr)) return false;
             Reader r{head}; uint32_t n = r.dword(); uint64_t seq = r.qword();
             if (!n || n > (channel == 1 ? kMaxPacket : channel==2?128u:channel==3?ClipboardChunk+64:MaxNativeSnapshotBytes + 64) || rx_seq == UINT64_MAX || seq != rx_seq+1) return false;
             Bytes encrypted(n); std::array<uint8_t,16> tag{};
             if (!recv_all(s,encrypted.data(),encrypted.size(),progress) || !recv_all(s,tag.data(),tag.size(),progress) || !rx.crypt(false,head,encrypted,b,tag)) return false;
+            if(channel==1)packet_completed_us=transport_us();
             rx_seq = seq; return true;
         }
         void write_loop() {
@@ -889,6 +903,8 @@ struct Transport::Impl {
                 if(!valid_cursor_composition(frame.cursor_composition))return false;
             }
             if (!r.good || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384 || key > 1 || b.size()-r.at > kMaxFrame || b.size() == r.at) return false;
+            frame.receive_started_us=c.packet_started_us;frame.receive_completed_us=c.packet_completed_us;
+            frame.receive_progress=c.received_bytes;
             frame.data.assign(b.begin()+r.at,b.end()); if (callbacks.frame) callbacks.frame(c.peer.id,std::move(frame)); return true;
         }
         default: return false;
@@ -1049,7 +1065,7 @@ bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
     b.insert(b.end(),frame.data.begin(),frame.data.end()); return c->enqueue(std::move(b),frame.keyframe);
 }
 bool Transport::frame_ready(const std::string& peer) const {
-    auto c=impl_->find(peer,true);if(!c)return false;const std::lock_guard lock(c->queue_mutex);return !c->video.has_value();
+    auto c=impl_->find(peer,true);if(!c)return false;const std::lock_guard lock(c->queue_mutex);return c->ready&&!c->closed&&c->video_credit&&!c->video.has_value();
 }
 VideoSendDiagnostics Transport::video_send_diagnostics(const std::string& peer)const{
     const auto c=impl_->find(peer,true);if(!c)return {};
@@ -1071,7 +1087,7 @@ std::string Transport::tcp_diagnostics(const std::string& peer)const{
     return text;
 }
 uint64_t Transport::received_video_bytes(const std::string& peer)const{
-    const auto c=impl_->find(peer,true);return c?c->received_bytes.load(std::memory_order_relaxed):0;
+    const auto c=impl_->find(peer,true);return c?c->received_bytes->load(std::memory_order_relaxed):0;
 }
 bool Transport::send_feedback(const std::string& peer,const StreamFeedback& f) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||!valid_feedback(f))return false;
@@ -1294,19 +1310,23 @@ bool Transport::self_test(std::string& result) {
         auto channel=std::make_shared<Impl::Conn>(&owner,writer.s);writer.s=INVALID_SOCKET;
         Key key{};if(!channel->tx.init(key)){result="Slow video cipher setup failed";return false;}
         channel->channel=1;channel->ready=true;owner.running=true;
-        std::thread writing([&]{channel->write_video_loop();});
+        std::atomic<unsigned> returned_credit{0};
+        owner.callbacks.frame_ready=[&](const std::string&){std::lock_guard lock(channel->queue_mutex);if(channel->video_credit)++returned_credit;};
+        std::thread writing([&]{channel->write_video_loop(VideoTcpSample{true,140000,138000,65536,13090,262912,13090});});
         bool queued=channel->enqueue(payload,true);
-        Bytes wire(payload.size()+28);size_t offset=0;const auto video_began=Clock::now();
+        Bytes wire(payload.size()+28);size_t offset=0;const auto video_began=Clock::now();bool denied_credit=false;
         while(queued&&offset<wire.size()){
             Sleep(10);const auto count=recv(reader.s,reinterpret_cast<char*>(wire.data()+offset),int((std::min)(wire.size()-offset,size_t(16*1024))),0);
             if(count<=0)break;offset+=count;
+            if(offset<wire.size()/2){std::lock_guard lock(channel->queue_mutex);denied_credit=denied_credit||(!channel->video&& !channel->video_credit);}
         }
         const auto video_duration=Clock::now()-video_began;
         const auto finish=Clock::now()+std::chrono::seconds(1);
-        while(offset==wire.size()&&!channel->video_send.snapshot(transport_us()).completed_packets&&Clock::now()<finish)Sleep(1);
+        while(offset==wire.size()&&(!channel->video_send.snapshot(transport_us()).completed_packets||!returned_credit)&&Clock::now()<finish)Sleep(1);
         const auto stats=channel->video_send.snapshot(transport_us());
         channel->close();writing.join();owner.running=false;
-        if(!queued||offset!=wire.size()||video_duration<SessionStallTimeout||stats.completed_packets!=1||stats.failed_packets){
+        owner.callbacks.frame_ready={};
+        if(!queued||!denied_credit||!returned_credit||offset!=wire.size()||video_duration<SessionStallTimeout||stats.completed_packets!=1||stats.failed_packets){
             result="Slow progressing overlapped video was canceled or did not complete: bytes="+std::to_string(offset)+
                 " elapsed_ms="+std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(video_duration).count());return false;
         }
@@ -1963,7 +1983,7 @@ bool Transport::self_test(std::string& result) {
     bcb.start_stream = [&](const std::string&,const StreamSettings& s) { std::lock_guard lock(mutex); if(s.warm){got_warm=s.session==919&&s.receiver_millihz==100000;cv.notify_all();return;} if (state == 2 && s.fps == 237 && s.bitrate_mbps == 80) state = 3; else if (state == 3 && s.fps == 0 && s.bitrate_mbps == 80) got_uncapped = true; cv.notify_all(); };
     bcb.cancel_warm=[&](const std::string&,uint64_t session){std::lock_guard lock(mutex);got_warm_cancel=session==919;cv.notify_all();};
     bcb.stop_stream = [&](const std::string&) { std::lock_guard lock(mutex); got_stop = true; cv.notify_all(); };
-    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}); cv.notify_all(); };
+    bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}) && f.receive_started_us>1 && f.receive_completed_us>=f.receive_started_us; cv.notify_all(); };
     TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
     acb.host_ended=[&](const std::string& peer,uint64_t session){std::lock_guard lock(mutex);got_host_ended=peer=="test-b"&&session==91;cv.notify_all();};
     acb.diagnostics=[&](const std::string&,const SourceDiagnostics& d){std::lock_guard lock(mutex);const bool base=d.session==91&&d.encoded_millihz==59940&&d.encode_us==1234&&d.capture_wait_us==5678&&d.send_wait_us_per_second==9000&&d.feedback_age_us==11000&&d.network_extra_us==13000;if(d.encode_details)got_encode_diagnostics=base&&d.color_us==500&&d.nvenc_us==734&&d.encode_age_us==10000;else got_diagnostics=base;cv.notify_all();};
@@ -1994,7 +2014,7 @@ bool Transport::self_test(std::string& result) {
     cursor.width=cursor.height=cursor.hotspot_x=0;cursor.mask.clear();cursor.visible=false;
     ok=b.send_cursor("test-a",cursor)&&ok;
     ok = a.send_clipboard("test-b",L"Hive \x4e2d\x6587 \xd83d\xde80") && a.send_input("test-b",{InputKind::Key,30,0,0}) && a.request_stream("test-b",{237,80}) && a.request_stream("test-b",{0,80}) && ok;
-    EncodedFrame frame; frame.width = 1920; frame.height = 1080; frame.sequence = 42; frame.capture_time_us = 123456; frame.source_ready_us = 124500; frame.session = 77; frame.keyframe = true; frame.cursor_composition=CursorComposition::NoSeparate; frame.data = {0,0,0,1,42,99};
+    EncodedFrame frame; frame.width = 1920; frame.height = 1080; frame.sequence = 42; frame.capture_time_us = 123456; frame.source_ready_us = 124500; frame.session = 77; frame.keyframe = true; frame.cursor_composition=CursorComposition::NoSeparate; frame.data = {0,0,0,1,42,99}; frame.receive_started_us=1;frame.receive_completed_us=UINT64_MAX;
     const auto token_before_kick=a.connection_token("test-b");
     ok = ok && a.send_frame("test-b",frame) && b.send_clipboard("test-a",L"return") && b.end_stream("test-a",91); a.stop_stream("test-b");
     {

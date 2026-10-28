@@ -17,7 +17,19 @@ public:
     // the completion in transit after Encoder::receive releases its GPU slot,
     // until push_reserved takes the caller's queue lock. Counting the encoder's
     // in-flight jobs separately would miss that interval and allow overflow.
-    bool can_reserve() const{return frames_.size()+reserved_<capacity;}
+    bool can_reserve() const{return frames_.size()+reserved_+size_t(delivering_)<(serial_?1:capacity);}
+    // Only sustained downstream blocking reduces GPU look-ahead. A fast LAN
+    // retains both jobs; after recovery require five seconds without a long wait before
+    // speculating again. All fields share the caller's pipeline mutex.
+    void observe_credit(bool ready,uint64_t now){
+        if(serial_&&now>=serial_until_)serial_=false;
+        if(!ready){
+            if(!blocked_)blocked_=now;
+            if(now>=blocked_&&now-blocked_>=max_age_us){serial_=true;serial_until_=now+5000000;}
+        }else blocked_=0;
+    }
+    std::optional<EncodedFrame> begin_delivery(uint64_t now){auto frame=take(now);delivering_=frame.has_value();return frame;}
+    void finish_delivery(){delivering_=false;}
     size_t reserved() const{return reserved_;}
     bool reserve_completion(){if(!can_reserve())return false;++reserved_;return true;}
     void cancel_completion(){if(!reserved_)throw std::logic_error("Missing source completion reservation");--reserved_;}
@@ -55,5 +67,7 @@ private:
     bool waiting_keyframe_=true;
     uint64_t discarded_=0;
     size_t reserved_=0;
+    bool delivering_=false,serial_=false;
+    uint64_t blocked_=0,serial_until_=0;
 };
 }

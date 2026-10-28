@@ -32,6 +32,9 @@ int main(){try{
     budget.observe({true,100000,100000,UINT32_MAX,UINT32_MAX,UINT32_MAX,0});
     require(budget.bytes()==hive::VideoSendBudget::MaximumBytes&&!budget.admits(32,32,1),"Hard ownership bound ignored");
     require(!budget.admits(3,UINT64_MAX,UINT64_MAX),"Byte admission overflow");
+    budget.observe({true,140000,138000,65536,13090,262912,13090});
+    require(budget.admits(0,0,1200000)&&!budget.admits(1,1200000,1),"Slow path queued another frame behind a large IDR");
+    require(budget.admits(1,1000,1000)&&!budget.admits(2,13090,1),"Small high RTT packets lost their byte budget");
     budget.observe({true,UINT32_MAX,UINT32_MAX,1000000,1000000,1000000,0});
     require(!budget.adaptive(),"Invalid RTT sentinel expanded the window");
     budget.observe({});require(!budget.admits(3,300000,1),"Lost TCP observation retained expanded credit");

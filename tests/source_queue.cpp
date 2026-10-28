@@ -56,5 +56,17 @@ int main(){try{
     require(!timed.push(complete,3400001),"Source completion preceding capture accepted");
     complete.sequence=4;complete.source_ready_us=3401000;
     require(!timed.push(complete,3400999),"Future completion entered local delivery queue");
-    std::puts("PASS source output queue: two-frame bound, reserved GPU completions including transit, ordered P bursts without overflow/IDR, canceled submit, age expiry and fresh-IDR recovery without catch-up playback.");return 0;
+    hive::SourceFrameQueue paced;
+    require(paced.push(frame(0,5000000,true),5000010)&&paced.begin_delivery(5000020).has_value(),"Delivery handoff setup failed");
+    require(paced.reserve_completion()&&!paced.can_reserve(),"Output handoff released its slot before downstream took ownership");
+    paced.cancel_completion();
+    paced.finish_delivery();require(paced.can_reserve(),"Output handoff leaked credit");
+    paced.observe_credit(false,5000100);paced.observe_credit(false,5100100);
+    require(paced.reserve_completion()&&!paced.can_reserve(),"Sustained blocked output still admitted speculative second GPU job");
+    paced.cancel_completion();paced.observe_credit(true,5200100);
+    require(paced.reserve_completion()&&!paced.can_reserve(),"One ready notification prematurely restored speculative work");
+    paced.cancel_completion();paced.observe_credit(false,9000000);paced.observe_credit(true,9001000);
+    paced.observe_credit(true,10100100);
+    require(paced.reserve_completion()&&paced.reserve_completion()&&!paced.can_reserve(),"Healthy recovery failed to restore asynchronous GPU capacity");
+    std::puts("PASS source output queue: bounded GPU reservations, atomic delivery handoff, slow-output serialization and healthy capacity recovery, age expiry without catch-up playback.");return 0;
 }catch(const std::exception& e){std::printf("FAIL source output queue: %s\n",e.what());return 1;}}

@@ -1081,6 +1081,7 @@ struct MediaViewer::Impl {
     mutable std::mutex mutex;
     std::condition_variable changed;
     ViewerQueue frames;
+    std::shared_ptr<const std::atomic<uint64_t>> network_progress;
     bool stopping = true, displayed = false, present_enabled = true;
     std::shared_ptr<ViewerComposition> composition;
     std::atomic<bool> display_cadence=false;
@@ -1095,6 +1096,10 @@ struct MediaViewer::Impl {
     uint64_t receive_sample_at=0;
     DiagnosticWindow<4> live_window;std::array<uint64_t,4> live_totals{};
     void sync_queue() {
+        // The counter belongs to the exact video connection which delivered
+        // this session. Poll locally without UI/lifecycle or transport locks;
+        // reconnecting cannot substitute a different socket's byte progress.
+        if(network_progress)frames.network_progress(feedback.session,network_progress->load(std::memory_order_relaxed),now_us());
         feedback.recover=frames.recovering();diagnostics.discarded=frames.discarded();
         if(stopping)return;
         // A genuine sustained encoder/transport latency change cannot be
@@ -1330,11 +1335,12 @@ void MediaViewer::submit(EncodedFrame frame) {
     const auto now=now_us();impl_->feedback.session=frame.session;impl_->feedback.capture_time_us=frame.capture_time_us;impl_->last_arrival=now;
     impl_->diagnostics.session=frame.session;++impl_->received_count;++impl_->live_totals[0];impl_->live_totals[3]+=frame.data.size();impl_->received_bytes+=frame.data.size();
     ++impl_->feedback.received_frames;impl_->feedback.received_bytes+=frame.data.size();
+    impl_->network_progress=frame.receive_progress;
     const bool queued=impl_->frames.push(std::move(frame),now);impl_->sync_queue();
     if(queued||impl_->frames.recovery_pending())impl_->changed.notify_one();
 }
 void MediaViewer::request_stop() {
-    { std::lock_guard guard(impl_->mutex); impl_->stopping = true; impl_->frames.reset();impl_->cursor={}; }
+    { std::lock_guard guard(impl_->mutex); impl_->stopping = true; impl_->frames.reset();impl_->network_progress.reset();impl_->cursor={}; }
     impl_->changed.notify_all();
 }
 void MediaViewer::close() {
