@@ -644,8 +644,10 @@ struct Shell::Impl {
         publish_input();
     }
     int card_at(POINT p) const {
+        // The compact hot-corner preview owns the top/left screen edges too.
+        // Its visual inset must not force a diagonal move before quick swap.
+        if(panel_mode==1)return p.x>=0&&p.x<panel_width-px(12)&&p.y>=0&&p.y<px(12)+tile_height()?preview_index():-1;
         if(p.x<px(12)||p.x>=panel_width-px(12)||p.y<px(12))return -1;
-        if(panel_mode==1)return p.y<px(12)+tile_height()?preview_index():-1;
         const int row=(p.y-px(12))/tile_stride();
         if(row>=visible_tiles()||(p.y-px(12))%tile_stride()>=tile_height())return -1;
         const int index=row+scroll;return index<=static_cast<int>(peers.size())?index:-1;
@@ -1125,6 +1127,7 @@ Shell::~Shell(){close();}
 void Shell::close(){if(impl_){delete impl_;impl_=nullptr;log("Shell shutdown: complete");}}
 #ifdef HIVEDESK_SHELL_TEST
 #include "../tests/shell_taskbar_regression.inc"
+#include "../tests/shell_corner_regression.inc"
 #endif
 bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks callbacks,std::string& error){return impl_->create(instance,config,std::move(callbacks),error);}
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
