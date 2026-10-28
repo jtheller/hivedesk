@@ -22,6 +22,8 @@ int probe(){
     }
     for(int cycle=0;cycle<8;++cycle){
         const bool topmost=cycle%2!=0;
+        const bool fullscreen=cycle>=4;
+        SetWindowPos(viewer,fullscreen?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowPos(tray,topmost?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowPos(panel,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         const HWND previous=GetWindow(tray,GW_HWNDPREV);RECT before{};GetWindowRect(tray,&before);
@@ -30,6 +32,7 @@ int probe(){
         for(int tick=0;tick<8;++tick)peek.tick();
         require(peek.active(),"timer sampling revoked the latched taskbar lease");
         peek.leave(cycle%2==0);require(!peek.active(),"leaving taskbar retained input lease");
+        require(bool(GetWindowLongPtrW(viewer,GWL_EXSTYLE)&WS_EX_TOPMOST)==fullscreen,"Taskbar reveal changed the viewer topmost mode");
         require(bool(GetWindowLongPtrW(tray,GWL_EXSTYLE)&WS_EX_TOPMOST)==topmost,"Explorer topmost state leaked");
         RECT after{};GetWindowRect(tray,&after);require(EqualRect(&before,&after),"taskbar geometry changed");
         if(previous&&previous!=panel)require(GetWindow(tray,GW_HWNDPREV)==previous,"taskbar original predecessor not restored");

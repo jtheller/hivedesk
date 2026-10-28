@@ -146,6 +146,17 @@ struct Shell::Impl {
     }
     PanelComposition waiting_composition;
     bool waiting_visible=false,waiting_fading=false,waiting_retry=false;
+    static constexpr UINT ConnectionHintDelayMs=650;
+    ULONGLONG connection_hint_due=0;bool connection_hint_visible=false;
+    void cancel_connection_hint(){KillTimer(owner,5);connection_hint_due=0;connection_hint_visible=false;}
+    void reveal_connection_hint(){
+        if(!reconnecting||!connection_hint_due){KillTimer(owner,5);return;}
+        const auto now=GetTickCount64();
+        // A queued timer from an earlier selection must not reveal the next one.
+        if(now<connection_hint_due){SetTimer(owner,5,UINT(connection_hint_due-now),nullptr);return;}
+        KillTimer(owner,5);connection_hint_visible=true;
+        if(waiting_visible&&!waiting_fading){try{paint_waiting(false);}catch(const std::exception&){local(true);}}
+    }
     gpu_policy_restart::SettingsAdmission settings_restart;
     StreamHealth stream_health{};SlowIndicator slow_indicator;ULONGLONG last_stream_tick=0;
     SourceDiagnostics source_diagnostics{};ViewerDiagnostics viewer_diagnostics{};ULONGLONG source_stats_time=0,health_time=0;
@@ -346,7 +357,7 @@ struct Shell::Impl {
         if(surface){
             SetWindowLongPtrW(next,GWL_STYLE,style);
             auto ex=GetWindowLongPtrW(next,GWL_EXSTYLE);SetWindowLongPtrW(next,GWL_EXSTYLE,(ex&~(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE))|WS_EX_APPWINDOW);
-            SetWindowPos(next,HWND_NOTOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
+            SetWindowPos(next,windowed?HWND_NOTOPMOST:HWND_TOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
                 SWP_NOACTIVATE|SWP_FRAMECHANGED);
         }
         if(!next)return false;
@@ -401,14 +412,18 @@ struct Shell::Impl {
         }
         auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==pending_id;});
         const auto label=peer==peers.end()?wide(pending_id):wide(peer->name);
+        std::wstring message=waiting_retry?L"Reconnecting":L"Connecting";
+        if(snapshot)message+=L"  \x00b7  Snapshot";
+        message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
+        RemovePropW(waiting,L"HiveDesk.ConnectionHintVisible");
+        if(connection_hint_visible){
         const int left=px(24),bottom=height-px(24);
         RECT badge{left,bottom-px(74),std::min(width-left,left+px(480)),bottom};fill(dc,badge,Background);
         fill(dc,{left,badge.top,left+px(3),bottom},accent);
         draw_text(dc,title_font,label,{left+px(16),badge.top+px(5),badge.right-px(12),badge.top+px(38)},Text);
-        std::wstring message=waiting_retry?L"Reconnecting":L"Connecting";
-        if(snapshot)message+=L"  \x00b7  Snapshot";
-        message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
         draw_text(dc,small_font,message,{left+px(16),badge.top+px(39),badge.right-px(12),bottom-px(5)},Muted);
+        SetPropW(waiting,L"HiveDesk.ConnectionHintVisible",reinterpret_cast<HANDLE>(1));
+        }
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
         try{waiting_composition.present(pixels,width,height,false);waiting_composition.cover(float(width),float(height),false);}
         catch(...){SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);throw;}
@@ -417,11 +432,13 @@ struct Shell::Impl {
     }
     void begin_waiting(const std::string& id,bool retry,bool adopting=false) {
         KillTimer(owner,4);waiting_fading=false;waiting_retry=retry;
+        cancel_connection_hint();connection_hint_due=GetTickCount64()+ConnectionHintDelayMs;
+        SetTimer(owner,5,ConnectionHintDelayMs,nullptr);
         if(active_id!=id)previous_id=active_id;
         if(!IsWindowVisible(viewer)&&!prior_focus)prior_focus=GetForegroundWindow();
         active_id=id;remote=true;reconnecting=true;input_session=0;publish_input();
         reset_remote_cursor();
-        if(adopting){hide_waiting();SetWindowPos(viewer,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);SetForegroundWindow(viewer);return;}
+        if(adopting){hide_waiting();SetWindowPos(viewer,windowed?HWND_NOTOPMOST:HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);SetForegroundWindow(viewer);return;}
         try{
             paint_waiting(false);
             // Submit the complete opaque snapshot before exposing either HWND.
@@ -434,7 +451,7 @@ struct Shell::Impl {
         waiting_visible=true;
         const auto r=viewer_client();const int width=r.right-r.left,height=r.bottom-r.top;
         SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-        SetWindowPos(viewer,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
+        SetWindowPos(viewer,windowed?HWND_NOTOPMOST:HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
         // Showing an owner can change its owned popup visibility. Reassert the
         // prepared cover after the viewer becomes visible, before activation.
         SetWindowPos(waiting,HWND_TOP,r.left,r.top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
@@ -495,6 +512,7 @@ struct Shell::Impl {
         }
     }
     void local(bool notify) {
+        cancel_connection_hint();
         ++generation;remote=false;reconnecting=false;input_session=0;publish_input();
         // Remove video before its cover, including Escape during a fade.
         ShowWindow(viewer,SW_HIDE);
@@ -525,7 +543,7 @@ struct Shell::Impl {
     }
     void show_remote_ui(const std::string& id,const std::wstring& label,uint64_t session) {
         if(shutting_down||!selection_armed||(!pending_id.empty()&&pending_id!=id))return;
-        reconnecting=false;InvalidateRect(health_badge,nullptr,FALSE);
+        cancel_connection_hint();reconnecting=false;InvalidateRect(health_badge,nullptr,FALSE);
         if(active_id!=id)previous_id=active_id;
         if(!remote&&!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
         if(!remote||active_id!=id||input_session!=session)remote_cursor_composition.reset(session);
@@ -534,7 +552,7 @@ struct Shell::Impl {
             waiting_fading=true;
             try{SetTimer(owner,4,waiting_composition.hide(),nullptr);}catch(const std::exception&){hide_waiting();}
         }
-        SetWindowPos(viewer,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
+        SetWindowPos(viewer,windowed?HWND_NOTOPMOST:HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
         SetForegroundWindow(viewer);SetFocus(viewer);confine_mouse();hide_panel();apply_remote_position();apply_remote_cursor();
         publish_input();
     }
@@ -638,7 +656,7 @@ struct Shell::Impl {
     }
     void paint_health() {
         RECT rect{};GetClientRect(health_badge,&rect);DebugRows rows;
-        if(reconnecting)rows={{{L"Reconnecting...  Ctrl + Alt + ` to cancel",DiagnosticTone::Warning}}};
+        if(reconnecting)rows={{{waiting_retry?L"Reconnecting...  Ctrl + Alt + ` to cancel":L"Connecting...  Ctrl + Alt + ` to cancel",DiagnosticTone::Warning}}};
         else if(config.desktop.debug_overlay)rows=debug_rows();
         else rows={{{(stream_health.pressure&PressureNetwork)?L"Slow connection":L"Device busy",DiagnosticTone::Warning}}};
         if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
@@ -653,7 +671,7 @@ struct Shell::Impl {
         if(GetTickCount64()-last_stream_tick>=100){last_stream_tick=GetTickCount64();if(callbacks.stream_tick)callbacks.stream_tick();}
         const bool warning=slow_indicator.update(GetTickCount64(),stream_health);
         if(health_badge) {
-            if(remote&&!waiting_visible&&(reconnecting||warning||config.desktop.debug_overlay)&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
+            if(remote&&!waiting_visible&&(reconnecting?connection_hint_visible:(warning||config.desktop.debug_overlay))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
                 const auto client=viewer_client();
                 const int width=std::min(px(reconnecting?280:config.desktop.debug_overlay?460:136),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&config.desktop.debug_overlay?474:30),std::max(px(30),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
@@ -894,7 +912,7 @@ struct Shell::Impl {
             case WM_APP+46:return s->hotkey_registered?1:0;
             case WM_APP+49:return s->raw_mouse_available?1:0;
             case UiTask:{std::unique_ptr<std::function<void()>> task(reinterpret_cast<std::function<void()>*>(l));if(task&&!s->shutting_down)(*task)();return 0;}
-            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel(false,s->taskbar_peek.active());else if(w==3){KillTimer(window,3);s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();return 0;
+            case WM_TIMER:if(w==1)s->timer();else if(w==2&&s->panel_closing)s->hide_panel(false,s->taskbar_peek.active());else if(w==3){KillTimer(window,3);s->show_panel(2,true);s->panel_summoned=s->panel_mode!=0;s->publish_input();}else if(w==4&&s->waiting_fading)s->hide_waiting();else if(w==5)s->reveal_connection_hint();return 0;
             case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:case WM_SETTINGCHANGE:s->system_color();return 0;
             case WM_CLIPBOARDUPDATE:s->read_clipboard(true);return 0;
             case TrayMessage:

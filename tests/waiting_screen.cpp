@@ -16,6 +16,7 @@ void require(bool ok,const char* message){if(!ok)throw std::runtime_error(messag
 HWND find(const wchar_t* name){return FindWindowW(name,nullptr);}
 // The isolated station itself is invisible; inspect the child window show state.
 bool shown(HWND window){return (GetWindowLongW(window,GWL_STYLE)&WS_VISIBLE)!=0;}
+bool above(HWND first,HWND second){for(HWND h=GetTopWindow(nullptr);h;h=GetWindow(h,GW_HWNDNEXT)){if(h==first)return true;if(h==second)return false;}return false;}
 std::wstring title(HWND window){wchar_t text[1024]{};GetWindowTextW(window,text,1024);return text;}
 void pump(DWORD ms){
     const auto end=GetTickCount64()+ms;
@@ -67,25 +68,42 @@ int probe(){
         SendMessageW(owner,WM_CLIPBOARDUPDATE,0,0);pump(10);
         require(clipboard_echoes==0,"Remote clipboard handoff echoed back through the listener");
     }
+    const HWND pet=CreateWindowExW(WS_EX_TOPMOST|WS_EX_NOACTIVATE,L"STATIC",L"Generated desktop overlay",WS_POPUP|WS_VISIBLE,20,20,48,48,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    require(pet!=nullptr,"Desktop overlay fixture failed");
     shell.update_thumbnail("a",image(80));select(1);
+    require(above(shell.viewer_window(),pet),"Fullscreen viewer did not cover an existing topmost desktop overlay");
+    DestroyWindow(pet);
+    require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"Fast selection flashed a connection hint");
+    require(GetWindowLongPtrW(shell.viewer_window(),GWL_EXSTYLE)&WS_EX_TOPMOST,"Fullscreen waiting viewer is below desktop overlays");
     const auto initial_revision=GetPropW(waiting,L"HiveDesk.SurfaceRevision");
     SendMessageW(shell.viewer_window(),WM_SIZE,SIZE_RESTORED,0);
     require(GetPropW(waiting,L"HiveDesk.SurfaceRevision")==initial_revision,"Synchronous DXGI size notification reentered GPU composition");
     require(selected==1&&shown(waiting)&&title(waiting).find(L"Computer A")!=std::wstring::npos&&title(waiting).find(L"Snapshot")!=std::wstring::npos,"A cached snapshot was not shown immediately");
     select(2);
+    SendMessageW(owner,WM_TIMER,5,0);
+    require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"Previous selection's timer revealed the next hint early");
     require(selected==2&&shown(waiting)&&title(waiting).find(L"Computer B")!=std::wstring::npos&&title(waiting).find(L"Snapshot")==std::wstring::npos,"B reused A's snapshot");
     std::thread late([&]{shell.update_thumbnail("a",image(130));shell.show_remote("a",L"Computer A",1);});late.join();pump(20);
     require(shown(waiting)&&title(waiting).find(L"Computer B")!=std::wstring::npos&&title(waiting).find(L"Snapshot")==std::wstring::npos,"Late A completion changed B's waiting screen");
     shell.update_thumbnail("b",image(180));
     require(title(waiting).find(L"Snapshot")!=std::wstring::npos,"Fresh B snapshot did not update while connecting");
+    require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"Snapshot update bypassed connection hint delay");
+    pump(700);
+    require(GetPropW(waiting,L"HiveDesk.ConnectionHintVisible")!=nullptr,"Slow connection never displayed its hint");
     shell.show_remote("b",L"Computer B",2); // Simulates the prepared-first-frame notification.
     select(3);SendMessageW(owner,WM_TIMER,4,0);
+    require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"New selection inherited the previous connection hint");
     require(selected==3&&shown(waiting)&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Previous fade timer hid the next machine");
     shell.show_remote("c",L"Computer C",3);pump(260);
+    SendMessageW(owner,WM_TIMER,5,0);
+    require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"First frame failed to cancel a pending hint");
+    require(GetWindowLongPtrW(shell.viewer_window(),GWL_EXSTYLE)&WS_EX_TOPMOST,"First frame demoted the fullscreen viewer");
     require(!shown(waiting)&&shown(shell.viewer_window()),"First frame did not dismiss the waiting layer");
     shell.show_reconnecting("c");
+    require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"Reconnection flashed its hint without waiting");
     require(shown(waiting)&&title(waiting).find(L"Reconnecting")!=std::wstring::npos&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Reconnection reused stale video instead of a waiting screen");
     shell.show_local();shell.show_remote("c",L"Computer C",4);shell.update_thumbnail("c",image(220));pump(260);
+    SendMessageW(owner,WM_TIMER,5,0);
     require(!shown(waiting)&&!shown(shell.viewer_window()),"Canceled connection reopened on a late completion");
     // DEVG -> VI -> DEVG -> 6Re: keep the VI renderer lease alive to
     // simulate an old worker/flip surface that has not finished shutting down.
@@ -167,6 +185,7 @@ int probe(){
     require(floating&&floating->peer=="b"&&floating->window!=old->window&&shown(waiting),"Drag out failed to open the chosen machine on a fresh surface");
     const auto style=GetWindowLongW(floating->window,GWL_STYLE);
     require((style&WS_THICKFRAME)&&(style&WS_CAPTION)&&(style&WS_MAXIMIZEBOX),"Floating viewer is not a resizable/maximizable framed window");
+    require(!(GetWindowLongPtrW(floating->window,GWL_EXSTYLE)&WS_EX_TOPMOST),"Floating viewer inherited fullscreen topmost");
     RECT client{},outer{};GetClientRect(floating->window,&client);GetWindowRect(floating->window,&outer);
     require(std::abs(double(client.right)/client.bottom-1.6)<.01,"Window did not use the native snapshot aspect");
     RECT work_area{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0);
@@ -201,6 +220,7 @@ int probe(){
     POINT origin{};ClientToScreen(floating->window,&origin);RECT cover{};GetWindowRect(waiting,&cover);GetClientRect(floating->window,&client);
     require(cover.left==origin.x&&cover.top==origin.y&&cover.right-cover.left==client.right&&cover.bottom-cover.top==client.bottom,"Waiting snapshot did not follow the floating client area");
     shell.show_remote("b",L"Computer B",30,floating->window);pump(260);
+    require(!(GetWindowLongPtrW(floating->window,GWL_EXSTYLE)&WS_EX_TOPMOST),"First frame made the floating viewer topmost");
     GetClientRect(floating->window,&client);require(std::abs(double(client.right)/client.bottom-.5625)<.01&&!shown(waiting),"First-frame reveal changed the floating size or left its cover");
     SendMessageW(floating->window,WM_CLOSE,0,0);require(!shown(floating->window),"Closing floating viewer did not return locally");
     SendMessageW(owner,WM_HOTKEY,81,0);SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
@@ -213,12 +233,14 @@ int probe(){
     SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),center(1)));const auto old_epoch=peek_epoch;
     require(peek_id==peek->peer&&selected==before,"Hover selected a controller");
     shell.show_peek(peek,media,old_epoch,true);require(shown(peek->window)&&GetPropW(panel,L"HiveDesk.PeekReady"),"Ready preview did not show");
+    require(above(panel,peek->window),"Fullscreen preview covered Hive");
     SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(0,0));shell.show_peek(peek,media,old_epoch,true);
     require(!GetPropW(panel,L"HiveDesk.PeekReady"),"Stale preview completion reclaimed hover");
     SendMessageW(panel,WM_MOUSEMOVE,0,MAKELPARAM(px(100),center(1)));shell.show_peek(peek,media,peek_epoch,true);
     SendMessageW(panel,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(px(100),center(1)));SendMessageW(panel,WM_LBUTTONUP,0,MAKELPARAM(px(100),center(1)));
     waiting=find(L"HiveDesk.Waiting");
     require(shell.viewer_surface()==peek&&shown(peek->window)&&!shown(waiting),"Preview click recreated or covered its live surface");
+    require(GetWindowLongPtrW(peek->window,GWL_EXSTYLE)&WS_EX_TOPMOST,"Live preview adoption lost fullscreen topmost");
     SendMessageW(owner,WM_TIMER,4,0);shell.show_peek(peek,media,old_epoch,true);
     require(shown(peek->window)&&!shown(waiting),"Delayed preview/fade event hid the adopted viewer");shell.show_local();
     shell.close();require(!IsWindow(owner)&&!IsWindow(panel),"Explicit shell close retained native windows");shell.close();
