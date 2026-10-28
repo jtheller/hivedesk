@@ -36,7 +36,9 @@ public:
     // Prewarm prepares pixels without touching the hidden swapchain. Selection
     // enables presentation after the UI has assigned its final window/style.
     void activate();
+    void set_display_cadence(bool enabled);
     void submit(EncodedFrame frame);
+    void request_stop(); // Invalidate work immediately; close() joins separately.
     void close();
     std::string stats() const;
     bool has_frame() const;
@@ -49,4 +51,5 @@ private: struct Impl; std::unique_ptr<Impl> impl_;
 };
 // Must actually encode/decode a generated 4:4:4 test image and verify reconstructed color/size.
 bool media_self_test(std::string& report);
+bool media_prewarm_capacity();
 }

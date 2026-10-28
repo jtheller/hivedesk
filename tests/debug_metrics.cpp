@@ -29,7 +29,7 @@ int main(){try{
     state.health={1,144000,120000,3};state.source.session=1;state.source.encode_us=9000;state.source.encode_age_us=2000;state.source.rate_details=state.source.encode_details=true;
     state.source.automatic_cbr=true;state.source.target_bitrate_bps=420000000;state.source.actual_bitrate_bps=380000000;state.source.average_qp=25;
     state.viewer.session=1;state.viewer.decode_us=13000;state.viewer.render_us=5500;state.viewer.received_millihz=state.viewer.decoded_millihz=state.viewer.presented_millihz=120000;
-    state.viewer.service_sample_age_us=2000;state.viewer.queue_us=18000;state.viewer.queue_depth=3;state.input.ready=true;state.input.samples=50;state.input.sample_age_us=1000;state.input.ack_roundtrip_p99_us=23000;
+    state.viewer.service_sample_age_us=2000;state.viewer.queue_us=18000;state.viewer.queue_depth=3;state.input.ready=true;state.input.credit_limit=64;state.input.inflight=64;state.input.samples=50;state.input.sample_age_us=1000;state.input.ack_roundtrip_p99_us=23000;
     std::array<hive::DiagnosticPulse,6> pulses{};auto rows=hive::build_debug_rows(state,pulses);
     require(rows[1][0].text==L"Viewer (this PC): Unknown"&&rows[2][0].text==L"Host (remote): Unknown"&&rows[2][0].tone==T::Muted,"Unknown peer version was invented");
     state.viewer_version=L"0.1.0-alpha.36";state.host_version=L"0.1.0-alpha.35";rows=hive::build_debug_rows(state,pulses);

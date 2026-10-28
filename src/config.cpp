@@ -57,6 +57,7 @@ AppConfig load_config() {
     config.desktop.tray_icon=GetPrivateProfileIntW(L"HiveDesk",L"TrayIcon",1,path.c_str())!=0;
     config.desktop.debug_overlay=GetPrivateProfileIntW(L"HiveDesk",L"DebugOverlay",0,path.c_str())!=0;
     config.desktop.relative_mouse=GetPrivateProfileIntW(L"HiveDesk",L"RelativeMouse",0,path.c_str())!=0;
+    config.desktop.display_cadence=GetPrivateProfileIntW(L"HiveDesk",L"DisplayCadence",0,path.c_str())!=0;
     std::istringstream order(narrow(read_ini(path,L"DeviceOrder")));std::string id;
     while(order>>id)if(id.size()<=128&&config.device_order.size()<256&&
         std::find(config.device_order.begin(),config.device_order.end(),id)==config.device_order.end())config.device_order.push_back(id);
@@ -76,6 +77,7 @@ void save_config(const AppConfig& config) {
     std::string order;for(const auto& id:config.device_order){if(!order.empty())order+=' ';order+=id;}write(L"DeviceOrder",widen(order));
     write(L"Startup",config.desktop.startup?L"1":L"0");write(L"TrayIcon",config.desktop.tray_icon?L"1":L"0");
     write(L"DebugOverlay",config.desktop.debug_overlay?L"1":L"0");
+    write(L"DisplayCadence",config.desktop.display_cadence?L"1":L"0");
     write(L"RelativeMouse",config.desktop.relative_mouse?L"1":L"0");
     write(L"HotkeyModifiers",std::to_wstring(config.desktop.hotkey_modifiers));write(L"HotkeyKey",std::to_wstring(config.desktop.hotkey_key));
     write(L"FPS",std::to_wstring(config.stream.fps)); write(L"BitrateMbps",std::to_wstring(config.stream.bitrate_mbps));

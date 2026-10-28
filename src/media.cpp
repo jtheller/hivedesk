@@ -1053,6 +1053,7 @@ struct MediaViewer::Impl {
     std::condition_variable changed;
     ViewerQueue frames;
     bool stopping = true, displayed = false, present_enabled = true;
+    std::atomic<bool> display_cadence=false;
     CursorPresentation cursor;
     std::thread worker;
     std::string status = "Closed";
@@ -1085,6 +1086,25 @@ struct MediaViewer::Impl {
     }
 };
 MediaViewer::MediaViewer() : impl_(std::make_unique<Impl>()) {}
+bool media_prewarm_capacity() {
+    ComPtr<IDXGIFactory1> factory;if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))return false;
+    const auto primary=MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY);
+    for(UINT i=0;;++i){
+        ComPtr<IDXGIAdapter1> adapter;if(FAILED(factory->EnumAdapters1(i,&adapter)))break;
+        for(UINT j=0;;++j){
+            ComPtr<IDXGIOutput> output;if(FAILED(adapter->EnumOutputs(j,&output)))break;
+            DXGI_OUTPUT_DESC desc{};if(FAILED(output->GetDesc(&desc))||desc.Monitor!=primary)continue;
+            ComPtr<IDXGIAdapter3> budget_adapter;if(FAILED(adapter.As(&budget_adapter)))return false;
+            DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+            if(FAILED(budget_adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory)))return false;
+            // Leave room for the foreground stream and the user's applications.
+            // WDDM's current budget includes pressure from other processes.
+            const auto reserve=std::max<uint64_t>(256ull<<20,memory.Budget/8);
+            return memory.Budget>memory.CurrentUsage&&memory.Budget-memory.CurrentUsage>reserve;
+        }
+    }
+    return false;
+}
 MediaViewer::~MediaViewer() { close(); }
 bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented,bool warm) {
     close();
@@ -1137,7 +1157,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
             } workers{pipeline_stop,pictures,decoder,presenter,impl_->mutex,impl_->changed};
             presenter=std::thread([&]{
                 SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer presentation");
-                std::optional<size_t> current;
+                std::optional<size_t> current;bool current_presented=false;
                 try{
                     {
                         std::unique_lock guard(impl_->mutex);
@@ -1146,6 +1166,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                     }
                     FrameTimer present_retry;
                     while(!cancelled()){
+                        if(current&&current_presented&&!impl_->display_cadence){renderer->cancel_pending();pictures.release(*current);current.reset();current_presented=false;}
                         if(!current&&!pictures.wait_ready(cancelled))break;
                         // Wait BEFORE acquiring the latest image and before
                         // touching the swapchain backbuffer. Mapping/NVDEC keep
@@ -1153,20 +1174,20 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                         if(!renderer->wait_available(cancelled))break;
                         const auto latest=pictures.take(current);
                         if(latest){
-                            if(current){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
-                            current=latest;renderer->cancel_pending();
+                            if(current&&!current_presented){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
+                            current=latest;current_presented=false;renderer->cancel_pending();
                         }
                         if(!current)continue;
                         auto& picture=ready_pictures[*current];
-                        const auto can_present=[&]{return eligible(picture.pending);};
+                        const auto can_present=[&]{return current_presented||eligible(picture.pending);};
                         if(!can_present()){
                             renderer->cancel_pending();pictures.release(*current);current.reset();
                             std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;continue;
                         }
                         uint32_t render_us=0,present_us=0;bool presented=false;
-                        if(latest)renderer->draw_prepared(picture.pixels,nullptr,&render_us,&present_us,&presented,can_present);
+                        if(latest||(current_presented&&!renderer->present_pending()))renderer->draw_prepared(picture.pixels,nullptr,&render_us,&present_us,&presented,can_present);
                         else presented=renderer->retry_present(can_present,&present_us);
-                        if(presented&&experience_enabled()){
+                        if(presented&&!current_presented&&experience_enabled()){
                             const auto d=renderer->display_observation();
                             experience_trace(ExperienceEvent::Present,picture.pending->frame.session,picture.pending->frame.sequence,
                                 {picture.pending->arrival,picture.prepared_at,render_us,present_us,d[0],d[1],d[2],d[3],d[4],d[5]});
@@ -1176,11 +1197,12 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                             if(!impl_->stopping){
                                 if(latest){impl_->diagnostics.render_us=render_us;impl_->diagnostics.draw_us=renderer->draw_us();}
                                 impl_->diagnostics.present_us=present_us;
-                                if(presented){++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}
+                                if(presented){if(current_presented)++impl_->diagnostics.repeated_presentations;else{++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}}
                                 else if(!renderer->present_pending())++impl_->diagnostics.skipped;
                             }
                         }
-                        if(!renderer->present_pending()){pictures.release(*current);current.reset();}
+                        if(presented&&impl_->display_cadence)current_presented=true;
+                        else if(!renderer->present_pending()){pictures.release(*current);current.reset();current_presented=false;}
                         else present_retry.wait_until(Clock::now()+std::chrono::milliseconds(1)); // High-resolution retry, never timer-tick-sized Sleep jitter.
                     }
                 }catch(const std::exception& problem){
@@ -1280,10 +1302,14 @@ void MediaViewer::submit(EncodedFrame frame) {
     const bool queued=impl_->frames.push(std::move(frame),now);impl_->sync_queue();
     if(queued||impl_->frames.recovery_pending())impl_->changed.notify_one();
 }
-void MediaViewer::close() {
+void MediaViewer::request_stop() {
     { std::lock_guard guard(impl_->mutex); impl_->stopping = true; impl_->frames.reset();impl_->cursor={}; }
-    impl_->changed.notify_all(); if (impl_->worker.joinable()) impl_->worker.join();
+    impl_->changed.notify_all();
 }
+void MediaViewer::close() {
+    request_stop();if (impl_->worker.joinable()) impl_->worker.join();
+}
+void MediaViewer::set_display_cadence(bool enabled){impl_->display_cadence=enabled;}
 void MediaViewer::activate(){
     {std::lock_guard guard(impl_->mutex);impl_->present_enabled=true;}
     impl_->changed.notify_all();

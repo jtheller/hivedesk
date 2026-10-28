@@ -49,7 +49,7 @@ public:
     void release();
 };
 // Called under App's host/admission locks, after command work has completed.
-constexpr bool idle_for_update(bool viewing,bool hosting,bool reconnecting,bool queued) {
-    return !viewing&&!hosting&&!reconnecting&&!queued;
+constexpr bool idle_for_update(bool viewing,bool hosting,bool reconnecting,bool queued,bool host_warming=false) {
+    return !viewing&&(!hosting||host_warming)&&!reconnecting&&!queued;
 }
 }

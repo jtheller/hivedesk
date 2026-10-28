@@ -38,6 +38,9 @@ int main(int argc,char** argv){try{
     {std::ofstream file(temp,std::ios::binary);file<<"short";}
     rejects([&]{update::verify_package(parsed,temp);},"Truncated installer verified");
     require(update::idle_for_update(false,false,false,false),"Discovery-only idle blocked");
+    require(update::idle_for_update(false,true,false,false,true),"Prewarm lease blocked idle update");
+    require(!update::idle_for_update(true,true,false,false,true),"Warm host allowed an active viewer update");
+    require(!update::idle_for_update(false,true,true,false,true),"Warm host allowed a reconnect update");
     require(!update::idle_for_update(true,false,false,false),"Outbound remote could be interrupted");
     require(!update::idle_for_update(false,true,false,false),"Inbound remote could be interrupted");
     require(!update::idle_for_update(false,false,true,false),"Pending reconnect could be interrupted");

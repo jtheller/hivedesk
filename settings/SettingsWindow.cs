@@ -20,6 +20,7 @@ internal sealed class SettingsWindow : Window
     private readonly Button save = new() { Content = "Save", MinWidth = 104 };
     private readonly Button checkUpdates = new() { Content = "Check for updates" };
     private readonly CheckBox gpuPerformance = new() { Content = "Prefer maximum GPU performance", IsEnabled = false };
+    private readonly CheckBox displayCadence = new() { Content = "Steady display cadence (experimental)" };
     private readonly CheckBox relativeMouse = new() { Content = "Relative mouse" };
     private readonly TextBlock gpuPolicyHint = Hint("Checking GPU policy...");
     private readonly Button retryGpuRestart = new() { Content = "Retry restart" };
@@ -40,7 +41,7 @@ internal sealed class SettingsWindow : Window
     [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr window);
     private static TextBlock Label(string text, string style = "BodyTextBlockStyle") => new() { Text = text, Style = (Style)Application.Current.Resources[style], TextWrapping = TextWrapping.Wrap };
     private static StackPanel Stack(double spacing, params UIElement[] children) { var result = new StackPanel { Spacing = spacing }; foreach (var child in children) result.Children.Add(child); return result; }
-    private static Border Card(UIElement content) { var result = (Border)XamlReader.Load("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Padding='20' CornerRadius='8' BorderThickness='1' Background='{ThemeResource CardBackgroundFillColorDefaultBrush}' BorderBrush='{ThemeResource CardStrokeColorDefaultBrush}' />"); result.Child = content; return result; }
+    private static Border Card(UIElement content) { var result = (Border)XamlReader.Load("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Padding='16' CornerRadius='8' BorderThickness='1' Background='{ThemeResource CardBackgroundFillColorDefaultBrush}' BorderBrush='{ThemeResource CardStrokeColorDefaultBrush}' />"); result.Child = content; return result; }
     private static TextBlock Hint(string text) { var result = Label(text, "CaptionTextBlockStyle"); result.Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]; return result; }
     private static void Id(DependencyObject item, string id) => AutomationProperties.SetAutomationId(item, id);
     internal SettingsWindow(bool preview)
@@ -65,7 +66,7 @@ internal sealed class SettingsWindow : Window
         root.Children.Add(titlebar); ExtendsContentIntoTitleBar = true; SetTitleBar(titlebar);
         void CaptionTheme() { AppWindow.TitleBar.ButtonBackgroundColor = Microsoft.UI.Colors.Transparent; AppWindow.TitleBar.ButtonInactiveBackgroundColor = Microsoft.UI.Colors.Transparent; AppWindow.TitleBar.ButtonForegroundColor = root.ActualTheme == ElementTheme.Dark ? Microsoft.UI.Colors.White : Microsoft.UI.Colors.Black; }
         root.ActualThemeChanged += (_, _) => CaptionTheme(); CaptionTheme();
-        var content = new StackPanel { Padding = new Thickness(28, 20, 28, 28), Spacing = 16, MaxWidth = 700, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var content = new StackPanel { Padding = new Thickness(28, 16, 28, 20), Spacing = 12, MaxWidth = 700, HorizontalAlignment = HorizontalAlignment.Stretch };
         var heading = new Grid { ColumnSpacing = 16 };
         heading.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         heading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -74,13 +75,14 @@ internal sealed class SettingsWindow : Window
         var release = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, VerticalAlignment = VerticalAlignment.Center };
         release.Children.Add(version); release.Children.Add(checkUpdates); Grid.SetColumn(release, 1);
         heading.Children.Add(release); content.Children.Add(heading); content.Children.Add(Card(name));
-        content.Children.Add(Card(Stack(18, startup, tray, Hint("With the icon hidden, open HiveDesk again for Settings."))));
+        content.Children.Add(Card(Stack(12, startup, tray, Hint("With the icon hidden, open HiveDesk again for Settings."))));
         var tools = new Grid { ColumnSpacing = 24 }; tools.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); tools.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         tools.Children.Add(Stack(10, Label("Show Hive"), shortcut));
         var mouseAndDebug = Stack(0, debug, relativeMouse); Grid.SetColumn(mouseAndDebug, 1); tools.Children.Add(mouseAndDebug);
         Id(relativeMouse, "RelativeMouse");
         relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
-        content.Children.Add(Card(Stack(12, tools, Stack(0, gpuPerformance, gpuPolicyHint))));
+        Id(displayCadence, "DisplayCadence");
+        content.Children.Add(Card(Stack(8, tools, Stack(0, gpuPerformance, gpuPolicyHint), displayCadence)));
         var footer = new Grid { ColumnSpacing = 16 }; footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var escape = Hint("Ctrl + Alt + `  returns here"); escape.VerticalAlignment = VerticalAlignment.Center; footer.Children.Add(escape); Grid.SetColumn(save, 1); footer.Children.Add(save);
         content.Children.Add(footer); content.Children.Add(feedback);
@@ -112,9 +114,9 @@ internal sealed class SettingsWindow : Window
     }
     private static bool ValidHotkey(uint mods, uint code) => mods > 0 && mods <= 15 && (mods & 11) != 0 && ((code >= 65 && code <= 90) || (code >= 48 && code <= 57) || (code >= 112 && code <= 122));
     private string ShortcutText() => ((modifiers & 2) != 0 ? "Ctrl + " : "") + ((modifiers & 1) != 0 ? "Alt + " : "") + ((modifiers & 4) != 0 ? "Shift + " : "") + ((modifiers & 8) != 0 ? "Win + " : "") + (key >= 112 && key <= 122 ? "F" + (key - 111) : ((char)key).ToString());
-    private void Load(Preferences value) { name.Text = value.Name; startup.IsOn = value.Startup; tray.IsOn = value.TrayIcon; debug.IsOn = value.DebugOverlay; relativeMouse.IsChecked = value.RelativeMouse; modifiers = value.HotkeyModifiers; key = value.HotkeyKey; shortcut.Content = ShortcutText(); savedPreferences = value; }
+    private void Load(Preferences value) { name.Text = value.Name; startup.IsOn = value.Startup; tray.IsOn = value.TrayIcon; debug.IsOn = value.DebugOverlay; relativeMouse.IsChecked = value.RelativeMouse; displayCadence.IsChecked = value.DisplayCadence; modifiers = value.HotkeyModifiers; key = value.HotkeyKey; shortcut.Content = ShortcutText(); savedPreferences = value; }
     private void EndRecording() { if (!recording) return; recording = false; try { bridge.Send("record", "0"); } catch (Exception error) { Show(error.Message, InfoBarSeverity.Error); } shortcut.Content = ShortcutText(); }
-    private Preferences Values() { var text = name.Text.Trim(); if (string.IsNullOrWhiteSpace(text) || System.Text.Encoding.UTF8.GetByteCount(text) > 256) throw new InvalidOperationException("Enter a computer name of up to 256 UTF-8 bytes."); if (!ValidHotkey(modifiers, key)) throw new InvalidOperationException("Use Ctrl, Alt or Win with a letter, number, or F1-F11."); return new(text, startup.IsOn, tray.IsOn, modifiers, key, debug.IsOn, relativeMouse.IsChecked == true); }
+    private Preferences Values() { var text = name.Text.Trim(); if (string.IsNullOrWhiteSpace(text) || System.Text.Encoding.UTF8.GetByteCount(text) > 256) throw new InvalidOperationException("Enter a computer name of up to 256 UTF-8 bytes."); if (!ValidHotkey(modifiers, key)) throw new InvalidOperationException("Use Ctrl, Alt or Win with a letter, number, or F1-F11."); return new(text, startup.IsOn, tray.IsOn, modifiers, key, debug.IsOn, relativeMouse.IsChecked == true, displayCadence.IsChecked == true); }
     private void Show(string message, InfoBarSeverity severity) { feedback.ActionButton = null; feedback.Message = message; feedback.Severity = severity; feedback.IsOpen = true; }
     private async Task Save() { EndRecording(); save.IsEnabled = false; try { var value = Values(); await bridge.Save(value); savedPreferences = value; Show(bridge.Preview ? "Preview settings saved." : "Settings saved.", InfoBarSeverity.Success); } catch (Exception error) { Show(error.Message, InfoBarSeverity.Error); } finally { save.IsEnabled = true; } }
     private void DisplayGpuPolicy(GpuPolicyResult? result)
@@ -160,7 +162,7 @@ internal sealed class SettingsWindow : Window
         catch (Exception) { Show("Save your other changes before changing GPU performance.", InfoBarSeverity.Warning); return; }
         EndRecording(); changingGpuPolicy = true; gpuPerformance.IsEnabled = false;
         name.IsEnabled = startup.IsEnabled = tray.IsEnabled = debug.IsEnabled = shortcut.IsEnabled = save.IsEnabled = false;
-        relativeMouse.IsEnabled = false;
+        relativeMouse.IsEnabled = displayCadence.IsEnabled = false;
         var previousGpuPolicy = gpuPolicyState;
         Show("Changing GPU policy. Windows may request administrator permission...", InfoBarSeverity.Informational);
         try
@@ -198,7 +200,7 @@ internal sealed class SettingsWindow : Window
             if (!closed)
             {
                 name.IsEnabled = startup.IsEnabled = tray.IsEnabled = debug.IsEnabled = shortcut.IsEnabled = save.IsEnabled = true;
-                relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
+                relativeMouse.IsEnabled = bridge.RelativeMouseAvailable(); displayCadence.IsEnabled = true;
                 DisplayGpuPolicy(gpuPolicyState);
             }
         }
@@ -280,9 +282,11 @@ internal sealed class SettingsWindow : Window
             if (!relativeMouse.IsEnabled || relativeMouse.ActualWidth <= 0 || AutomationProperties.GetAutomationId(relativeMouse) != "RelativeMouse") throw new Exception("Relative mouse checkbox missing");
             var mouseBounds = relativeMouse.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, relativeMouse.ActualWidth, relativeMouse.ActualHeight));
             if (mouseBounds.Right > root.ActualWidth - 12 || mouseBounds.Bottom > root.ActualHeight - 12) throw new Exception("Relative mouse checkbox clips");
+            var cadenceBounds = displayCadence.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, displayCadence.ActualWidth, displayCadence.ActualHeight));
+            if (displayCadence.ActualWidth <= 0 || cadenceBounds.Right > root.ActualWidth - 12 || cadenceBounds.Bottom > root.ActualHeight - 12) throw new Exception("Cadence checkbox clips");
             var saveBounds = save.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, save.ActualWidth, save.ActualHeight));
             if (saveBounds.Bottom > root.ActualHeight - 12) throw new Exception("Settings Save button requires scrolling");
-            if (version.Text != VersionText || version.ActualWidth <= 0 || !VersionText.StartsWith("v0.1.0-alpha.")) throw new Exception("Packaged version label missing");
+            if (version.Text != VersionText || version.ActualWidth <= 0 || !Version.TryParse(VersionText[1..], out _)) throw new Exception("Packaged version label missing");
             if (checkUpdates.ActualWidth <= 0 || AutomationProperties.GetAutomationId(checkUpdates) != "CheckForUpdates") throw new Exception("Update action missing");
             var versionBounds = version.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, version.ActualWidth, version.ActualHeight));
             var updateBounds = checkUpdates.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, checkUpdates.ActualWidth, checkUpdates.ActualHeight));
@@ -350,6 +354,8 @@ internal sealed class SettingsWindow : Window
             name.Text = "Studio 2"; startup.IsOn = false; tray.IsOn = false; debug.IsOn = true; relativeMouse.IsChecked = true; modifiers = 6; key = 74; shortcut.Content = ShortcutText(); await Save();
             if (feedback.Severity != InfoBarSeverity.Success || bridge.Load() != new Preferences("Studio 2", false, false, 6, 74, true, true)) throw new Exception("Preference save failed");
             relativeMouse.IsChecked = false; Load(bridge.Load()); if (relativeMouse.IsChecked != true) throw new Exception("Relative mouse preference did not reload");
+            displayCadence.IsChecked = true; await Save(); if (!bridge.Load().DisplayCadence) throw new Exception("Cadence preference did not enable");
+            displayCadence.IsChecked = false; await Save(); if (bridge.Load().DisplayCadence) throw new Exception("Cadence preference did not disable");
             relativeMouse.IsChecked = false; await Save(); if (bridge.Load().RelativeMouse) throw new Exception("Relative mouse preference did not disable");
             name.Text = " "; await Save(); if (feedback.Severity != InfoBarSeverity.Error) throw new Exception("Blank name accepted"); name.Text = "Studio 2"; modifiers = 0; await Save(); if (feedback.Severity != InfoBarSeverity.Error) throw new Exception("Unmodified shortcut accepted"); modifiers = 3; key = 72; shortcut.Content = ShortcutText();
             if (AppWindow.Presenter is not OverlappedPresenter presenter || presenter.IsResizable || presenter.IsMaximizable || !presenter.IsMinimizable) throw new Exception("Window is not fixed-size with minimize retained");

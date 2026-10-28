@@ -50,7 +50,7 @@ inline DebugRows build_debug_rows(const DebugOverlayState& state,std::array<Diag
             {metric(L"Present gap p95 ",v.present_gap_p95_us/1000.0,view_fresh?T::Normal:T::Muted),metric(L" / max ",v.present_gap_max_us/1000.0,view_fresh?T::Normal:T::Muted),{L" ms"}},
             {input_ms(L"Input ACK p50 ",input.ack_roundtrip_p50_us,8000,20000),input_ms(L" / p99 ",input.ack_roundtrip_p99_us,8000,20000),{L" ms"}},
             {input_ms(L"Dispatch ",input.capture_to_send_p99_us,2000,8000),input_ms(L"   Host ",input.host_queue_p95_us,2000,8000),input_ms(L"   Inject ",input.inject_p95_us,2000,8000),{L" ms (p99/95/95)"}},
-            {{L"Input queue "+std::to_wstring(input.queued),diagnostic_threshold(input.queued,8,32)},{L"   In flight "+std::to_wstring(input.inflight),diagnostic_threshold(input.inflight,6,8)},{input.ready?L"  ready":L"  waiting",input.ready?T::Normal:T::Muted}},
+            {{L"Input queue "+std::to_wstring(input.queued),diagnostic_threshold(input.queued,8,32)},{L"   In flight "+std::to_wstring(input.inflight)+L"/"+std::to_wstring(input.credit_limit),diagnostic_threshold(input.inflight,input.credit_limit*3/4,input.credit_limit)},{input.ready?L"  ready":L"  waiting",input.ready?T::Normal:T::Muted}},
             {{L"Live tick ~16ms | FPS / Mbps rolling 250ms",T::Muted}},
             {{L"Amber: slow   Red: over budget   Gray: idle / stale",T::Muted}},
             {{L"Latency is not capacity. Present is not scanout.",T::Muted}}

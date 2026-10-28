@@ -44,7 +44,14 @@ int main(int argc,char** argv){
         while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
         auto frame=hive::media_generated_test_frame();
         frame.capture_time_us=frame.source_ready_us=0;
-        viewer.submit(frame);for(unsigned i=0;i<100&&!viewer.has_frame();++i)pump(10);
+        viewer.submit(frame);unsigned warm_refreshes=0;
+        for(unsigned i=0;i<300&&!viewer.has_frame();++i){
+            pump(10);
+            // Match the real feedback lane: a cold GPU may expire its first
+            // decoded picture, and the paused host must provide another IDR.
+            if(i%25==24&&viewer.feedback().recover){++frame.sequence;viewer.submit(frame);++warm_refreshes;}
+        }
+        std::printf("Warm fixture recovery requests=%u status=%s\n",warm_refreshes,viewer.stats().c_str());
         if(!viewer.has_frame()||viewer.has_presented_frame())throw std::runtime_error("Warm preparation touched presentation or failed to decode");
         // A real Hive selection promotes an image prepared while the panel
         // was open. It can be older than the presentation freshness budget.
@@ -53,6 +60,12 @@ int main(int argc,char** argv){
         viewer.activate();pump(100);
         for(unsigned i=0;i<100&&!viewer.has_presented_frame();++i){++frame.sequence;viewer.submit(frame);pump(25);}
         const bool presented=viewer.has_presented_frame();std::printf("Real covered viewer: decoded=%d presented=%d status=%s\n",viewer.has_frame(),presented,viewer.stats().c_str());
+        viewer.set_display_cadence(true);++frame.sequence;viewer.submit(frame);pump(200);
+        const auto repeats=viewer.diagnostics().repeated_presentations;
+        if(!repeats)throw std::runtime_error("Cadence did not repeat the final displayed image without new input");
+        viewer.set_display_cadence(false);pump(40);const auto stopped=viewer.diagnostics().repeated_presentations;pump(100);
+        if(viewer.diagnostics().repeated_presentations!=stopped)throw std::runtime_error("Cadence kept repeating after disable");
+        std::printf("Cadence: %llu repeats with no additional encoded frames; live disable passed\n",static_cast<unsigned long long>(repeats));
         auto close=std::async(std::launch::async,[&]{viewer.close();});while(close.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);close.get();
         if(!presented)throw std::runtime_error("No real first Present under cover");
         if(GetForegroundWindow()!=foreground)throw std::runtime_error("Probe changed foreground window");

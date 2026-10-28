@@ -92,7 +92,7 @@ struct Telemetry::Impl {
             out<<",\"transit_excess_ms\":"<<v.transit_extra_us/1000.0<<",\"sequence_gaps\":"<<v.sequence_gaps
                <<",\"age_expired\":"<<v.age_expired<<",\"queue_overflows\":"<<v.queue_overflows
                <<",\"nvdec_map_ms\":"<<v.nvdec_map_us/1000.0<<",\"convert_ms\":"<<v.convert_us/1000.0<<",\"draw_ms\":"<<v.draw_us/1000.0
-               <<",\"present_gap_p95_ms\":"<<v.present_gap_p95_us/1000.0<<",\"present_gap_max_ms\":"<<v.present_gap_max_us/1000.0<<'}';
+               <<",\"present_gap_p95_ms\":"<<v.present_gap_p95_us/1000.0<<",\"present_gap_max_ms\":"<<v.present_gap_max_us/1000.0<<",\"repeated_presentations\":"<<v.repeated_presentations<<'}';
         }
         out<<",\"video_send_age_ms\":"<<age(now,e.send_at)<<",\"video_send\":";
         if(!e.send_at||!e.send.available)out<<"null";
@@ -116,7 +116,7 @@ struct Telemetry::Impl {
             out<<"{\"dedicated\":"<<(d.dedicated?"true":"false")<<",\"ready\":"<<(d.ready?"true":"false")
                <<",\"session\":"<<d.session<<",\"connection\":"<<d.connection<<",\"enqueued\":"<<d.enqueued
                <<",\"coalesced\":"<<d.coalesced<<",\"sent\":"<<d.sent<<",\"acknowledged\":"<<d.acknowledged
-               <<",\"credit_stalls\":"<<d.credit_stalls<<",\"credit_wait_total_ms\":"<<d.credit_wait_total_us/1000.0<<",\"credit_wait_max_ms\":"<<d.credit_wait_max_us/1000.0
+               <<",\"credit_limit\":"<<d.credit_limit<<",\"credit_stalls\":"<<d.credit_stalls<<",\"credit_wait_total_ms\":"<<d.credit_wait_total_us/1000.0<<",\"credit_wait_max_ms\":"<<d.credit_wait_max_us/1000.0
                <<",\"failed\":"<<d.failed<<",\"queued\":"<<d.queued<<",\"inflight\":"<<d.inflight
                <<",\"samples\":"<<d.samples<<",\"sample_age_ms\":";
             if(d.sample_age_us==UINT32_MAX)out<<"null";else out<<d.sample_age_us/1000.0;

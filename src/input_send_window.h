@@ -1,5 +1,6 @@
 #pragma once
 #include "hivedesk/input_channel.h"
+#include "input_credit.h"
 #include "hivedesk/input_diagnostics.h"
 #include <algorithm>
 #include <array>
@@ -7,8 +8,8 @@
 #include <iterator>
 
 namespace hive {
-// Protected by the owning input connection's queue mutex. At most eight input
-// packets can enter TCP without a completed-injection ACK. Adjacent motion is
+// Protected by the owning input connection's queue mutex. Eight packets on
+// low RTT links; measured propagation may increase the bounded ACK window. Adjacent motion is
 // coalesced before encryption; key/button/wheel/release boundaries never move.
 class InputSendWindow {
 public:
@@ -35,7 +36,7 @@ public:
         if(pending_.size()>=capacity){++totals_.failed;return false;}
         pending_.push_back({packet,now});credit_state(now);return true;
     }
-    bool writable() const {return !pending_.empty()&&flight_.size()<credit;}
+    bool writable() const {return !pending_.empty()&&flight_.size()<credits_.limit();}
     bool empty() const {return pending_.empty()&&flight_.empty();}
     uint64_t next_deadline() const {
         uint64_t at=flight_.empty()?0:flight_.front().sent_at;
@@ -58,6 +59,7 @@ public:
         const auto found=std::find_if(flight_.begin(),flight_.end(),[&](const Flight& f){return f.packet.sequence==ack.sequence;});
         if(found==flight_.end()||ack.capture_time_us!=found->packet.capture_time_us)return false;
         Sample sample{now,found->capture_to_send,elapsed(now,found->sent_at),ack.host_queue_us,ack.inject_us};
+        credits_.observe(sample.roundtrip,ack.host_queue_us,ack.inject_us,ack.injected);
         samples_[next_sample_]=sample;next_sample_=(next_sample_+1)%sample_capacity;last_sample_=now;
         totals_.acknowledged+=uint64_t(std::distance(flight_.begin(),found))+1;
         if(!ack.injected)++totals_.failed;
@@ -69,6 +71,7 @@ public:
     InputDiagnostics snapshot(uint64_t now) const {
         auto result=totals_;
         if(credit_since_){const auto age=elapsed(now,credit_since_);result.credit_wait_total_us+=age;result.credit_wait_max_us=std::max(result.credit_wait_max_us,age);}
+        result.credit_limit=uint32_t(credits_.limit());
         result.available=result.dedicated=true;result.session=session_;
         result.queued=uint32_t(pending_.size());result.inflight=uint32_t(flight_.size());
         result.sample_age_us=last_sample_?elapsed(now,last_sample_):UINT32_MAX;
@@ -85,10 +88,11 @@ private:
     static uint32_t elapsed(uint64_t end,uint64_t begin){return end>=begin?uint32_t(std::min<uint64_t>(UINT32_MAX,end-begin)):0;}
     struct Sample {uint64_t at=0;uint32_t capture=0,roundtrip=0,queue=0,inject=0;};
     void credit_state(uint64_t now){
-        const bool blocked=!pending_.empty()&&flight_.size()>=credit;
+        const bool blocked=!pending_.empty()&&flight_.size()>=credits_.limit();
         if(blocked&&!credit_since_){credit_since_=now;++totals_.credit_stalls;}
         else if(!blocked&&credit_since_){const auto age=elapsed(now,credit_since_);totals_.credit_wait_total_us+=age;totals_.credit_wait_max_us=std::max(totals_.credit_wait_max_us,age);credit_since_=0;}
     }
+    InputCredit credits_;
     uint64_t credit_since_=0;
     uint64_t session_=0,last_enqueued_=0,last_ack_=0,last_sample_=0;
     size_t next_sample_=0;
