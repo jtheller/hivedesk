@@ -104,7 +104,11 @@ struct Telemetry::Impl {
                <<",\"samples\":"<<s.samples<<",\"sample_age_ms\":";
             if(s.sample_age_us==UINT32_MAX)out<<"null";else out<<s.sample_age_us/1000.0;
             out<<",\"encrypt_p95_ms\":"<<s.encrypt_p95_us/1000.0<<",\"encrypt_max_ms\":"<<s.encrypt_max_us/1000.0
-               <<",\"inflight\":"<<s.inflight<<",\"send_p95_ms\":"<<s.send_p95_us/1000.0<<",\"send_max_ms\":"<<s.send_max_us/1000.0
+               <<",\"write_limit\":"<<s.write_limit<<",\"owned_bytes\":"<<s.owned_bytes<<",\"write_budget_bytes\":"<<s.write_budget_bytes
+               <<",\"tcp_available\":"<<(s.tcp_available?"true":"false")<<",\"tcp_rtt_ms\":"<<s.tcp_rtt_us/1000.0<<",\"tcp_min_rtt_ms\":"<<s.tcp_min_rtt_us/1000.0
+               <<",\"tcp_ideal_bytes\":"<<s.tcp_ideal_bytes<<",\"tcp_cwnd_bytes\":"<<s.tcp_cwnd_bytes<<",\"tcp_send_window_bytes\":"<<s.tcp_send_window_bytes
+               <<",\"tcp_inflight_bytes\":"<<s.tcp_inflight_bytes<<",\"tcp_sample_age_ms\":";if(s.tcp_sample_age_us==UINT32_MAX)out<<"null";else out<<s.tcp_sample_age_us/1000.0;
+            out<<",\"inflight\":"<<s.inflight<<",\"send_p95_ms\":"<<s.send_p95_us/1000.0<<",\"send_max_ms\":"<<s.send_max_us/1000.0
                <<",\"queue_p95_ms\":"<<s.queue_p95_us/1000.0<<",\"queue_max_ms\":"<<s.queue_max_us/1000.0
                <<",\"submit_gap_p95_ms\":"<<s.submit_gap_p95_us/1000.0<<",\"submit_gap_max_ms\":"<<s.submit_gap_max_us/1000.0
                <<",\"ready_gap_p95_ms\":"<<s.ready_gap_p95_us/1000.0<<",\"ready_gap_max_ms\":"<<s.ready_gap_max_us/1000.0<<'}';

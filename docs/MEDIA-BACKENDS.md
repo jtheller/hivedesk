@@ -20,9 +20,24 @@ different chroma format in this release.
   GPU settings or persist a backend selection. Missing driver runtimes are
   reported per adapter, without disrupting enumeration of other adapters.
 
-An exact query is NOT a functioning backend. Remaining Intel work includes the
-D3D11 texture allocator, color conversion, asynchronous encode/decode ownership,
-bitstream/chroma verification and compatibility negotiation. AMD needs a
+`HiveDeskMediaProbe.exe --intel-roundtrip` additionally runs a generated-content
+Intel hardware qualification test. It requires VPL 2.x and exact low-delay
+HEVC REXT/AYUV 8-bit 4:4:4 initialization. Sixteen 640x360 patterns with
+single-pixel chroma changes pass through managed D3D11 encode surfaces,
+asynchronous completion, encoder drain, SPS inspection, hardware decode and
+mapped output comparison. The actual bitstream must declare 4:4:4, 8-bit and
+the expected dimensions; all sixteen decoded frames must match the generated
+sequence within the documented mean absolute component error bound of 12.
+The test reports encoded bytes and Y/U/V mean/maximum errors. Exit status is
+0 for passing Intel adapters, 1 for a failed test, and 2 when Intel hardware is
+absent. This test uses CPU-mapped diagnostic patterns, not desktop capture or
+a production zero-copy path, and does not qualify latency or frame throughput.
+
+An exact query or generated roundtrip is NOT a functioning backend. Remaining
+Intel work includes desktop-texture color conversion, asynchronous production
+encode/decode ownership, negotiated compatibility, GPU-native presentation and
+real-device throughput/latency qualification. Managed surfaces and SPS parsing
+now exist in the isolated diagnostic only. AMD needs a
 verified full-chroma representation first; no silent 4:2:0 fallback is allowed.
 Dual-stream representations require separate interoperability and latency work.
 

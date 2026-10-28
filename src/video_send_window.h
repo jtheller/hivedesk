@@ -1,5 +1,6 @@
 #pragma once
 #include "hivedesk/video_send_diagnostics.h"
+#include "video_send_budget.h"
 #include <algorithm>
 #include <array>
 #include <mutex>
@@ -30,9 +31,17 @@ public:
         last_completion_=attempt.finished_at;
         samples_[next_]=sample;next_=(next_+1)%capacity;
     }
+    void network(const VideoTcpSample& sample,uint64_t now,uint32_t limit,uint64_t budget){
+        std::lock_guard lock(mutex_);network_at_=now;
+        totals_.tcp_available=sample.available;totals_.tcp_rtt_us=sample.rtt_us;totals_.tcp_min_rtt_us=sample.min_rtt_us;
+        totals_.tcp_ideal_bytes=sample.ideal_bytes;totals_.tcp_cwnd_bytes=sample.cwnd_bytes;
+        totals_.tcp_send_window_bytes=sample.send_window_bytes;totals_.tcp_inflight_bytes=sample.inflight_bytes;
+        totals_.write_limit=limit;totals_.write_budget_bytes=budget;
+    }
     void expired(){std::lock_guard lock(mutex_);++totals_.queue_expired;}
     VideoSendDiagnostics snapshot(uint64_t now)const{
         std::lock_guard lock(mutex_);auto result=totals_;result.available=true;
+        result.tcp_sample_age_us=network_at_?elapsed(now,network_at_):UINT32_MAX;
         result.sample_age_us=last_completion_?elapsed(now,last_completion_):UINT32_MAX;
         std::array<uint32_t,capacity> encrypt{},send{},queue{},submit_gap{},ready_gap{};
         size_t count=0;
@@ -54,7 +63,7 @@ private:
     struct Sample{uint64_t at=0;uint32_t encrypt=0,send=0,queue=0,submit_gap=0,ready_gap=0;};
     mutable std::mutex mutex_;
     std::array<Sample,capacity> samples_{};size_t next_=0;
-    uint64_t last_completion_=0;
+    uint64_t last_completion_=0,network_at_=0;
     VideoSendDiagnostics totals_{};
 };
 }

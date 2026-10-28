@@ -2,6 +2,7 @@
 // working backend based on a capability query. No capture, network or input.
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d10.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <vpl/mfxdispatcher.h>
@@ -12,6 +13,8 @@
 #include <cstdio>
 #include <string>
 #include <stdexcept>
+#include <cstring>
+#include "intel_roundtrip.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -33,7 +36,7 @@ struct Vpl {
 };
 mfxVideoParam hevc444(bool encode){
     mfxVideoParam p{};p.AsyncDepth=1;
-    p.IOPattern=encode?MFX_IOPATTERN_IN_VIDEO_MEMORY:MFX_IOPATTERN_OUT_VIDEO_MEMORY;
+    p.IOPattern=mfxU16(encode?MFX_IOPATTERN_IN_VIDEO_MEMORY:MFX_IOPATTERN_OUT_VIDEO_MEMORY);
     p.mfx.CodecId=MFX_CODEC_HEVC;p.mfx.CodecProfile=MFX_PROFILE_HEVC_REXT;
     auto& f=p.mfx.FrameInfo;f.FourCC=MFX_FOURCC_AYUV;f.ChromaFormat=MFX_CHROMAFORMAT_YUV444;
     f.BitDepthLuma=8;f.BitDepthChroma=8;f.Width=1920;f.Height=1088;f.CropW=1920;f.CropH=1080;
@@ -42,15 +45,15 @@ mfxVideoParam hevc444(bool encode){
         p.mfx.NumRefFrame=1;p.mfx.RateControlMethod=MFX_RATECONTROL_CBR;p.mfx.TargetKbps=30000;}
     return p;
 }
-void intel(UINT index,ID3D11Device* device){
+void intel(UINT index,ID3D11Device* device,bool roundtrip){
     Vpl vpl;vpl.filter("mfxImplDescription.Impl",MFX_IMPL_TYPE_HARDWARE);
     vpl.filter("mfxImplDescription.VendorID",0x8086);
     vpl.filter("mfxImplDescription.AccelerationMode",MFX_ACCEL_MODE_VIA_D3D11);
     vpl.filter("DXGIAdapterIndex",index);
     const auto created=MFXCreateSession(vpl.loader,0,&vpl.session);
-    std::printf("  intel.session_status=%d\n",created);if(created<0)return;
+    std::printf("  intel.session_status=%d\n",created);if(created<0){require(!roundtrip,"Intel hardware session unavailable for roundtrip");return;}
     const auto bound=MFXVideoCORE_SetHandle(vpl.session,MFX_HANDLE_D3D11_DEVICE,device);
-    std::printf("  intel.d3d11_bind_status=%d\n",bound);if(bound<0)return;
+    std::printf("  intel.d3d11_bind_status=%d\n",bound);if(bound<0){require(!roundtrip,"Intel D3D11 binding unavailable for roundtrip");return;}
     for(bool encode:{true,false}){
         auto requested=hevc444(encode),actual=requested;
         const auto status=encode?MFXVideoENCODE_Query(vpl.session,&requested,&actual):MFXVideoDECODE_Query(vpl.session,&requested,&actual);
@@ -62,7 +65,8 @@ void intel(UINT index,ID3D11Device* device){
         std::printf("  intel.hevc444_%s.query_status=%d exact_format=%s profile=%u chroma=%u fourcc=0x%08x\n",
             encode?"encode":"decode",status,exact?"yes":"no",actual.mfx.CodecProfile,f.ChromaFormat,f.FourCC);
     }
-    std::puts("  intel.backend_ready=no (query only; texture allocator, bitstream roundtrip and presentation qualification pending)");
+    if(roundtrip)std::printf("  intel.roundtrip=PASS %s\n",intel_roundtrip(vpl.session).c_str());
+    std::puts("  intel.backend_ready=no (desktop capture, async pipeline integration and display qualification pending)");
 }
 struct Library {HMODULE handle=nullptr;~Library(){if(handle)FreeLibrary(handle);}};
 void amd(ID3D11Device* device){
@@ -94,7 +98,10 @@ void amd(ID3D11Device* device){
     std::puts("  amd.backend_ready=no (AMF HEVC exposes Main/Main10, not a qualified native 4:4:4 path; no 4:2:0 fallback)");
 }
 }
-int main(){
+int main(int argc,char** argv){
+    const bool roundtrip=argc==2&&std::strcmp(argv[1],"--intel-roundtrip")==0;
+    if(argc>1&&!roundtrip){std::puts("Usage: HiveDeskMediaProbe [--intel-roundtrip]");return 1;}
+    unsigned tested=0,failed=0;
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32|LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
     std::puts("HiveDesk media capability probe " HIVEDESK_VERSION " - no capture, no codec fallback, no production backend changes");
     ComPtr<IDXGIFactory1> factory;if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))return 1;
@@ -106,8 +113,12 @@ int main(){
         try{
             ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
             require(SUCCEEDED(D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_VIDEO_SUPPORT|D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"D3D11 video device creation");
-            if(d.VendorId==0x8086)intel(i,device.Get());else amd(device.Get());
-        }catch(const std::exception& error){std::printf("  probe_unavailable=%s\n",error.what());}
+            ComPtr<ID3D10Multithread> multithread;
+            require(SUCCEEDED(context.As(&multithread)),"D3D11 multithread protection unavailable");
+            multithread->SetMultithreadProtected(TRUE);
+            if(d.VendorId==0x8086){if(roundtrip)++tested;intel(i,device.Get(),roundtrip);}else amd(device.Get());
+        }catch(const std::exception& error){std::printf("  probe_unavailable=%s\n",error.what());if(roundtrip&&d.VendorId==0x8086)++failed;}
     }
-    return 0;
+    if(roundtrip&&!tested&&!failed){std::puts("SKIP Intel roundtrip: no Intel hardware adapter");return 2;}
+    return failed?1:0;
 }

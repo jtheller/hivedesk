@@ -1,4 +1,4 @@
-# 画面与输入测量（0.4.0）
+# 画面与输入测量（0.5.1）
 
 编码仍是 HEVC 4:4:4、原有 P1 / 无 B 帧 / 无 lookahead / 自动 CBR。本轮不通过改变编码质量、显示模式或增加播放缓冲来换取平滑曲线。
 
@@ -24,7 +24,9 @@ python scripts/analyze-experience.py '.local/capture/VI/experience-*.csv' --sess
 - Present 是成功提交。额外记录 DXGI 的 PresentCount、PresentRefreshCount、SyncRefreshCount、SyncQPCTime、HRESULT 和 GetLastPresentCount。只对连续观测的已显示编号计算刷新周期间隔，漏观测单列，不能作为丢帧数。
 - DXGI 统计可能不可用或延迟，特别是硬件显示队列、多屏/其他全屏应用。此时保持 unavailable；不调用 DwmFlush 强行同步，以免改变待测管线。仍需 PresentMon/ETW 或外部测量补充验证。
 - 输入发送和完成 ACK 按 session + sequence 对齐；ACK 包含注入和返回网络，不是应用响应或物理 input-to-photon。
-- diagnostics.json/jsonl 增加输入 credit_stalls、credit_wait_total_ms、credit_wait_max_ms，判断固定八包在途额度是否真的阻塞。未凭猜测加大输入队列。
+- diagnostics.json/jsonl 的输入 credit_stalls、credit_wait_total_ms、credit_wait_max_ms 用于判断在途额度是否阻塞。0.5.0 起，快连接保留八包额度，高传播延迟时最多增加到 64；看当前 credit limit 和 in-flight，不能再默认所有连接都是八包。
+- 0.5.1 的 video_send 增加 write_limit、owned_bytes、write_budget_bytes 及 tcp_rtt_ms、tcp_min_rtt_ms、tcp_ideal_bytes、tcp_cwnd_bytes、tcp_send_window_bytes、tcp_inflight_bytes、tcp_sample_age_ms。owned_bytes 包含整个尚未完成的 WSASend 存储，tcp_inflight_bytes 是 TCP 实测，两者不同；预算只限制原有两笔以上的扩展发送，大 IDR 可以让前两笔的总字节超过预算。
+- 必须同时看 tcp_available 和采样年龄。发送线程工作时最多每 250ms 查询一次；静止期样本会变老。RTT、WSASend 完成时间都不是 input-to-photon，也不能用“Send wait 下降”单独证明画面更顺。
 - 240Hz 固定刷新显示 100 FPS 内容可能有 2/3 个刷新周期的重复帧节奏。它与几十/上百毫秒的停顿是不同问题，不能混为一谈。
 
 最终“USB 手感”验收需要同一输入设备、同一应用与显示条件下的本地/远程对照，必要时用高速摄影或光电测量。软件 ACK 不能代替这个结论。
