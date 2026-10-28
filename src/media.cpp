@@ -1323,13 +1323,23 @@ void MediaViewer::request_stop() {
 }
 void MediaViewer::close() {
     request_stop();if (impl_->worker.joinable()) impl_->worker.join();
-    std::lock_guard guard(impl_->mutex);impl_->composition.reset();
+    std::shared_ptr<ViewerComposition> composition;
+    {std::lock_guard guard(impl_->mutex);composition=std::move(impl_->composition);}
+    // DComp/DXGI destruction can synchronously contact the HWND thread. Never
+    // hold viewer state while that thread may be reading stats or changing Peek.
 }
 void MediaViewer::set_display_cadence(bool enabled){impl_->display_cadence=enabled;}
-void MediaViewer::peek_opacity(bool visible,bool animate){std::lock_guard guard(impl_->mutex);if(impl_->composition)impl_->composition->opacity(visible,animate);}
+void MediaViewer::peek_opacity(bool visible,bool animate){
+    std::shared_ptr<ViewerComposition> composition;
+    {std::lock_guard guard(impl_->mutex);composition=impl_->composition;}
+    if(composition)composition->opacity(visible,animate);
+}
 void MediaViewer::preview(bool enabled){if(!enabled)return;{std::lock_guard guard(impl_->mutex);impl_->present_enabled=true;}impl_->changed.notify_all();}
 void MediaViewer::activate(){
-    {std::lock_guard guard(impl_->mutex);if(impl_->composition)impl_->composition->opacity(true,false);impl_->present_enabled=true;}
+    // Commit can enter graphics locks also used by Present; its completion
+    // callback takes viewer state. Keep this ordering free of a lock cycle.
+    peek_opacity(true,false);
+    {std::lock_guard guard(impl_->mutex);impl_->present_enabled=true;}
     impl_->changed.notify_all();
 }
 std::string MediaViewer::stats() const { std::lock_guard guard(impl_->mutex); return impl_->status; }
