@@ -1327,6 +1327,9 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
     });
     error = ready.get(); if (!error.empty()) { close(); return false; } return true;
 }
+bool MediaViewer::receive_ready()const{
+    std::lock_guard guard(impl_->mutex);return !impl_->stopping&&impl_->frames.size()<ViewerQueue::MaxPending;
+}
 void MediaViewer::submit(EncodedFrame frame) {
     experience_trace(ExperienceEvent::Arrival,frame.session,frame.sequence,{frame.capture_time_us,frame.source_ready_us,frame.width,frame.height});
     std::lock_guard guard(impl_->mutex);

@@ -16,6 +16,7 @@ public:
     using Bytes=std::vector<uint8_t>;
     struct Hooks {
         std::function<void(Bytes,uint64_t,uint64_t)> picture;
+        std::function<bool(const Bytes&)> receive_ready;
         std::function<void()> credit,keyframe;
         std::function<void(const std::string&)> status;
     };

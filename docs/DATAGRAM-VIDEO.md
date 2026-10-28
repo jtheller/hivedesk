@@ -47,6 +47,12 @@ released in reference order to the existing bounded decoder queue; presentation
 still uses the latest ready image. Late epochs are acknowledged but never shown.
 Session identity remains in the original authenticated frame message.
 
+From 0.8.1, complete frames wait for decoder queue credit without blocking UDP
+receive/ACK work. Their real final-fragment timestamp is retained while waiting
+for references or credit. Both incomplete and completed retained frames count
+towards the same 32 MiB / 128-frame receive budget. Expired reference ownership
+requires a new IDR, with bounded repeat reset requests until a new epoch arrives.
+
 UDP establishment has a 3 s limit. A retained frame has a 2 s transport lifetime.
 A blocked sender switches to TCP and requires an IDR, without disconnecting the
 independent reciprocal stream. Receiving the first TCP frame permanently fences

@@ -605,6 +605,17 @@ private:
             const auto target=hosting_.load();
             if(target&&target->peer==peer) {target->revoke();input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);shell_.observe_cursor({});staged_clipboards_.erase(peer);host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();status("Remote control released.");}
         };
+        callbacks.frame_credit=[this](const std::string& peer,uint64_t session){
+            if(closing_)return true;
+            const auto target=active_.load();
+            if(!target||*target!=peer){
+                std::shared_ptr<WarmView> warm;
+                {const std::lock_guard lock(warm_mutex_);auto found=warm_views_.find(peer);if(found!=warm_views_.end())warm=found->second;}
+                return !warm||warm->failed||warm->settings.session!=session||warm->viewer->receive_ready();
+            }
+            const std::lock_guard lock(view_mutex_);const auto current=active_.load();
+            return !current||*current!=peer||session!=active_session_||viewer_.load()->receive_ready();
+        };
         callbacks.frame=[this](const std::string& peer,hive::EncodedFrame frame) {
             const auto target=active_.load();
             if(closing_)return;

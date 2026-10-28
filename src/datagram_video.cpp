@@ -100,7 +100,6 @@ struct DatagramVideo::Impl {
         try {
             while(!stopping) {
                 bool credit=false,key=false,fallback=false,activated=false;uint64_t wake=0;
-                std::vector<datagram::Window::Picture> pictures;
                 {
                     std::lock_guard lock(mutex);const auto now=now_us();
                     const bool before=mode==Route::Datagram&&window.ready();
@@ -125,7 +124,7 @@ struct DatagramVideo::Impl {
                         for(unsigned i=0;i<256;++i){auto packet=window.poll(now);if(!packet)break;send_wire(*packet);}
                         if(prior.owned&&window.stats().expired>prior.expired)fallback=fallback_locked();
                     }
-                    pictures=window.take_pictures();key=window.take_key_request();
+                    key=window.take_key_request();
                     credit=activated||fallback||(!before&&mode==Route::Datagram&&window.ready());
                     wake=std::min(window.next_wake(now),now+1000000);
                     if(mode==Route::Negotiating)wake=std::min(wake,now+100000);
@@ -133,11 +132,23 @@ struct DatagramVideo::Impl {
                 if(activated)say("Video packet transport ready (authenticated UDP).");
                 if(fallback)say("Video packet path unavailable; continuing with TCP and a fresh reference frame.");
                 if(key&&hooks.keyframe)hooks.keyframe();if(credit&&hooks.credit)hooks.credit();
-                for(auto& picture:pictures) {
+                for(;;) {
                     // Fallback and delivery serialize, so the last UDP callback
                     // cannot overtake the first TCP frame on another reader.
                     std::lock_guard delivery(delivery_mutex);
-                    if(!receive_tcp&&!stopping&&hooks.picture)hooks.picture(std::move(picture.bytes),picture.started,picture.completed);
+                    if(receive_tcp||stopping)break;
+                    const datagram::Window::Picture* pending=nullptr;
+                    {std::lock_guard lock(mutex);pending=window.front_picture();}
+                    if(!pending)break;
+                    // Only this worker changes the receive queue; TCP fencing
+                    // holds delivery_mutex. Query consumer capacity outside the
+                    // transport state lock and keep ACK/pacing work independent.
+                    if(hooks.receive_ready&&!hooks.receive_ready(pending->bytes)){
+                        wake=std::min(wake,now_us()+1000);break;
+                    }
+                    std::optional<datagram::Window::Picture> picture;
+                    {std::lock_guard lock(mutex);picture=window.take_picture();}
+                    if(picture&&hooks.picture)hooks.picture(std::move(picture->bytes),picture->started,picture->completed);
                 }
                 timer.wait_until(FrameTimer::Clock::time_point(std::chrono::microseconds(wake)),readable);
             }
@@ -180,7 +191,7 @@ bool DatagramVideo::send(Bytes bytes,bool key,uint64_t session){
 }
 bool DatagramVideo::accept_tcp(bool key){std::lock_guard lock(impl_->mutex);if(impl_->mode!=Route::Tcp)return false;if(key)impl_->tcp_key=true;return impl_->tcp_key;}
 void DatagramVideo::cancel(uint64_t session){std::lock_guard lock(impl_->mutex);impl_->window.cancel(session);impl_->timer.notify();}
-void DatagramVideo::tcp_received(){std::lock_guard delivery(impl_->delivery_mutex);std::lock_guard lock(impl_->mutex);impl_->receive_tcp=true;}
+void DatagramVideo::tcp_received(){std::lock_guard delivery(impl_->delivery_mutex);std::lock_guard lock(impl_->mutex);impl_->receive_tcp=true;impl_->window.discard_received(true);}
 std::string DatagramVideo::diagnostics()const{
     std::lock_guard lock(impl_->mutex);auto s=impl_->window.stats();std::ostringstream out;
     out<<" media="<<(impl_->mode==Route::Datagram?"udp":impl_->mode==Route::Tcp?"tcp-fallback":"udp-negotiating")

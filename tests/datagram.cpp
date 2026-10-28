@@ -23,6 +23,7 @@ void reference_tests(){
     require(b.receive(packets[1],31000),"last fragment rejected");auto output=b.take_pictures();
     require(output.size()==2&&output[0].bytes==first&&output[1].bytes==second,"ordered exact reassembly");
     require(output[0].started==30001&&output[0].completed==31000,"local assembly timing");
+    require(output[1].started==30000&&output[1].completed==30000,"reference wait restamped an old picture as newly received");
     for(auto& ack:drain(b,32000))require(a.receive(ack,40000),"ACK rejected");
     require(a.stats().flight==0&&a.stats().owned==0,"ACK storage not freed");
     const auto cwnd=a.stats().cwnd;Bytes forged{Window::Ack,1};hive::datagram::put(forged,1000000,8);
@@ -42,6 +43,9 @@ void reference_tests(){
     Window switching;
     for(uint64_t now=1;now<100000;now+=100){if(switching.ready())require(switching.enqueue(image(1000,1),true,now,now),"rapid session enqueue");drain(switching,now);}
     require(switching.stats().sent<=32&&switching.stats().flight<=32,"IDR/session churn bypassed congestion credits");
+    Window stalled_receiver;for(auto& p:packets)require(stalled_receiver.receive(p,1),"receive expiration setup");
+    drain(stalled_receiver,Window::Deadline+2);
+    require(stalled_receiver.receive(next[0],Window::Deadline+3)&&stalled_receiver.take_pictures().empty(),"expired retained references exposed dependent pictures");
     std::puts("PASS reorder, missing reference, duplicate, session/epoch fence, bounds, ACK ownership and deadline");
 }
 struct Delivery {bool to_b;Bytes packet;};
@@ -81,11 +85,12 @@ void socket_test(){
     using hive::DatagramVideo;WSADATA ws{};require(WSAStartup(MAKEWORD(2,2),&ws)==0,"Winsock");
     struct Cleanup{~Cleanup(){WSACleanup();}} cleanup;
     std::array<uint8_t,32> key{};for(size_t i=0;i<key.size();++i)key[i]=uint8_t(i+3);
-    std::atomic<unsigned> rx_a=0,rx_b=0;std::atomic<bool> damaged=false;
+    std::atomic<unsigned> rx_a=0,rx_b=0;std::atomic<bool> damaged=false,consumer_ready=true;
     const auto content=image(64000,71);auto progress_a=std::make_shared<std::atomic<uint64_t>>(0),progress_b=std::make_shared<std::atomic<uint64_t>>(0);
     DatagramVideo::Hooks ha,hb;
     ha.picture=[&](Bytes b,uint64_t start,uint64_t end){if(b!=content||!start||end<start)damaged=true;++rx_a;};
     hb.picture=[&](Bytes b,uint64_t start,uint64_t end){if(b!=content||!start||end<start)damaged=true;++rx_b;};
+    hb.receive_ready=[&](const Bytes&){return consumer_ready.load();};
     DatagramVideo a("127.0.0.1",key,true,progress_a,ha),b("127.0.0.1",key,false,progress_b,hb);
     require(a.offer(b.port())&&b.offer(a.port()),"port exchange");a.start();b.start();
     auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);unsigned sent_a=0,sent_b=0;
@@ -97,8 +102,15 @@ void socket_test(){
     std::printf("SOCKET a=%u b=%u%s%s\n",rx_a.load(),rx_b.load(),a.diagnostics().c_str(),b.diagnostics().c_str());
     require(!damaged&&rx_a==120&&rx_b==120,"full duplex socket transfer");
     require(progress_a->load()==120*content.size()&&progress_b->load()==120*content.size(),"unique authenticated byte feedback");
+    consumer_ready=false;unsigned burst=0;deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(burst<10&&std::chrono::steady_clock::now()<deadline){if(a.ready()){require(a.send(content,false,7),"burst send");++burst;}std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+    while(progress_b->load()<130*content.size()&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(burst==10&&progress_b->load()==130*content.size()&&rx_b==120&&a.route()==DatagramVideo::Route::Datagram,"decoder credit blocked packet ACK/progress or leaked a picture");
+    consumer_ready=true;deadline=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+    while(rx_b<130&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(rx_b==130,"decoder credit did not resume retained references");
     b.tcp_received();require(a.ready()&&a.send(content,true,10),"late UDP setup");
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));require(rx_b==120,"UDP callback escaped TCP fallback fence");
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));require(rx_b==130,"UDP callback escaped TCP fallback fence");
     deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
     while(a.route()!=DatagramVideo::Route::Tcp&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(10));
     require(a.route()==DatagramVideo::Route::Tcp&&!a.accept_tcp(false)&&a.accept_tcp(true),"midstream black hole did not recover through a fresh TCP reference");

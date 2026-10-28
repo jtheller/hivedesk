@@ -54,27 +54,35 @@ public:
     bool take_key_request() { return std::exchange(request_key_,false); }
     void abandon() { clear_sender();need_key_=true;request_key_=true; }
     Stats stats() const { auto s=stats_;s.flight=flight_.size();s.owned=owned_;s.cwnd=cwnd_;s.srtt=srtt_;s.min_rtt=min_rtt_;return s; }
-    std::vector<Picture> take_pictures() { return std::exchange(pictures_,{}); }
+    const Picture* front_picture()const{return pictures_.empty()?nullptr:&pictures_.front();}
+    std::optional<Picture> take_picture(){
+        if(pictures_.empty())return {};auto picture=std::move(pictures_.front());pictures_.pop_front();receive_owned_-=picture.bytes.size();return picture;
+    }
+    std::vector<Picture> take_pictures(){std::vector<Picture> result;while(auto p=take_picture())result.push_back(std::move(*p));return result;}
+    void discard_received(bool stop_recovery=false){assembly_.clear();pictures_.clear();receive_owned_=0;if(stop_recovery){receive_wait_key_=false;reset_epoch_=0;}}
     uint64_t next_wake(uint64_t now) const {
         uint64_t due=now+1000000;
         if(!acks_.empty())due=std::min(due,ack_due_);
         if(reset_epoch_)due=now;
+        if(receive_wait_key_)due=std::min(due,reset_sent_at_+250000);
         if(!frames_.empty()) {
             due=std::min(due,frames_.front()->at+Deadline);
             if(frames_.back()->offset<frames_.back()->bytes.size()&&flight_.size()<size_t(cwnd_))due=std::min(due,pace_due_);
         }
         if(!timers_.empty())due=std::min(due,std::max(pace_due_,timers_.begin()->first));
         if(!assembly_.empty())due=std::min(due,assembly_.begin()->second.at+Deadline);
+        if(!pictures_.empty())due=std::min(due,pictures_.front().completed+Deadline);
         return std::max(now,due);
     }
     std::optional<Bytes> poll(uint64_t now) {
         if(!frames_.empty()&&now-frames_.front()->at>=Deadline) {
             ++stats_.expired; abandon(); congestion(now,true);
         }
-        if(!assembly_.empty()&&now-assembly_.begin()->second.at>=Deadline) {
-            reset_epoch_=receive_epoch_;assembly_.clear();receive_owned_=0;++stats_.expired;
+        if((!assembly_.empty()&&now-assembly_.begin()->second.at>=Deadline)||(!pictures_.empty()&&now-pictures_.front().completed>=Deadline)) {
+            reset_epoch_=receive_epoch_;discard_received();receive_wait_key_=true;++stats_.expired;
         }
-        if(reset_epoch_) {Bytes b{Reset};put(b,std::exchange(reset_epoch_,0),8);return b;}
+        if(receive_wait_key_&&now-reset_sent_at_>=250000)reset_epoch_=receive_epoch_;
+        if(reset_epoch_) {Bytes b{Reset};put(b,std::exchange(reset_epoch_,0),8);reset_sent_at_=now;return b;}
         if(!acks_.empty()&&(acks_.size()>=32||now>=ack_due_)) {
             const size_t count=std::min<size_t>(128,acks_.size());Bytes b{Ack,uint8_t(count)};
             for(size_t i=0;i<count;++i){put(b,acks_.front(),8);acks_.pop_front();}
@@ -129,13 +137,14 @@ public:
         if(epoch<receive_epoch_){ack(id,now);return true;}
         if(epoch>receive_epoch_) {
             if(frame-epoch>=MaxFrames)return false;
-            assembly_.clear();receive_owned_=0;receive_epoch_=epoch;next_receive_=epoch;
+            discard_received(true);receive_epoch_=epoch;next_receive_=epoch;
         }
+        if(receive_wait_key_){ack(id,now);if(now-reset_sent_at_>=250000)reset_epoch_=receive_epoch_;return true;}
         if(frame<next_receive_){ack(id,now);++stats_.duplicates;return true;}
         if(frame-next_receive_>=MaxFrames)return false;
         auto it=assembly_.find(frame);
         if(it==assembly_.end()) {
-            if(receive_owned_+total>MaxBytes||assembly_.size()>=MaxFrames)return false;
+            if(receive_owned_+total>MaxBytes||assembly_.size()+pictures_.size()>=MaxFrames)return false;
             Assembly a;a.bytes.resize(size_t(total));a.seen.resize(size_t((total+Fragment-1)/Fragment));a.base=id-offset/Fragment;a.at=now;
             receive_owned_+=total;it=assembly_.emplace(frame,std::move(a)).first;
         }
@@ -144,11 +153,12 @@ public:
         const auto index=size_t(offset/Fragment);ack(id,now);
         if(a.seen[index]){++stats_.duplicates;return true;}
         a.seen[index]=true;++a.count;std::copy(b.begin()+r.at,b.end(),a.bytes.begin()+size_t(offset));
+        if(a.count==a.seen.size())a.completed=now;
         ++stats_.received;stats_.received_bytes+=b.size()-r.at;
         for(;;) {
             auto next=assembly_.find(next_receive_);if(next==assembly_.end()||next->second.count!=next->second.seen.size())break;
-            auto& done=next->second;receive_owned_-=done.bytes.size();
-            pictures_.push_back({std::move(done.bytes),done.at,now});++stats_.delivered;
+            auto& done=next->second;
+            pictures_.push_back({std::move(done.bytes),done.at,done.completed});++stats_.delivered;
             assembly_.erase(next);++next_receive_;
         }
         return true;
@@ -157,12 +167,13 @@ private:
     struct Frame {Bytes bytes;uint64_t id=0,epoch=0,base=0,at=0;size_t offset=0,pending=0;};
     using Timers=std::multimap<uint64_t,uint64_t>;
     struct Packet {std::shared_ptr<Frame> frame;size_t offset;uint64_t at;unsigned tries;Timers::iterator timer;};
-    struct Assembly {Bytes bytes;std::vector<bool> seen;size_t count=0;uint64_t base=0,at=0;};
+    struct Assembly {Bytes bytes;std::vector<bool> seen;size_t count=0;uint64_t base=0,at=0,completed=0;};
     std::deque<std::shared_ptr<Frame>> frames_;std::map<uint64_t,Packet> flight_;
     Timers timers_;
-    std::map<uint64_t,Assembly> assembly_;std::deque<uint64_t> acks_;std::vector<Picture> pictures_;
-    size_t owned_=0,receive_owned_=0;bool need_key_=true,request_key_=false;
+    std::map<uint64_t,Assembly> assembly_;std::deque<uint64_t> acks_;std::deque<Picture> pictures_;
+    size_t owned_=0,receive_owned_=0;bool need_key_=true,request_key_=false,receive_wait_key_=false;
     uint64_t next_frame_=1,next_packet_=1,epoch_=0,session_=0,receive_epoch_=0,next_receive_=0,reset_epoch_=0;
+    uint64_t reset_sent_at_=0;
     uint64_t pace_due_=0,ack_due_=0,srtt_=0,variance_=0,min_rtt_=0,congested_at_=0;
     double cwnd_=32,threshold_=MaxFlight;Stats stats_;
     struct LossBin {uint64_t epoch=0,acked=0,retries=0;};std::array<LossBin,20> loss_bins_{};

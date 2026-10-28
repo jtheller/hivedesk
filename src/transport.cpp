@@ -675,6 +675,12 @@ struct Transport::Impl {
                 hooks.picture=[this,&c](Bytes bytes,uint64_t began,uint64_t completed){
                     if(!c.closed&&!dispatch(c,bytes,began,completed,true))c.close(true);
                 };
+                hooks.receive_ready=[this,&c](const Bytes& bytes){
+                    if(c.closed||!callbacks.frame_credit)return true;
+                    Reader frame{bytes};const auto type=frame.byte();
+                    const auto session=(type==AutoFrame||type==AutoFrameTimed||type==FrameCursor)?frame.qword():0;
+                    return !frame.good||callbacks.frame_credit(c.peer.id,session);
+                };
                 hooks.credit=[&c]{if(!c.closed)c.notify_ready();};
                 hooks.keyframe=[&c]{if(!c.closed)c.request_fresh_frame();};
                 hooks.status=[this,&c](const std::string& text){status(c.peer.name+": "+text);};

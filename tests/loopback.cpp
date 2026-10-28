@@ -104,6 +104,7 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
     };
     host_callbacks.feedback=[&](const std::string&,const hive::StreamFeedback& feedback){host.feedback(feedback);};
     hive::TransportCallbacks client_callbacks;
+    client_callbacks.frame_credit=[&](const std::string&,uint64_t){return closing||viewer.receive_ready();};
     client_callbacks.health=[&](const std::string&,const hive::StreamHealth& health){
         if(health.session!=session||health.target_millihz!=target||health.rate_millihz>target){fail("Invalid health negotiation");return;}
         negotiated=health.target_millihz;rate=health.rate_millihz;

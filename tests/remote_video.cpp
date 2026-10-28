@@ -15,6 +15,7 @@ int main(int argc,char** argv){
  auto config=hive::load_config();hive::Transport client;auto viewer=std::make_shared<hive::MediaViewer>();
  const uint64_t session=GetTickCount64(),began=session;std::atomic<bool> declined=false;std::atomic<unsigned> frames=0;
  hive::TransportCallbacks cb;
+ cb.frame_credit=[&](const std::string&,uint64_t id){return id!=session||viewer->receive_ready();};
  cb.status=[](const std::string& text){std::printf("transport %s\n",text.c_str());};
  cb.peer=[](const hive::Peer& p){if(!p.version.empty())std::printf("peer=%s version=%s\n",p.name.c_str(),p.version.c_str());};
  cb.frame=[&](const std::string&,hive::EncodedFrame f){if(f.session!=session)return;const auto n=++frames;if(n<=12||n%30==0)std::printf("frame t=%llu n=%u seq=%llu bytes=%zu source_us=%llu key=%d assembly_us=%llu\n",GetTickCount64()-began,n,f.sequence,f.data.size(),f.source_ready_us-f.capture_time_us,f.keyframe,f.receive_completed_us>=f.receive_started_us?f.receive_completed_us-f.receive_started_us:0);viewer->submit(std::move(f));};

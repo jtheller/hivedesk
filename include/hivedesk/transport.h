@@ -27,6 +27,9 @@ struct TransportCallbacks {
     std::function<void(const std::string&, uint64_t)> cancel_warm;
     std::function<void(const std::string&, uint64_t,bool)> preview;
     std::function<void(const std::string&, EncodedFrame)> frame;
+    // Optional receive-side decoder credit. False retains compressed references
+    // in the bounded packet lane while ACK/input work continues independently.
+    std::function<bool(const std::string&,uint64_t)> frame_credit;
     std::function<void(const std::string&, const InputEvent&)> input;
     std::function<void(const std::string&, const std::wstring&)> clipboard;
     std::function<void(const std::string&, const ClipboardOffer&)> clipboard_offer;
