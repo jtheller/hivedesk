@@ -32,6 +32,11 @@ int probe(){
     auto warm_open=std::async(std::launch::async,[&]{std::string why;require(warm_viewer.open(warm_surface->window,why,{},true),why.c_str());});
     while(warm_open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);warm_open.get();
     warm_viewer.submit(encoded);for(unsigned i=0;i<80&&!warm_viewer.has_frame();++i)pump(25);
+    if(!warm_viewer.has_frame()){
+        const auto d=warm_viewer.diagnostics();const auto f=warm_viewer.feedback();
+        std::fprintf(stderr,"Warm failure diagnostics: %s; expired=%llu discarded=%llu skipped=%llu recover=%d map_us=%u convert_us=%u arrival_age_us=%u\n",
+            warm_viewer.stats().c_str(),static_cast<unsigned long long>(d.age_expired),static_cast<unsigned long long>(d.discarded),static_cast<unsigned long long>(d.skipped),f.recover,d.nvdec_map_us,d.convert_us,f.arrival_age_us);
+    }
     require(warm_viewer.has_frame(),"Hidden warm viewer failed to decode its first picture");
     pump(30);require(!warm_viewer.has_presented_frame(),"Unselected warm viewer touched its swapchain");
     const int warm_y=px(12)+stride+tile/2;
