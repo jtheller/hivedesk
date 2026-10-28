@@ -110,7 +110,12 @@ int main(int argc,char** argv){
             for(unsigned i=0;i<12;++i){pump(i==5?80:3);const auto actual=samples();++dynamic_samples;
                 const int red=GetRValue(actual[0]);
                 if(red+5<previous_red||std::abs(int(GetBValue(actual[0]))-int(GetBValue(stable[0])))>5||std::abs(int(GetGValue(actual[0]))-int(GetGValue(stable[0])))>5)
+                {
+                    DWORD foreground_pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground_pid);
+                    std::printf("Cadence failure sample=%u previous_red=%d stable=%06lx,%06lx,%06lx actual=%06lx,%06lx,%06lx foreground_pid=%lu own_pid=%lu visible=%d iconic=%d status=%s\n",
+                        dynamic_samples,previous_red,stable[0],stable[1],stable[2],actual[0],actual[1],actual[2],foreground_pid,GetCurrentProcessId(),IsWindowVisible(video),IsIconic(video),viewer.stats().c_str());
                     throw std::runtime_error("Cadence flashed or replayed older pixels during fresh/repeated handoff");
+                }
                 previous_red=std::max(previous_red,red);
             }
         }
