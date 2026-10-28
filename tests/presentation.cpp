@@ -2,10 +2,11 @@
 #include "hivedesk/experience_trace.h"
 #include "../src/panel_composition.h"
 #include <future>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <vector>
-namespace hive { EncodedFrame media_generated_test_frame(); }
+namespace hive { EncodedFrame media_generated_test_frame(); std::vector<EncodedFrame> media_generated_cadence_frames(); }
 static void pump(DWORD ms){const auto end=GetTickCount64()+ms;do{MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(1);}while(GetTickCount64()<end);}
 static LRESULT CALLBACK proc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_NCHITTEST)return HTTRANSPARENT;if(m==WM_MOUSEACTIVATE)return MA_NOACTIVATE;return DefWindowProcW(h,m,w,l);}
 static bool took_foreground=false;
@@ -85,9 +86,35 @@ int main(int argc,char** argv){
             viewer.peek_opacity(true);pump(50);viewer.activate();pump(80);if(sample()!=live)throw std::runtime_error("Preview promotion changed/lost its presented pixels");
             std::printf("PASS real DWM peek: transparent readiness, live fade-in/out, same-surface promotion; pixels=%06lx\n",(unsigned long)live);
         }
+        ShowWindow(cover,SW_HIDE);pump(100);
+        const auto samples=[&]{std::array<COLORREF,3> colors{};HDC screen=GetDC(nullptr);
+            colors[0]=GetPixel(screen,x+160,y+30);colors[1]=GetPixel(screen,x+60,y+90);colors[2]=GetPixel(screen,x+260,y+146);ReleaseDC(nullptr,screen);return colors;};
+        const auto stable=samples();
         viewer.set_display_cadence(true);++frame.sequence;viewer.submit(frame);pump(200);
         const auto repeats=viewer.diagnostics().repeated_presentations;
         if(!repeats)throw std::runtime_error("Cadence did not repeat the final displayed image without new input");
+        unsigned mismatches=0;
+        for(unsigned i=0;i<100;++i){
+            if(i%10==0){++frame.sequence;viewer.submit(frame);}
+            pump(3);const auto actual=samples();
+            if(actual!=stable){if(!mismatches)std::printf("Cadence pixel mismatch: expected=%06lx,%06lx,%06lx actual=%06lx,%06lx,%06lx\n",stable[0],stable[1],stable[2],actual[0],actual[1],actual[2]);++mismatches;}
+        }
+        std::printf("Cadence continuous pixel samples: %u/100 mismatches\n",mismatches);
+        if(mismatches)throw std::runtime_error("Cadence flashed or replaced a static picture during repeated presentation");
+        // Increasing red values identify old-picture replay while fresh images
+        // alternate with gaps that must retain the latest displayed picture.
+        auto ramp=hive::media_generated_cadence_frames();int previous_red=GetRValue(stable[0]);unsigned dynamic_samples=0;
+        for(auto& next:ramp){
+            next.sequence=++frame.sequence;next.capture_time_us=next.source_ready_us=0;viewer.submit(next);
+            for(unsigned i=0;i<12;++i){pump(i==5?80:3);const auto actual=samples();++dynamic_samples;
+                const int red=GetRValue(actual[0]);
+                if(red+5<previous_red||std::abs(int(GetBValue(actual[0]))-int(GetBValue(stable[0])))>5||std::abs(int(GetGValue(actual[0]))-int(GetGValue(stable[0])))>5)
+                    throw std::runtime_error("Cadence flashed or replayed older pixels during fresh/repeated handoff");
+                previous_red=std::max(previous_red,red);
+            }
+        }
+        if(previous_red<215)throw std::runtime_error("Cadence did not reach the last changing picture");
+        std::printf("Cadence fresh/repeated handoff: %u pixel samples, monotonic red reached %d\n",dynamic_samples,previous_red);
         viewer.set_display_cadence(false);pump(40);const auto stopped=viewer.diagnostics().repeated_presentations;pump(100);
         if(viewer.diagnostics().repeated_presentations!=stopped)throw std::runtime_error("Cadence kept repeating after disable");
         std::printf("Cadence: %llu repeats with no additional encoded frames; live disable passed\n",static_cast<unsigned long long>(repeats));

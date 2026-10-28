@@ -1383,6 +1383,16 @@ EncodedFrame media_generated_test_frame() {
     for(uint32_t y=0;y<height;++y)for(uint32_t x=0;x<width;++x){auto* p=source.bgra.data()+(size_t(y)*width+x)*4;p[0]=uint8_t(x*255/width);p[1]=uint8_t(y*255/height);p[2]=80;p[3]=255;}
     Encoder encoder(width,height,StreamSettings{60,40});return encoder.encode(source,0,true);
 }
+std::vector<EncodedFrame> media_generated_cadence_frames() {
+    constexpr uint32_t width=640,height=360;
+    Image source{width,height,std::vector<uint8_t>(size_t(width)*height*4)};
+    Encoder encoder(width,height,StreamSettings{60,40});std::vector<EncodedFrame> frames;
+    for(uint32_t i=0;i<8;++i){
+        for(uint32_t y=0;y<height;++y)for(uint32_t x=0;x<width;++x){auto* p=source.bgra.data()+(size_t(y)*width+x)*4;p[0]=uint8_t(x*255/width);p[1]=uint8_t(y*255/height);p[2]=uint8_t(80+i*20);p[3]=255;}
+        frames.push_back(encoder.encode(source,i,true));
+    }
+    return frames;
+}
 static bool codec_self_test(std::string& report,const StreamSettings& settings) {
     try {
         constexpr uint32_t width = 256, height = 192;
