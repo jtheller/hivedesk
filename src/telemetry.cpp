@@ -92,7 +92,7 @@ struct Telemetry::Impl {
             out<<",\"transit_excess_ms\":"<<v.transit_extra_us/1000.0<<",\"wire_assembly_ms\":"<<v.wire_assembly_us/1000.0<<",\"sequence_gaps\":"<<v.sequence_gaps
                <<",\"age_expired\":"<<v.age_expired<<",\"queue_overflows\":"<<v.queue_overflows
                <<",\"nvdec_map_ms\":"<<v.nvdec_map_us/1000.0<<",\"convert_ms\":"<<v.convert_us/1000.0<<",\"draw_ms\":"<<v.draw_us/1000.0
-               <<",\"present_gap_p95_ms\":"<<v.present_gap_p95_us/1000.0<<",\"present_gap_max_ms\":"<<v.present_gap_max_us/1000.0<<",\"repeated_presentations\":"<<v.repeated_presentations<<'}';
+               <<",\"present_gap_p95_ms\":"<<v.present_gap_p95_us/1000.0<<",\"present_gap_max_ms\":"<<v.present_gap_max_us/1000.0<<",\"presented_frames\":"<<v.presented_frames<<'}';
         }
         out<<",\"video_send_age_ms\":"<<age(now,e.send_at)<<",\"video_send\":";
         if(!e.send_at||!e.send.available)out<<"null";

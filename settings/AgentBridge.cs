@@ -5,7 +5,7 @@ using System.Text;
 
 namespace HiveDesk.Settings;
 
-internal sealed record Preferences(string Name, bool Startup, bool TrayIcon, uint HotkeyModifiers, uint HotkeyKey, bool DebugOverlay = false, bool RelativeMouse = false, bool DisplayCadence = false);
+internal sealed record Preferences(string Name, bool Startup, bool TrayIcon, uint HotkeyModifiers, uint HotkeyKey, bool DebugOverlay = false, bool RelativeMouse = false);
 
 internal sealed class AgentBridge(bool preview)
 {
@@ -22,7 +22,7 @@ internal sealed class AgentBridge(bool preview)
     {
         if (preview) return demo;
         return new(Read("Name"), Read("Startup", "1") == "1", Read("TrayIcon", "1") == "1",
-            uint.Parse(Read("HotkeyModifiers", "3"), CultureInfo.InvariantCulture), uint.Parse(Read("HotkeyKey", "72"), CultureInfo.InvariantCulture), Read("DebugOverlay", "0") == "1", Read("RelativeMouse", "0") == "1", Read("DisplayCadence", "0") == "1");
+            uint.Parse(Read("HotkeyModifiers", "3"), CultureInfo.InvariantCulture), uint.Parse(Read("HotkeyKey", "72"), CultureInfo.InvariantCulture), Read("DebugOverlay", "0") == "1", Read("RelativeMouse", "0") == "1");
     }
     internal bool HotkeyAvailable() {
         if(preview)return true;
@@ -54,7 +54,7 @@ internal sealed class AgentBridge(bool preview)
     internal async Task Save(Preferences value)
     {
         if (preview) { demo = value; return; }
-        await Task.Run(() => Send("preferences", value.Name, value.Startup ? "1" : "0", value.TrayIcon ? "1" : "0", value.HotkeyModifiers.ToString(CultureInfo.InvariantCulture), value.HotkeyKey.ToString(CultureInfo.InvariantCulture), value.DebugOverlay ? "1" : "0", value.RelativeMouse ? "1" : "0", value.DisplayCadence ? "1" : "0"));
+        await Task.Run(() => Send("preferences", value.Name, value.Startup ? "1" : "0", value.TrayIcon ? "1" : "0", value.HotkeyModifiers.ToString(CultureInfo.InvariantCulture), value.HotkeyKey.ToString(CultureInfo.InvariantCulture), value.DebugOverlay ? "1" : "0", value.RelativeMouse ? "1" : "0"));
         for (int attempt = 0; attempt < 40; ++attempt)
         {
             await Task.Delay(100); var saved = Load();

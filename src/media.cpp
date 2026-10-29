@@ -1084,7 +1084,6 @@ struct MediaViewer::Impl {
     std::shared_ptr<const std::atomic<uint64_t>> network_progress;
     bool stopping = true, displayed = false, present_enabled = true;
     std::shared_ptr<ViewerComposition> composition;
-    std::atomic<bool> display_cadence=false;
     CursorPresentation cursor;
     std::thread worker;
     std::string status = "Closed";
@@ -1193,7 +1192,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
             } workers{pipeline_stop,pictures,decoder,presenter,impl_->mutex,impl_->changed};
             presenter=std::thread([&]{
                 SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer presentation");
-                std::optional<size_t> current;bool current_presented=false;
+                std::optional<size_t> current;
                 try{
                     {
                         std::unique_lock guard(impl_->mutex);
@@ -1202,7 +1201,6 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                     }
                     FrameTimer present_retry;
                     while(!cancelled()){
-                        if(current&&current_presented&&!impl_->display_cadence){renderer->cancel_pending();pictures.release(*current);current.reset();current_presented=false;}
                         if(!current&&!pictures.wait_ready(cancelled))break;
                         // Wait BEFORE acquiring the latest image and before
                         // touching the swapchain backbuffer. Mapping/NVDEC keep
@@ -1210,20 +1208,20 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                         if(!renderer->wait_available(cancelled))break;
                         const auto latest=pictures.take(current);
                         if(latest){
-                            if(current&&!current_presented){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
-                            current=latest;current_presented=false;renderer->cancel_pending();
+                            if(current){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;}
+                            current=latest;renderer->cancel_pending();
                         }
                         if(!current)continue;
                         auto& picture=ready_pictures[*current];
-                        const auto can_present=[&]{return current_presented||eligible(picture.pending);};
+                        const auto can_present=[&]{return eligible(picture.pending);};
                         if(!can_present()){
                             renderer->cancel_pending();pictures.release(*current);current.reset();
                             std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;continue;
                         }
                         uint32_t render_us=0,present_us=0;bool presented=false;
-                        if(latest||(current_presented&&!renderer->present_pending()))renderer->draw_prepared(picture.pixels,nullptr,&render_us,&present_us,&presented,can_present);
+                        if(latest)renderer->draw_prepared(picture.pixels,nullptr,&render_us,&present_us,&presented,can_present);
                         else presented=renderer->retry_present(can_present,&present_us);
-                        if(presented&&!current_presented&&experience_enabled()){
+                        if(presented&&experience_enabled()){
                             const auto d=renderer->display_observation();
                             experience_trace(ExperienceEvent::Present,picture.pending->frame.session,picture.pending->frame.sequence,
                                 {picture.pending->arrival,picture.prepared_at,render_us,present_us,d[0],d[1],d[2],d[3],d[4],d[5]});
@@ -1233,12 +1231,14 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                             if(!impl_->stopping){
                                 if(latest){impl_->diagnostics.render_us=render_us;impl_->diagnostics.draw_us=renderer->draw_us();}
                                 impl_->diagnostics.present_us=present_us;
-                                if(presented){if(current_presented)++impl_->diagnostics.repeated_presentations;else{++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}}
+                                if(presented){++impl_->diagnostics.presented_frames;++impl_->presented_count;++impl_->live_totals[2];impl_->present_samples.presented(now_us());}
                                 else if(!renderer->present_pending())++impl_->diagnostics.skipped;
                             }
                         }
-                        if(presented&&impl_->display_cadence)current_presented=true;
-                        else if(!renderer->present_pending()){pictures.release(*current);current.reset();current_presented=false;}
+                        // A successful Present retains its pixels in the
+                        // swapchain. Release source ownership and wait for new
+                        // work; only a not-yet-presented image needs a retry.
+                        if(!renderer->present_pending()){pictures.release(*current);current.reset();}
                         else present_retry.wait_until(Clock::now()+std::chrono::milliseconds(1)); // High-resolution retry, never timer-tick-sized Sleep jitter.
                     }
                 }catch(const std::exception& problem){
@@ -1355,7 +1355,6 @@ void MediaViewer::close() {
     // DComp/DXGI destruction can synchronously contact the HWND thread. Never
     // hold viewer state while that thread may be reading stats or changing Peek.
 }
-void MediaViewer::set_display_cadence(bool enabled){impl_->display_cadence=enabled;}
 void MediaViewer::peek_opacity(bool visible,bool animate){
     std::shared_ptr<ViewerComposition> composition;
     {std::lock_guard guard(impl_->mutex);composition=impl_->composition;}
@@ -1410,7 +1409,7 @@ EncodedFrame media_generated_test_frame() {
     for(uint32_t y=0;y<height;++y)for(uint32_t x=0;x<width;++x){auto* p=source.bgra.data()+(size_t(y)*width+x)*4;p[0]=uint8_t(x*255/width);p[1]=uint8_t(y*255/height);p[2]=80;p[3]=255;}
     Encoder encoder(width,height,StreamSettings{60,40});return encoder.encode(source,0,true);
 }
-std::vector<EncodedFrame> media_generated_cadence_frames() {
+std::vector<EncodedFrame> media_generated_motion_frames() {
     constexpr uint32_t width=640,height=360;
     Image source{width,height,std::vector<uint8_t>(size_t(width)*height*4)};
     Encoder encoder(width,height,StreamSettings{60,40});std::vector<EncodedFrame> frames;

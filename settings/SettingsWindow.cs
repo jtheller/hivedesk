@@ -26,7 +26,6 @@ internal sealed class SettingsWindow : Window
     private bool loadingPreferences, preferencesReady, closingSettings, closeAllowed;
     private readonly Button checkUpdates = new() { Content = "Check for updates" };
     private readonly CheckBox gpuPerformance = new() { Content = "Prefer maximum GPU performance", IsEnabled = false };
-    private readonly CheckBox displayCadence = new() { Content = "Steady display cadence (experimental)" };
     private readonly CheckBox relativeMouse = new() { Content = "Relative mouse" };
     private readonly TextBlock gpuPolicyHint = Hint("Checking GPU policy...");
     private readonly Button retryGpuRestart = new() { Content = "Retry restart" };
@@ -88,8 +87,7 @@ internal sealed class SettingsWindow : Window
         var mouseAndDebug = Stack(0, debug, relativeMouse); Grid.SetColumn(mouseAndDebug, 1); tools.Children.Add(mouseAndDebug);
         Id(relativeMouse, "RelativeMouse");
         relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
-        Id(displayCadence, "DisplayCadence");
-        content.Children.Add(Card(Stack(8, tools, Stack(0, gpuPerformance, gpuPolicyHint), displayCadence)));
+        content.Children.Add(Card(Stack(8, tools, Stack(0, gpuPerformance, gpuPolicyHint))));
         var footer = new Grid { ColumnSpacing = 16 }; footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var escape = Hint("Ctrl + Alt + `  returns here"); escape.VerticalAlignment = VerticalAlignment.Center; footer.Children.Add(escape); Grid.SetColumn(saveStatus, 1); footer.Children.Add(saveStatus);
         content.Children.Add(footer); content.Children.Add(feedback);
@@ -100,7 +98,6 @@ internal sealed class SettingsWindow : Window
         name.LostFocus += async (_, _) => { if (preferencesReady && !loadingPreferences) await Save(); };
         startup.Toggled += (_, _) => QueueSave(); tray.Toggled += (_, _) => QueueSave(); debug.Toggled += (_, _) => QueueSave();
         relativeMouse.Checked += (_, _) => QueueSave(); relativeMouse.Unchecked += (_, _) => QueueSave();
-        displayCadence.Checked += (_, _) => QueueSave(); displayCadence.Unchecked += (_, _) => QueueSave();
         checkUpdates.Click += async (_, _) => await CheckForUpdates();
         gpuPerformance.Click += async (_, _) => await ChangeGpuPolicy(gpuPolicyState?.State == GpuPolicyState.Conflict ? false : gpuPerformance.IsChecked == true);
         retryGpuRestart.Click += async (_, _) => await RetryGpuRestart();
@@ -138,9 +135,9 @@ internal sealed class SettingsWindow : Window
     }
     private static bool ValidHotkey(uint mods, uint code) => mods > 0 && mods <= 15 && (mods & 11) != 0 && ((code >= 65 && code <= 90) || (code >= 48 && code <= 57) || (code >= 112 && code <= 122));
     private string ShortcutText() => ((modifiers & 2) != 0 ? "Ctrl + " : "") + ((modifiers & 1) != 0 ? "Alt + " : "") + ((modifiers & 4) != 0 ? "Shift + " : "") + ((modifiers & 8) != 0 ? "Win + " : "") + (key >= 112 && key <= 122 ? "F" + (key - 111) : ((char)key).ToString());
-    private void Load(Preferences value) { loadingPreferences = true; try { name.Text = value.Name; startup.IsOn = value.Startup; tray.IsOn = value.TrayIcon; debug.IsOn = value.DebugOverlay; relativeMouse.IsChecked = value.RelativeMouse; displayCadence.IsChecked = value.DisplayCadence; modifiers = value.HotkeyModifiers; key = value.HotkeyKey; shortcut.Content = ShortcutText(); savedPreferences = value; } finally { loadingPreferences = false; } }
+    private void Load(Preferences value) { loadingPreferences = true; try { name.Text = value.Name; startup.IsOn = value.Startup; tray.IsOn = value.TrayIcon; debug.IsOn = value.DebugOverlay; relativeMouse.IsChecked = value.RelativeMouse; modifiers = value.HotkeyModifiers; key = value.HotkeyKey; shortcut.Content = ShortcutText(); savedPreferences = value; } finally { loadingPreferences = false; } }
     private void EndRecording() { if (!recording) return; recording = false; try { bridge.Send("record", "0"); } catch (Exception error) { Show(error.Message, InfoBarSeverity.Error); } shortcut.Content = ShortcutText(); }
-    private Preferences Values() { var text = name.Text.Trim(); if (string.IsNullOrWhiteSpace(text) || System.Text.Encoding.UTF8.GetByteCount(text) > 256) throw new InvalidOperationException("Enter a computer name of up to 256 UTF-8 bytes."); if (!ValidHotkey(modifiers, key)) throw new InvalidOperationException("Use Ctrl, Alt or Win with a letter, number, or F1-F11."); return new(text, startup.IsOn, tray.IsOn, modifiers, key, debug.IsOn, relativeMouse.IsChecked == true, displayCadence.IsChecked == true); }
+    private Preferences Values() { var text = name.Text.Trim(); if (string.IsNullOrWhiteSpace(text) || System.Text.Encoding.UTF8.GetByteCount(text) > 256) throw new InvalidOperationException("Enter a computer name of up to 256 UTF-8 bytes."); if (!ValidHotkey(modifiers, key)) throw new InvalidOperationException("Use Ctrl, Alt or Win with a letter, number, or F1-F11."); return new(text, startup.IsOn, tray.IsOn, modifiers, key, debug.IsOn, relativeMouse.IsChecked == true); }
     private void Show(string message, InfoBarSeverity severity) { feedback.ActionButton = null; feedback.Message = message; feedback.Severity = severity; feedback.IsOpen = true; }
     private void QueueSave(bool debounce = false) {
         if (!preferencesReady || loadingPreferences || closed || changingGpuPolicy) return;
@@ -207,7 +204,7 @@ internal sealed class SettingsWindow : Window
         DisplayGpuPolicy(gpuPolicyState);
         EndRecording(); changingGpuPolicy = true; gpuPerformance.IsEnabled = false;
         name.IsEnabled = startup.IsEnabled = tray.IsEnabled = debug.IsEnabled = shortcut.IsEnabled = false;
-        relativeMouse.IsEnabled = displayCadence.IsEnabled = false;
+        relativeMouse.IsEnabled = false;
         var previousGpuPolicy = gpuPolicyState;
         try
         {
@@ -246,7 +243,7 @@ internal sealed class SettingsWindow : Window
             if (!closed)
             {
                 name.IsEnabled = startup.IsEnabled = tray.IsEnabled = debug.IsEnabled = shortcut.IsEnabled = true;
-                relativeMouse.IsEnabled = bridge.RelativeMouseAvailable(); displayCadence.IsEnabled = true;
+                relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
                 DisplayGpuPolicy(gpuPolicyState);
             }
         }
@@ -323,13 +320,11 @@ internal sealed class SettingsWindow : Window
         string report;
         try {
             await Task.Delay(300);
-            int textFields = 0; void Inspect(DependencyObject node) { if (node is TextBox) ++textFields; if (node is Button && AutomationProperties.GetAutomationId(node) == "SaveSettings") throw new Exception("Manual Save button remains"); if (node is NumberBox || node is PasswordBox || node is Expander) throw new Exception("Manual connection/performance control remains"); for (int i = 0; i < VisualTreeHelper.GetChildrenCount(node); ++i) Inspect(VisualTreeHelper.GetChild(node, i)); } Inspect(root);
+            int textFields = 0; void Inspect(DependencyObject node) { if (node is TextBox) ++textFields; if (node is Button && AutomationProperties.GetAutomationId(node) == "SaveSettings") throw new Exception("Manual Save button remains"); if (AutomationProperties.GetAutomationId(node) == "DisplayCadence" || node is CheckBox box && box.Content is string label && label.Contains("cadence", StringComparison.OrdinalIgnoreCase)) throw new Exception("Retired cadence control remains"); if (node is NumberBox || node is PasswordBox || node is Expander) throw new Exception("Manual connection/performance control remains"); for (int i = 0; i < VisualTreeHelper.GetChildrenCount(node); ++i) Inspect(VisualTreeHelper.GetChild(node, i)); } Inspect(root);
             if (textFields != 1) throw new Exception("Expected only the computer name text field");
             if (!relativeMouse.IsEnabled || relativeMouse.ActualWidth <= 0 || AutomationProperties.GetAutomationId(relativeMouse) != "RelativeMouse") throw new Exception("Relative mouse checkbox missing");
             var mouseBounds = relativeMouse.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, relativeMouse.ActualWidth, relativeMouse.ActualHeight));
             if (mouseBounds.Right > root.ActualWidth - 12 || mouseBounds.Bottom > root.ActualHeight - 12) throw new Exception("Relative mouse checkbox clips");
-            var cadenceBounds = displayCadence.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, displayCadence.ActualWidth, displayCadence.ActualHeight));
-            if (displayCadence.ActualWidth <= 0 || cadenceBounds.Right > root.ActualWidth - 12 || cadenceBounds.Bottom > root.ActualHeight - 12) throw new Exception("Cadence checkbox clips");
             var saveBounds = saveStatus.TransformToVisual(root).TransformBounds(new Windows.Foundation.Rect(0, 0, saveStatus.ActualWidth, saveStatus.ActualHeight));
             if (saveStatus.ActualWidth <= 0 || saveBounds.Bottom > root.ActualHeight - 12 || saveBounds.Right > root.ActualWidth - 12) throw new Exception("Automatic-save status clips");
             if (version.Text != VersionText || version.ActualWidth <= 0 || !Version.TryParse(VersionText[1..], out _)) throw new Exception("Packaged version label missing");
@@ -401,8 +396,6 @@ internal sealed class SettingsWindow : Window
             name.Text = "Studio 2"; startup.IsOn = false; tray.IsOn = false; debug.IsOn = true; relativeMouse.IsChecked = true; modifiers = 6; key = 74; shortcut.Content = ShortcutText(); await Save();
             if (saveStatus.Text != "Saved automatically" || bridge.Load() != new Preferences("Studio 2", false, false, 6, 74, true, true)) throw new Exception("Preference save failed");
             Load(bridge.Load()); if (relativeMouse.IsChecked != true) throw new Exception("Relative mouse preference did not reload");
-            displayCadence.IsChecked = true; await Save(); if (!bridge.Load().DisplayCadence) throw new Exception("Cadence preference did not enable");
-            displayCadence.IsChecked = false; await Save(); if (bridge.Load().DisplayCadence) throw new Exception("Cadence preference did not disable");
             relativeMouse.IsChecked = false; await Save(); if (bridge.Load().RelativeMouse) throw new Exception("Relative mouse preference did not disable");
             name.Text = " "; await Save(); if (feedback.Severity != InfoBarSeverity.Error) throw new Exception("Blank name accepted"); name.Text = "Studio 2"; modifiers = 0; await Save(); if (feedback.Severity != InfoBarSeverity.Error) throw new Exception("Unmodified shortcut accepted"); modifiers = 3; key = 72; shortcut.Content = ShortcutText();
             await Task.Delay(100); await Save(); // Drain queued XAML toggle notifications from the setup above.
@@ -414,7 +407,7 @@ internal sealed class SettingsWindow : Window
             await WaitFor(() => bridge.Load().Name == "Typing done");
             if (writes != 1) throw new Exception("Name editing wrote intermediate text");
             startup.IsOn = !startup.IsOn; tray.IsOn = !tray.IsOn; debug.IsOn = !debug.IsOn;
-            relativeMouse.IsChecked = true; displayCadence.IsChecked = true;
+            relativeMouse.IsChecked = true;
             await WaitFor(() => bridge.Load() == Values());
             var firstWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             writes = 0; int activeWrites = 0, maxWrites = 0;

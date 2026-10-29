@@ -161,7 +161,7 @@ public:
             auto next=config_;next.name=name;next.desktop=desktop;
             try {hive::set_startup(desktop.startup);hive::save_config(next);}
             catch(const std::exception& e){try{hive::set_startup(config_.desktop.startup);}catch(...){}status(e.what());return false;}
-            config_=std::move(next);viewer_.load()->set_display_cadence(desktop.display_cadence);telemetry_.enabled(desktop.debug_overlay);transport_.rename(hive::narrow(name));return true;
+            config_=std::move(next);telemetry_.enabled(desktop.debug_overlay);transport_.rename(hive::narrow(name));return true;
         };
         callbacks.restart_video=[this] {
             {
@@ -814,7 +814,6 @@ private:
         // GPU/DXGI teardown can send UI messages; never join with the intent
         // lock held while UI selection or the input thread needs that lock.
         if(!admitted){go_local(nullptr,false,false);return;}
-        {const std::lock_guard lock(config_mutex_);viewer_.load()->set_display_cadence(config_.desktop.display_cadence);}
         const auto startup_picture=viewer_.load()->cursor_presentation();
         if(warm)viewer_.load()->activate();
         if(warm){const auto size=warm->size.load();remote_size_=size;if(size)shell_.set_remote_size(uint32_t(size>>32),uint32_t(size));}

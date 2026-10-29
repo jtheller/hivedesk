@@ -38,7 +38,7 @@ constexpr UINT UiTask=WM_APP+41, TrayMessage=WM_APP+42, KickControllerMessage=WM
 constexpr ULONG_PTR InputMarker=0x48495645;
 constexpr COLORREF Background=RGB(19,22,29), Card=RGB(34,39,49), Selected=RGB(37,66,80);
 constexpr COLORREF Accent=RGB(94,217,213), Text=RGB(240,243,247), Muted=RGB(162,172,188);
-constexpr int Name=101, Save=111, Close=113, Startup=117, TrayIcon=118, Hotkey=119, DebugOverlay=120, RelativeMouse=121, DisplayCadence=122;
+constexpr int Name=101, Save=111, Close=113, Startup=117, TrayIcon=118, Hotkey=119, DebugOverlay=120, RelativeMouse=121;
 std::wstring wide(const std::string& s) {
     if(s.empty()) return {};
     int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),nullptr,0);
@@ -829,7 +829,9 @@ struct Shell::Impl {
             desktop.startup=startup!=0;desktop.tray_icon=tray_icon!=0;
             if(fields.size()>=7){if(!number(fields[6],debug)||debug>1)return 0;desktop.debug_overlay=debug!=0;}
             if(fields.size()>=8){if(!number(fields[7],relative)||relative>1)return 0;desktop.relative_mouse=relative!=0;}
-            if(fields.size()==9){uint32_t cadence=0;if(!number(fields[8],cadence)||cadence>1)return 0;desktop.display_cadence=cadence!=0;}
+            // Accept an older Settings client's trailing boolean, but never
+            // restore the retired repeat-presentation experiment.
+            if(fields.size()==9){uint32_t retired=0;if(!number(fields[8],retired)||retired>1)return 0;}
             return apply_preferences(fields[1],desktop);
         }
         if(fields[0]==L"record"&&fields.size()==2){
@@ -866,7 +868,6 @@ struct Shell::Impl {
         SendMessageW(hotkey,CB_SETCURSEL,0,0);
         HWND debug=child(L"BUTTON",L"Debug overlay",BS_AUTOCHECKBOX|WS_TABSTOP,DebugOverlay,24,302,200,26);SendMessageW(debug,BM_SETCHECK,config.desktop.debug_overlay?BST_CHECKED:BST_UNCHECKED,0);
         HWND relative=child(L"BUTTON",L"Relative mouse",BS_AUTOCHECKBOX|WS_TABSTOP,RelativeMouse,244,302,230,26);SendMessageW(relative,BM_SETCHECK,config.desktop.relative_mouse?BST_CHECKED:BST_UNCHECKED,0);EnableWindow(relative,raw_mouse_available);
-        HWND cadence=child(L"BUTTON",L"Steady display cadence (experimental)",BS_AUTOCHECKBOX|WS_TABSTOP,DisplayCadence,24,330,450,18);SendMessageW(cadence,BM_SETCHECK,config.desktop.display_cadence?BST_CHECKED:BST_UNCHECKED,0);
         child(L"STATIC",L"Saved automatically",0,Save,24,350,320,22);
         child(L"STATIC",wide(HIVEDESK_VERSION).c_str(),0,0,24,379,185,24);
         child(L"BUTTON",L"Close",BS_PUSHBUTTON|WS_TABSTOP,Close,354,350,120,32);
@@ -878,7 +879,6 @@ struct Shell::Impl {
         auto desktop=config.desktop;desktop.startup=SendDlgItemMessageW(settings,Startup,BM_GETCHECK,0,0)==BST_CHECKED;desktop.tray_icon=SendDlgItemMessageW(settings,TrayIcon,BM_GETCHECK,0,0)==BST_CHECKED;
         desktop.debug_overlay=SendDlgItemMessageW(settings,DebugOverlay,BM_GETCHECK,0,0)==BST_CHECKED;
         desktop.relative_mouse=SendDlgItemMessageW(settings,RelativeMouse,BM_GETCHECK,0,0)==BST_CHECKED;
-        desktop.display_cadence=SendDlgItemMessageW(settings,DisplayCadence,BM_GETCHECK,0,0)==BST_CHECKED;
         const auto selected=SendDlgItemMessageW(settings,Hotkey,CB_GETCURSEL,0,0);
         if(selected>=1&&selected<=3){desktop.hotkey_key='H';desktop.hotkey_modifiers=selected==1?3:selected==2?6:9;}
         const bool saved=apply_preferences(control_text(GetDlgItem(settings,Name)),desktop);
@@ -998,7 +998,7 @@ struct Shell::Impl {
                 switch(LOWORD(w)) {
                 case Close:SendMessageW(window,WM_CLOSE,0,0);return 0;
                 case Name:if(s->fallback_settings_ready&&HIWORD(w)==EN_CHANGE){SetDlgItemTextW(window,Save,L"Saving...");SetTimer(window,6,350,nullptr);}return 0;
-                case Startup:case TrayIcon:case DebugOverlay:case RelativeMouse:case DisplayCadence:
+                case Startup:case TrayIcon:case DebugOverlay:case RelativeMouse:
                     if(s->fallback_settings_ready&&HIWORD(w)==BN_CLICKED)s->save_settings();return 0;
                 case Hotkey:if(s->fallback_settings_ready&&HIWORD(w)==CBN_SELCHANGE)s->save_settings();return 0;
                 }break;

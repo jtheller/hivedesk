@@ -41,7 +41,6 @@ public:
     void activate();
     void preview(bool enabled);
     void peek_opacity(bool visible,bool animate=true);
-    void set_display_cadence(bool enabled);
     void submit(EncodedFrame frame);
     bool receive_ready() const; // Compressed queue credit; does not wait for presentation.
     void request_stop(); // Invalidate work immediately; close() joins separately.
