@@ -5,6 +5,7 @@
 #include "input_diagnostics.h"
 #include "clipboard.h"
 #include "nested_return.h"
+#include "view_route.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -59,6 +60,7 @@ struct TransportCallbacks {
     std::function<void(const std::string&, const InputAck&)> input_ack;
     std::function<void(const std::string&, const ReturnRequest&)> return_request;
     std::function<void(const std::string&, const ReturnReply&)> return_reply;
+    std::function<void()> view_route_changed;
 };
 // Explicit developer diagnostic: generated data only, bounded duration/rate.
 struct PathProbeResult {
@@ -74,6 +76,10 @@ public:
     // Blocking connect/authenticate; call off UI thread. Explicit address supports LAN discovery restrictions.
     bool connect(const std::string& address, uint16_t port, std::string& peer_id, std::string& error);
     std::vector<Peer> peers() const;
+    std::vector<Peer> visible_peers() const;
+    bool view_allowed(const std::string&) const;
+    void set_view_parent(const std::string&,uint64_t session);
+    ViewRoute view_route() const;
     // Nonzero only when all negotiated authenticated channels are ready. Changes on reconnect.
     uint64_t connection_token(const std::string& peer) const;
     void rename(const std::string& name);

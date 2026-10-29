@@ -154,6 +154,7 @@ impersonator. No universal shared password is embedded in the application.
   They use real WinUI 3 controls, system light/dark theme and accent, with
   Mica on Windows 11 and a themed background on Windows 10. Open from the tray,
   Start menu or by opening HiveDesk.exe, even when the agent is already running. The Win8-inspired switcher remains native.
+- From 0.12.0, Hive hides computers that are directly or indirectly viewing this computer. A -> B hides A on B; A -> B -> C hides A and B on C. The list restores devices in their saved positions when the path is released. Live Peek counts as viewing; background warmup does not. Stream and Peek admission also check the route. Concurrent cycles are resolved by terminating one deterministically selected inbound session. Upgrade the whole chain for transitive protection; older peers cannot propagate ancestry.
 - Nested keyboard/mouse control is supported from 0.11.0: A -> B -> C routes input to C when B's active viewer is under control. Upgrade all computers in the chain. B's own UI and secure desktop remain local input destinations; forwarded presses are not injected a second time into B. Absolute coordinates are mapped through windowed viewers; raw relative movement is preserved.
 - Ctrl+Alt+physical backtick returns one remote level: A -> B -> C first returns to B, then to A.
 - Ctrl+Alt+Backspace returns directly to the computer at your keyboard, without waiting for the network.

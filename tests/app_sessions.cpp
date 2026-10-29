@@ -113,6 +113,13 @@ int probe(){
             app.test_relay_controller("peer-1",701,[&](const hive::InputPacket& p){
                 if(p.event.kind!=hive::InputKind::Absolute&&p.event.kind!=hive::InputKind::ReleaseAll)++local_edges;
             });
+            require(!app.test_view_allowed("peer-1")&&app.test_view_allowed("peer-0"),"Actual App did not hide its inbound viewer while preserving downstream control");
+            origin.net.set_view_parent("peer-2",702);
+            for(unsigned n=0;n<200&&app.test_view_allowed("peer-2");++n)Sleep(5);
+            require(!app.test_view_allowed("peer-2"),"Actual App did not hide an indirect ancestor");
+            origin.net.set_view_parent({},0);
+            for(unsigned n=0;n<200&&!app.test_view_allowed("peer-2");++n)Sleep(5);
+            require(app.test_view_allowed("peer-2"),"Actual App did not restore a removed ancestor");
             require(origin.net.begin_input("isolated-viewer",701),"Relay origin admission");
             for(unsigned n=0;n<200&&!origin.net.input_ready("isolated-viewer",701);++n)Sleep(5);
             require(origin.net.input_ready("isolated-viewer",701),"Relay origin not ready");
@@ -145,7 +152,20 @@ int probe(){
             for(unsigned n=0;n<200&&leaf.releases==prior;++n)Sleep(5);
             require(leaf.releases>prior&&app.test_ready("peer-0"),"Parent stop did not release child input while preserving its viewer");
             app.test_relay_controller({},0,{});
+            require(app.test_view_allowed("peer-1"),"Stopped controller stayed hidden");
             std::puts("PASS actual App A-B-C relay: all input kinds, no duplicate local edges, downstream ACK gating, raw relative deltas, bounded A-B-A input loop, parent-stop release without closing child view");
+        }
+        {
+            hive::Transport origin;std::atomic<bool> ended=false;hive::TransportCallbacks cb;
+            cb.host_ended=[&](const std::string&,uint64_t session){if(session==703)ended=true;};
+            std::string id,error;
+            require(origin.start({"a-cycle-origin","Cycle origin","stress-key",0,false,true},cb,error)&&origin.connect("127.0.0.1",48194,id,error),"Actual App cycle fixture connection");
+            app.test_relay_controller("a-cycle-origin",703,[](const hive::InputPacket&){});
+            origin.set_view_parent("isolated-viewer",704);
+            for(unsigned n=0;n<300&&(!ended||!app.test_view_allowed("a-cycle-origin"));++n)Sleep(5);
+            require(ended&&app.test_view_allowed("a-cycle-origin")&&app.test_ready("peer-0"),"Actual App failed cycle arbitration or closed unrelated outbound viewer");
+            app.test_relay_controller({},0,{});origin.stop();
+            std::puts("PASS actual App viewing-loop arbitration: scoped inbound termination, ancestor restoration, outbound viewer retained");
         }
         {
             auto& p=peers[0];{std::lock_guard lock(p.mutex);p.hold_release=true;p.held_release={};}

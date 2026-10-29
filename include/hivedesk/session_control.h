@@ -10,7 +10,7 @@ namespace hive {
 struct HostControl {
     const std::string peer;
     const uint64_t session, connection;
-    std::atomic<bool> revoked{false};
+    std::atomic<bool> revoked{false},cycle_rejected{false};
     std::atomic<bool> warming{false},previewing{false};
     std::atomic<uint64_t> warm_until{0};
     std::atomic<bool> input_enabled{false},input_error_reported{false};

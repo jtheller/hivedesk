@@ -56,4 +56,23 @@ void Shell::nested_return_self_test(){
     mapped=route_remote(501,absolute({0,0}),true,true);require(!mapped.forward&&mapped.local,"Local desktop pointer forwarded to nested viewer");
     mapped=route_remote(501,{InputKind::Key,30,0},false,true);require(!mapped.forward&&mapped.local,"Secure desktop input forwarded behind lock screen");
     route_remote(501,{InputKind::ReleaseAll},true,true);s.windowed=false;
+    s.local(false);s.hide_panel(false);
+    const auto order=s.config.device_order;
+    struct RestoreOrder{Impl& s;std::vector<std::string> order;~RestoreOrder(){s.config.device_order=std::move(order);}} restore_order{s,order};
+    s.config.device_order={"ancestor","ordinary"};
+    const std::vector<Peer> all{{"ordinary","Ordinary","",47980,true,FeatureWarmStream|FeatureLivePeek},{"ancestor","Ancestor","",47980,true,FeatureWarmStream|FeatureLivePeek}};
+    unsigned chosen=0,paused=0;
+    s.callbacks.select_peer=[&](const std::string&){++chosen;};
+    s.callbacks.peek_peer=[&](const std::string& id,uint64_t){if(id.empty())++paused;};
+    s.callbacks.visible_peers=[](const auto&){};
+    update_peers(all);s.show_panel(2);s.hover_peek(1);
+    const auto old_epoch=s.peek_epoch;s.pressed_card=1;s.dragged_peer="ancestor";
+    update_peers({all[0]});
+    require(s.peers.size()==1&&s.peers[0].id=="ordinary"&&s.peek_id.empty()&&s.peek_epoch>old_epoch&&paused&&s.pressed_card<0,"Hidden ancestor retained hover/drag/Peek authority");
+    require(std::find(s.warm_visible.begin(),s.warm_visible.end(),"ancestor")==s.warm_visible.end(),"Hidden ancestor retained warm visibility");
+    s.select("ancestor");s.select("ancestor",true);
+    require(!chosen,"Hidden ancestor selectable by stale fullscreen/window action");
+    update_peers(all);require(s.peers[0].id=="ancestor"&&s.config.device_order==std::vector<std::string>({"ancestor","ordinary"}),"Restored ancestor lost saved position");
+    s.hide_panel(false);
+
 }

@@ -49,6 +49,7 @@ constexpr uint32_t FeatureDatagramRecovery = 1048576;
 constexpr uint32_t FeatureScopedCursor = 2097152;
 constexpr uint32_t FeatureNestedReturn = 4194304;
 constexpr uint32_t FeatureInputRelay = 8388608;
+constexpr uint32_t FeatureViewRoute = 16777216;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;

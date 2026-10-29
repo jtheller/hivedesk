@@ -52,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -214,7 +214,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -264,7 +264,7 @@ struct Transport::Impl {
         uint64_t packet_started_us=0,packet_completed_us=0; // reader thread only
         VideoSendWindow video_send;
         InputSendWindow input_send;
-        uint64_t input_receive_session=0,input_receive_sequence=0;
+        uint64_t input_receive_session=0,input_receive_sequence=0,route_queued_revision=0;
         bool input_enabled=false,input_ending=false;
         explicit Conn(Impl* p, SOCKET s) : owner(p), socket(s) {}
         std::string local_ipv4(){
@@ -306,6 +306,11 @@ struct Transport::Impl {
         bool enqueue(Bytes b, bool keyframe = false) {
             if (!ready || closed) return false;
             std::unique_lock lock(queue_mutex);
+            if(channel==0&&!b.empty()&&b[0]==ViewRouteState){
+                Reader state{b};state.byte();const auto revision=state.qword();
+                if(revision<=route_queued_revision)return true;
+                route_queued_revision=revision;
+            }
             if (channel == 1) {
                 if (wait_keyframe && !keyframe) return false;
                 if (video) {
@@ -322,8 +327,8 @@ struct Transport::Impl {
             } else {
                 // HUD reports are latest-state data. Coalesce unsent reports
                 // so faster diagnostics cannot build a stale control backlog.
-                if(channel==0&&!b.empty()&&b[0]==Diagnostics){
-                    for(auto it=control.begin();it!=control.end();++it)if(!it->empty()&&(*it)[0]==Diagnostics){
+                if(channel==0&&!b.empty()&&(b[0]==Diagnostics||b[0]==ViewRouteState)){
+                    for(auto it=control.begin();it!=control.end();++it)if(!it->empty()&&(*it)[0]==b[0]){
                         control_bytes-=it->size();control.erase(it);break;
                     }
                 }
@@ -622,6 +627,19 @@ struct Transport::Impl {
     std::map<std::string,std::chrono::steady_clock::time_point> next_attempt;
     std::mutex sleep_mutex; std::condition_variable sleep_cv;
 
+    mutable std::mutex route_mutex;ViewRoutes routes;
+    Bytes route_bytes()const {
+        std::lock_guard lock(route_mutex);const auto& route=routes.local;
+        Bytes b{ViewRouteState};u64(b,route.revision);u64(b,route.session);b.push_back(route.full?1:0);b.push_back(uint8_t(route.path.size()));
+        for(const auto& node:route.path)str(b,node);return b;
+    }
+    void publish_route(){
+        const auto packet=route_bytes();
+        {std::lock_guard lock(mutex);for(const auto& [id,pair]:connected)
+            if(pair.control&&(pair.control->peer.features&FeatureViewRoute)&&!pair.control->enqueue(packet))pair.control->close(true);}
+        if(callbacks.view_route_changed)callbacks.view_route_changed();
+    }
+    bool incoming_view_allowed(const std::string& peer)const {std::lock_guard lock(route_mutex);return routes.incoming_allowed(peer);}
     void status(const std::string& s) { if (callbacks.status) { try { callbacks.status(s); } catch (...) {} } }
     void ended(Conn& c) {
         if (!running) return;
@@ -634,9 +652,10 @@ struct Transport::Impl {
                 if(it->second.video)it->second.video->close();
                 if(it->second.input)it->second.input->close();
                 ended_peer=c.peer;connected.erase(it);notify=true;
+                {std::lock_guard route_lock(route_mutex);routes.peers.erase(c.peer.id);if(routes.parent==c.peer.id){routes.parent.clear();routes.session=0;}routes.rebuild();}
             }
         }
-        if (notify) { ended_peer.authenticated = false; if (callbacks.peer) { try { callbacks.peer(ended_peer); } catch (...) {} } status("Connection closed: " + ended_peer.name); }
+        if (notify) { publish_route();ended_peer.authenticated = false; if (callbacks.peer) { try { callbacks.peer(ended_peer); } catch (...) {} } status("Connection closed: " + ended_peer.name); }
     }
     bool handshake(Conn& c, bool client, uint8_t requested) {
         c.outbound=client;
@@ -729,7 +748,12 @@ struct Transport::Impl {
             if(c->bound_control_token&&c->bound_control_token!=pair.control->token)return false;
             if(c->channel==0){if(pair.clipboard){pair.clipboard->close();pair.clipboard.reset();}if(pair.video){pair.video->close();pair.video.reset();}if(pair.input){pair.input->close();pair.input.reset();}}
             slot = c; c->ready = true;
+            if(!c->channel){std::lock_guard route_lock(route_mutex);routes.peers.erase(c->peer.id);
+                // A new control connection never inherits an old viewing lease,
+                // even if its registration races the old reader's ended().
+                if(routes.parent==c->peer.id){routes.parent.clear();routes.session=0;}routes.rebuild();}
         }
+        if(!c->channel)publish_route();
         if (!c->channel && callbacks.peer) { try { callbacks.peer(c->peer); } catch (...) {} }
         // Keep the authenticated hello layout and its random challenge intact.
         // Older peers never receive the optional encrypted version announcement.
@@ -869,6 +893,20 @@ struct Transport::Impl {
         if((c.channel==2)!=input_message)return false;
         if(type==ProbeStart||type==ProbeReady||type==ProbeDone||type==ProbePayload)return dispatch_probe(c,type,r);
         switch (type) {
+        case ViewRouteState: {
+            ViewRoute route;route.revision=r.qword();route.session=r.qword();const auto full=r.byte(),count=r.byte();route.full=full!=0;
+            if(!(c.peer.features&FeatureViewRoute)||!route.revision||full>1||!count||count>ViewRoutes::limit)return false;
+            for(unsigned i=0;i<count;++i){auto node=r.string(128);if(!text_ok(node,128))return false;
+                const bool repeat=std::find(route.path.begin(),route.path.end(),node)!=route.path.end();
+                if(repeat&&i+1!=count)return false;route.path.push_back(std::move(node));}
+            if(!r.end()||route.path.front()!=c.peer.id||(count>1)!=bool(route.session))return false;
+            bool changed=false;
+            {std::lock_guard lock(mutex);const auto it=connected.find(c.peer.id);
+                if(it==connected.end()||it->second.control.get()!=&c)return true;
+                std::lock_guard route_lock(route_mutex);auto& old=routes.peers[c.peer.id];
+                if(route.revision<=old.revision)return true;old=std::move(route);changed=routes.rebuild();}
+            if(changed)publish_route();return true;
+        }
         case InputEnable: {
             const auto session=r.qword();if(!(c.peer.features&FeatureDedicatedInput)||!session||!r.end())return false;
             auto input=find_input(c.peer.id);if(!input)return false;
@@ -935,6 +973,7 @@ struct Transport::Impl {
         case LivePeek: {
             const auto session=r.qword();const auto enabled=r.byte();
             if(!(c.peer.features&FeatureLivePeek)||!session||enabled>1||!r.end())return false;
+            if(enabled&&!incoming_view_allowed(c.peer.id)){Bytes ended{HostEnded};u64(ended,session);return c.enqueue(std::move(ended));}
             if(callbacks.preview)callbacks.preview(c.peer.id,session,enabled!=0);return true;
         }
         case WarmStart:
@@ -942,6 +981,7 @@ struct Transport::Impl {
             StreamSettings settings;settings.session=r.qword();settings.receiver_millihz=r.dword();settings.warm=type==WarmStart;
             if(settings.warm&&!(c.peer.features&FeatureWarmStream))return false;
             if(!(c.peer.features&FeatureAutomaticStream)||!settings.session||settings.receiver_millihz<1000||settings.receiver_millihz>2000000||!r.end())return false;
+            if(!settings.warm&&!incoming_view_allowed(c.peer.id)){Bytes ended{HostEnded};u64(ended,settings.session);return c.enqueue(std::move(ended));}
             if(callbacks.start_stream)callbacks.start_stream(c.peer.id,settings);return true;
         }
         case Feedback: {
@@ -1158,6 +1198,7 @@ bool Transport::start(const TransportConfig& cfg, TransportCallbacks callbacks, 
     if (!text_ok(cfg.device_id,128) || !text_ok(cfg.device_name,256) || (!cfg.automatic_lan&&!derive_network_key(cfg.group_key,p.group))) { error = "Invalid device identity or legacy Network Key."; return false; }
     WSADATA ws{}; if (WSAStartup(MAKEWORD(2,2),&ws) != 0) { error = "Winsock initialization failed."; return false; }
     p.winsock = true; p.cfg = cfg; p.callbacks = std::move(callbacks);
+    {std::lock_guard lock(p.route_mutex);p.routes={};p.routes.self=cfg.device_id;p.routes.rebuild();}
     p.running=true;
     if(!p.open_listener()){
         if(!cfg.discovery){error="Cannot listen on the configured TCP port.";stop();return false;}
@@ -1208,6 +1249,16 @@ void Transport::rename(const std::string& name){
 std::vector<Peer> Transport::peers() const {
     std::vector<Peer> result; std::lock_guard lock(impl_->mutex); for (const auto& [id,pair] : impl_->connected) if (pair.control && pair.control->ready && !pair.control->closed) result.push_back(pair.control->peer); return result;
 }
+std::vector<Peer> Transport::visible_peers()const {
+    auto list=peers();std::lock_guard lock(impl_->route_mutex);
+    std::erase_if(list,[&](const Peer& p){return !impl_->routes.allowed(p.id);});return list;
+}
+bool Transport::view_allowed(const std::string& peer)const {std::lock_guard lock(impl_->route_mutex);return impl_->routes.allowed(peer);}
+ViewRoute Transport::view_route()const {std::lock_guard lock(impl_->route_mutex);return impl_->routes.local;}
+void Transport::set_view_parent(const std::string& peer,uint64_t session){
+    bool changed;{std::lock_guard lock(impl_->route_mutex);impl_->routes.parent=session?peer:std::string{};impl_->routes.session=session;changed=impl_->routes.rebuild();}
+    if(changed)impl_->publish_route();
+}
 uint64_t Transport::connection_token(const std::string& peer) const {
     std::lock_guard lock(impl_->mutex);const auto it=impl_->connected.find(peer);
     if(it==impl_->connected.end())return 0;const auto& pair=it->second;
@@ -1215,6 +1266,7 @@ uint64_t Transport::connection_token(const std::string& peer) const {
     return pair.control->token;
 }
 bool Transport::request_stream(const std::string& peer, const StreamSettings& s) {
+    if(!view_allowed(peer))return false;
     if(s.warm&&!s.session)return false; // Never downgrade prewarming to legacy control Start.
     if(s.session){auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureAutomaticStream)||s.receiver_millihz<1000||s.receiver_millihz>2000000)return false;
         if(s.warm&&!(c->peer.features&FeatureWarmStream))return false;
@@ -1222,6 +1274,7 @@ bool Transport::request_stream(const std::string& peer, const StreamSettings& s)
     auto c = impl_->find(peer); if (!c || !s.bitrate_mbps || s.bitrate_mbps > 10000) return false; Bytes b{Start}; u32(b,s.fps); u32(b,s.bitrate_mbps); return c->enqueue(std::move(b));
 }
 bool Transport::preview(const std::string& peer,uint64_t session,bool enabled){
+    if(enabled&&!view_allowed(peer))return false;
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureLivePeek)||!session)return false;
     Bytes b{LivePeek};u64(b,session);b.push_back(enabled?1:0);return c->enqueue(std::move(b));
 }
@@ -1528,6 +1581,41 @@ bool Transport::discovery_self_test(std::string& result){
 }
 bool Transport::self_test(std::string& result) {
     {
+        Transport endpoint;auto& owner=*endpoint.impl_;owner.routes.self="local";owner.routes.parent="parent";owner.routes.session=99;owner.routes.rebuild();
+        auto c=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);c->ready=true;c->peer.id="parent";c->peer.features=FeatureViewRoute|FeatureHostKick|FeatureAutomaticStream|FeatureLivePeek;
+        owner.connected[c->peer.id]={c,{}};
+        const auto wire=[](uint64_t revision,uint64_t session,std::vector<std::string> nodes){Bytes b{ViewRouteState};u64(b,revision);u64(b,session);b.push_back(0);b.push_back(uint8_t(nodes.size()));for(const auto& n:nodes)str(b,n);return b;};
+        const auto valid=wire(2,88,{"parent","ancestor"});
+        if(!c->enqueue(wire(10,0,{"parent"}))||!c->enqueue(wire(9,1,{"parent","stale"}))||c->control.size()!=1||c->control.back()!=wire(10,0,{"parent"})){
+            result="Concurrent route publishers replaced newer state with older state";return false;
+        }
+
+        if(!owner.dispatch(*c,valid)||endpoint.view_allowed("ancestor")){result="View ancestry wire/filter failed";return false;}
+        if(!owner.dispatch(*c,wire(1,0,{"parent"}))||endpoint.view_allowed("ancestor")){result="Stale view revision restored ancestor";return false;}
+        for(auto bad:{wire(3,0,{"parent","ancestor"}),wire(3,1,{"wrong","ancestor"}),wire(3,1,{"parent","parent","ancestor"}),wire(0,0,{"parent"})})
+            if(owner.dispatch(*c,bad)){result="Malformed view ancestry accepted";return false;}
+        auto bad=valid;bad.pop_back();if(owner.dispatch(*c,bad)){result="Truncated view route accepted";return false;}
+        bad=valid;bad.push_back(0);if(owner.dispatch(*c,bad)){result="Trailing view route accepted";return false;}
+        bad=valid;bad[18]=65;if(owner.dispatch(*c,bad)){result="Oversized view route accepted";return false;}
+        c->peer.features&=~FeatureViewRoute;if(owner.dispatch(*c,valid)){result="Unnegotiated view route accepted";return false;}c->peer.features|=FeatureViewRoute;
+        if(!owner.dispatch(*c,wire(3,1,{"parent","local"}))){result="Cycle route rejected before arbitration";return false;}
+        unsigned starts=0;owner.callbacks.start_stream=[&](const std::string&,const StreamSettings&){++starts;};
+        Bytes start{AutoStart};u64(start,321);u32(start,60000);
+        if(!owner.dispatch(*c,start)||starts||c->control.back()[0]!=HostEnded){result="Inbound view cycle bypassed admission";return false;}
+        // The identical revision on a replacement connection cannot inherit
+        // the old socket's authority. Dispatch must use the registered control.
+        auto replacement=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);owner.connected[c->peer.id].control=replacement;
+        if(!owner.dispatch(*c,wire(100,0,{"parent"}))||owner.routes.peers["parent"].revision!=3){result="Retired view route source changed authority";return false;}
+        replacement->closed=true;replacement->peer.id="parent";
+        auto fresh=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);fresh->peer.id="parent";fresh->peer.features=FeatureViewRoute;
+        owner.running=true;
+        const bool renewed=owner.activate(fresh);owner.running=false;
+        if(!renewed||endpoint.view_route().session||!endpoint.view_allowed("parent")||!owner.routes.peers.empty()){
+            result="New control connection inherited old ancestry/lease";return false;
+        }
+
+    }
+    {
         Transport sender;auto& owner=*sender.impl_;
         auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);control->ready=true;
         control->peer.id="return-peer";control->peer.features=FeatureNestedReturn;
@@ -1800,7 +1888,7 @@ bool Transport::self_test(std::string& result) {
     }
     {
         Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);
-        control.channel=0;control.peer.features=FeatureAutomaticStream;
+        control.channel=0;control.peer.id="warm-peer";control.peer.features=FeatureAutomaticStream;
         Bytes request{WarmStart};u64(request,71);u32(request,100000);
         Bytes cancel{WarmCancel};u64(cancel,71);
         if(owner.dispatch(control,request)||owner.dispatch(control,cancel)){result="Unnegotiated prewarm accepted";return false;}
@@ -1866,7 +1954,7 @@ bool Transport::self_test(std::string& result) {
     }
     {
         Impl owner;Impl::Conn c(&owner,INVALID_SOCKET);c.channel=2;c.ready=true;
-        c.peer.id="relay-origin";c.peer.features=FeatureDedicatedInput|FeatureInputRelay;c.input_receive_session=701;
+        c.peer.id="relay-origin";c.peer.features=FeatureDedicatedInput|FeatureInputRelay|FeatureViewRoute;c.input_receive_session=701;
         unsigned received=0;InputPacket observed;
         owner.callbacks.input_packet=[&](const std::string&,const InputPacket& packet){++received;observed=packet;};
         InputPacket packet{701,1,input_now_us(),{InputKind::Key,30,0}};

@@ -47,6 +47,7 @@ public:
 #ifdef HIVEDESK_APP_SESSION_TEST
     bool test_ready(const std::string& peer)const{const auto active=active_.load();return active&&*active==peer&&view_ready_&&viewer_.load()->has_presented_frame();}
     HWND test_surface()const{return shell_.viewer_window();}
+    bool test_view_allowed(const std::string& peer)const{return transport_.view_allowed(peer);}
     void test_stop_viewer(){viewer_.load()->request_stop();}
     void test_return_previous(){shell_.return_previous();}
     bool test_return_pending(){const std::lock_guard lock(view_intent_mutex_);return return_barrier_.has_value();}
@@ -55,7 +56,7 @@ public:
         if(!GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)||(flags.dwFlags&WSF_VISIBLE))throw std::runtime_error("Relay fixture requires invisible station");
         const std::lock_guard lock(host_mutex_);test_relay_sink_=std::move(sink);
         if(auto old=hosting_.load())old->revoke();
-        hosting_=session?std::make_shared<hive::HostControl>(peer,session,transport_.connection_token(peer)):nullptr;input_ready_=session!=0;
+        hosting_=session?std::make_shared<hive::HostControl>(peer,session,transport_.connection_token(peer)):nullptr;input_ready_=session!=0;sync_host_route();
     }
     void test_delay_retirement(DWORD duration){retire_lane_.post([duration]{Sleep(duration);});}
     void test_report()const{const auto v=viewer_.load();const auto active=active_.load();const auto d=v->diagnostics();std::fprintf(stderr,"viewer test: active=%s ready=%d frame=%d presented=%d received=%llu state=%s input=%d decode_mhz=%u present_mhz=%u map_us=%u convert_us=%u depth=%u expired=%llu overflow=%llu skipped=%llu\n",active?active->c_str():"none",int(view_ready_.load()),v->has_frame(),v->has_presented_frame(),(unsigned long long)received_frames_.load(),v->stats().c_str(),active&&transport_.input_ready(*active,active_session_),d.decoded_millihz,d.presented_millihz,d.nvdec_map_us,d.convert_us,d.queue_depth,(unsigned long long)d.age_expired,(unsigned long long)d.queue_overflows,(unsigned long long)d.skipped);std::fflush(stderr);}
@@ -85,6 +86,7 @@ public:
             enqueue([this,peer,epoch]{
                 if(epoch!=generation_)return;
                 go_local(active_.exchange(nullptr),false);
+                if(!transport_.view_allowed(peer)){reconnect_={};shell_.show_local();return;}
                 reconnect_.select(peer,epoch);retry_tick();
             });
         };
@@ -134,7 +136,7 @@ public:
             peek_requested_=!peer.empty();warm_dirty_=true;wake_.notify_one();
         };
         callbacks.panel_opened=[this] {
-            for(const auto& peer:transport_.peers())if(peer.features&hive::FeatureDesktopAux) {
+            for(const auto& peer:transport_.visible_peers())if(peer.features&hive::FeatureDesktopAux) {
                 request_snapshot(peer.id);
             }
         };
@@ -235,6 +237,20 @@ public:
         return result;
     }
 private:
+    void sync_host_route(){
+        const auto c=hosting_.load();const bool visible=c&&!c->revoked&&(!c->warming||c->previewing);
+        transport_.set_view_parent(visible?c->peer:std::string{},visible?c->session:0);
+    }
+    void route_changed(){
+        if(closing_)return;
+        const auto route=transport_.view_route();const auto c=hosting_.load();
+        if(c&&route.path.size()>1&&route.path[1]==c->peer&&route.session==c->session&&
+            c->connection==transport_.connection_token(c->peer)&&route.cycle_owner()==route.path.front()&&!c->revoked){
+            c->cycle_rejected=true;
+            if(c->revoke()){{std::lock_guard lock(kick_mutex_);kick_pending_=c;}kick_wake_.notify_one();}
+        }
+        shell_.update_peers(transport_.visible_peers());warm_dirty_=true;wake_.notify_one();
+    }
     void relay_deliver(const std::shared_ptr<hive::HostControl>& control,const std::vector<hive::InputAck>& acks){
         if(closing_||!control||control->revoked||hosting_.load()!=control)return;
         for(const auto& ack:acks){if(ack.injected)shell_.cursor_input_applied(ack.session,ack.capture_time_us);transport_.send_input_ack(control->peer,ack);}
@@ -354,14 +370,14 @@ private:
                 const std::lock_guard lock(host_mutex_);
                 if(hosting_.load()!=target)continue;
                 if(!notified)legacy_kicked_[target->peer]=target->connection;
-                input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);
+                input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);sync_host_route();
                 shell_.observe_cursor({});staged_clipboards_.erase(target->peer);
                 host_.stop(); // Closing its input pipe releases held input.
                 telemetry_.clear(MonitorSide::Host);hive::release_injected_input();
             }
             // Remove any last frame whose callback raced with revocation.
             transport_.end_stream(target->peer,target->session);
-            status(notified?"Remote controller disconnected by local shortcut.":
+            status(target->cycle_rejected?"Viewing loop prevented; the conflicting session was released.":notified?"Remote controller disconnected by local shortcut.":
                 "Remote controller disconnected. Update both computers for kick support; this legacy connection is blocked.");
         }
     }
@@ -435,7 +451,7 @@ private:
         if(const auto host=hosting_.load();host&&host->warming&&((update_pending&&!host->previewing)||now>host->warm_until)){
             const std::lock_guard lock(host_mutex_);
             if(hosting_.load()==host&&host->warming&&((update_pending&&!host->previewing)||now>host->warm_until)){
-                host->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(host->peer,host->session);
+                host->revoke();hosting_=nullptr;sync_host_route();host_.stop();transport_.end_stream(host->peer,host->session);
             }
         }
         std::vector<std::shared_ptr<const hive::ViewerSurface>> visible;std::string peek_peer;uint64_t peek_epoch=0;
@@ -448,7 +464,7 @@ private:
                 if(wanted)warm->last_visible=now;
                 if(warm->done&&warm->viewer->stats().starts_with("Media error:"))warm->failed=true;
                 if(!warm->done&&now-warm->created>=8000){warm->failed=true;hive::log("Viewer preparation timed out: "+it->first);}
-                if((update_pending&&!warm->peeking)||warm->failed||now-warm->last_visible>2000){
+                if(!transport_.view_allowed(it->first)||(update_pending&&!warm->peeking)||warm->failed||now-warm->last_visible>2000){
                     if(warm->failed)warm_retry_[it->first]=now+2000;
                     expired.push_back(warm);it=warm_views_.erase(it);
                 }else ++it;
@@ -458,7 +474,7 @@ private:
         std::vector<std::shared_ptr<WarmView>> preview_candidates;
         {std::lock_guard lock(warm_mutex_);for(const auto& [id,warm]:warm_views_)preview_candidates.push_back(warm);}
         for(const auto& warm:preview_candidates){
-            const bool wanted=(!update_pending||warm->peeking)&&warm->surface->peer==peek_peer&&!warm->failed&&!warm->abandoned;
+            const bool wanted=transport_.view_allowed(warm->surface->peer)&&(!update_pending||warm->peeking)&&warm->surface->peer==peek_peer&&!warm->failed&&!warm->abandoned;
             if(warm->peeking&&(!wanted||warm->peek_epoch!=peek_epoch)){
                 transport_.preview(warm->surface->peer,warm->settings.session,false);warm->peeking=false;warm->peek_revealed=false;
             }
@@ -480,6 +496,7 @@ private:
         }
         std::stable_sort(visible.begin(),visible.end(),[&](const auto& a,const auto& b){return (a->peer==peek_peer)>(b->peer==peek_peer);});
         for(const auto& surface:visible){
+            if(!transport_.view_allowed(surface->peer))continue;
             {const std::lock_guard lock(queue_mutex_);if(closing_||!queue_.empty())break;}
             if(const auto active=active_.load();active&&*active==surface->peer)continue;
             const auto token=transport_.connection_token(surface->peer);if(!token)continue;
@@ -554,13 +571,14 @@ private:
                 const auto token=transport_.connection_token(peer.id);
                 if(target&&target->peer==peer.id&&(!token||target->connection!=token)){
                     target->revoke();
-                    input_ready_=false;clipboard_pending_=false;hosting_=nullptr;
+                    input_ready_=false;clipboard_pending_=false;hosting_=nullptr;sync_host_route();
                     shell_.observe_cursor({});staged_clipboards_.erase(peer.id);
                     host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();
                 }
             }
-            relay_tick();shell_.update_peers(transport_.peers());wake_.notify_one();
+            relay_tick();shell_.update_peers(transport_.visible_peers());wake_.notify_one();
         }};
+        callbacks.view_route_changed=[this]{route_changed();};
         callbacks.status=[this](const std::string& text){status(text);};
         callbacks.frame_ready=[this](const std::string& peer){
             const auto target=hosting_.load();
@@ -680,8 +698,8 @@ private:
                     return;
                 }
             }else if(old&&old->warming&&!old->revoked&&old->peer==peer&&old->session==settings.session){
-                old->warming=false;old->previewing=false;apply_handoff(peer);
-                if(!host_.activate()){old->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,settings.session);return;}
+                old->warming=false;old->previewing=false;sync_host_route();apply_handoff(peer);
+                if(!host_.activate()){old->revoke();hosting_=nullptr;sync_host_route();host_.stop();transport_.end_stream(peer,settings.session);return;}
                 std::string name=peer;for(const auto& item:transport_.peers())if(item.id==peer)name=item.name;
                 telemetry_.select(MonitorSide::Host,peer,settings.session,name);shell_.observe_cursor(peer,settings.session);
                 hive::log("Warm host promoted: "+peer+" session="+std::to_string(settings.session));return;
@@ -697,7 +715,7 @@ private:
             }
             const auto control=std::make_shared<hive::HostControl>(peer,settings.session,connection);
             control->warming=settings.warm;control->warm_until=GetTickCount64()+10000;
-            if(old){old->revoke();if(old->warming)transport_.end_stream(old->peer,old->session);}hosting_.store(control);
+            if(old){old->revoke();if(old->warming)transport_.end_stream(old->peer,old->session);}hosting_.store(control);sync_host_route();
             host_.stop(); shell_.observe_cursor({});hive::release_injected_input();
             input_ready_=false;clipboard_pending_=false;input_error_reported_=false;
             if(control->revoked)return;
@@ -720,7 +738,7 @@ private:
                 if(!closing_&&!control->revoked&&hosting_.load()==control&&ack.session==control->session){
                     relay_local_ack(control,ack);
                 }
-            })) {control->revoke();hosting_.store(nullptr);telemetry_.clear(MonitorSide::Host);status("Capture failed: "+error);}
+            })) {control->revoke();hosting_.store(nullptr);sync_host_route();telemetry_.clear(MonitorSide::Host);status("Capture failed: "+error);}
             else if(!settings.warm) {
                 const auto peers=transport_.peers();
                 for(const auto& p:peers)if(p.id==peer&&(p.features&hive::FeatureDesktopAux))shell_.observe_cursor(peer,settings.session);
@@ -732,20 +750,20 @@ private:
             // A preview can only change an existing warm lease. It never starts
             // a host, preempts a controller or grants clipboard/input authority.
             if(closing_||!target||target->revoked||!target->warming||target->peer!=peer||target->session!=session||target->connection!=transport_.connection_token(peer))return;
-            if(!host_.preview(enabled)){target->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,session);}
-            else {target->previewing=enabled;target->warm_until=GetTickCount64()+10000;}
+            if(!host_.preview(enabled)){target->revoke();hosting_=nullptr;sync_host_route();host_.stop();transport_.end_stream(peer,session);}
+            else {target->previewing=enabled;target->warm_until=GetTickCount64()+10000;sync_host_route();}
         };
         callbacks.cancel_warm=[this](const std::string& peer,uint64_t session){
             const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
             if(target&&target->warming&&target->peer==peer&&target->session==session){
-                target->revoke();hosting_=nullptr;host_.stop();hive::log("Warm host released: "+peer);
+                target->revoke();hosting_=nullptr;sync_host_route();host_.stop();hive::log("Warm host released: "+peer);
             }
         };
         callbacks.stop_stream=[this](const std::string& peer) {
             if(closing_)return;
             {const std::lock_guard lock(host_mutex_);
             const auto target=hosting_.load();
-            if(target&&target->peer==peer) {target->revoke();input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);shell_.observe_cursor({});staged_clipboards_.erase(peer);host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();status("Remote control released.");}}
+            if(target&&target->peer==peer) {target->revoke();input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);sync_host_route();shell_.observe_cursor({});staged_clipboards_.erase(peer);host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();status("Remote control released.");}}
             relay_tick();
         };
         callbacks.frame_credit=[this](const std::string& peer,uint64_t session){
@@ -861,6 +879,7 @@ private:
         select(peer,epoch);
     }
     void request_snapshot(const std::string& peer) {
+        if(!transport_.view_allowed(peer))return;
         const std::lock_guard lock(snapshot_reply_mutex_);
         const auto request=++snapshot_sequence_;
         snapshot_requests_[peer]=request;
@@ -868,6 +887,7 @@ private:
     }
     void select(std::string peer,uint64_t epoch) {
         if(epoch!=generation_||closing_)return;
+        if(!transport_.view_allowed(peer)){reconnect_={};go_local(active_.exchange(nullptr),true);return;}
         hive::log("Viewer startup: "+peer+" generation="+std::to_string(epoch));
         request_snapshot(peer);
         go_local(active_.exchange(nullptr),false);
@@ -1029,7 +1049,7 @@ private:
         // closing_ causes the command queue to stop. Retain this peer independently.
         const auto previous=last_controlled_.exchange(nullptr);
         if(previous) {const auto session=active_session_.exchange(0);if(active_dedicated_input_.exchange(false)&&session)transport_.end_input(*previous,session);else transport_.send_input(*previous,{hive::InputKind::ReleaseAll,0,0,0});transport_.stop_stream(*previous);}
-        {const std::lock_guard lock(host_mutex_);input_ready_=false;clipboard_pending_=false;staged_clipboards_.clear();hosting_.store(nullptr);host_.stop();}
+        {const std::lock_guard lock(host_mutex_);input_ready_=false;clipboard_pending_=false;staged_clipboards_.clear();hosting_.store(nullptr);sync_host_route();host_.stop();}
         {const std::lock_guard lock(view_mutex_);viewer_.load()->close();view_surface_.reset();}
         std::map<std::string,std::shared_ptr<WarmView>> warm;
         {const std::lock_guard lock(warm_mutex_);warm.swap(warm_views_);warm_visible_.clear();}

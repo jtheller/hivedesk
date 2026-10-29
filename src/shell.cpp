@@ -1236,7 +1236,19 @@ void Shell::discard_warm_surface(std::shared_ptr<const ViewerSurface> surface){
         s->warm_visible.clear();s->publish_visible();
     });
 }
-void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl_,peers]{if(s->pressed_card>=0&&!s->dragged_peer.empty()&&std::none_of(peers.begin(),peers.end(),[&](const Peer& p){return p.id==s->dragged_peer;}))s->cancel_drag();if(s->peers.size()!=peers.size())s->composition.finish_cards();s->peers=peers;s->sort_peers();s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));InvalidateRect(s->panel,nullptr,FALSE);});}
+void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl_,peers]{
+    const auto contains=[&](const std::string& id){return std::any_of(peers.begin(),peers.end(),[&](const Peer& p){return p.id==id;});};
+    const bool removed=std::any_of(s->peers.begin(),s->peers.end(),[&](const Peer& p){return !contains(p.id);});
+    if(removed){
+        s->cancel_drag();s->hovered=-1;
+        if(!s->peek_id.empty()&&!contains(s->peek_id))s->end_peek(false);
+        std::erase_if(s->fading_peeks,[&](const auto& p){if(contains(p.surface->peer))return false;ShowWindow(p.surface->window,SW_HIDE);return true;});
+    }
+    if(s->peers.size()!=peers.size())s->composition.finish_cards();
+    s->peers=peers;s->sort_peers();s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));
+    s->publish_visible();s->publish_input();InvalidateRect(s->panel,nullptr,FALSE);
+});}
+
 void Shell::show_remote(const std::string& peer,const std::wstring& label,uint64_t session,HWND surface){uint64_t g=impl_->generation.load();impl_->dispatch([s=impl_,peer,label,session,g,surface]{if(g==s->generation.load()&&(!surface||surface==s->viewer))s->show_remote_ui(peer,label,session);});}
 void Shell::show_reconnecting(const std::string& peer){const auto g=impl_->generation.load();impl_->dispatch([s=impl_,peer,g]{
     if(g!=s->generation.load()||!s->selection_armed||s->pending_id!=peer||s->reconnecting)return;
