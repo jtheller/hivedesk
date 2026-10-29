@@ -191,10 +191,10 @@ struct Smoke {
                 capture_was_foreground = GetForegroundWindow() == shell.viewer_window();
                 {
                     SetWindowPos(shell.viewer_window(),HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);DwmFlush();
-                    hive::CursorState cursor;require(hive::read_cursor_shape(LoadCursorW(nullptr,IDC_IBEAM),cursor),"read test cursor");
+                    hive::CursorState cursor;cursor.session=1;require(hive::read_cursor_shape(LoadCursorW(nullptr,IDC_IBEAM),cursor),"read test cursor");
                     shell.update_cursor("demo-studio",cursor);SendMessageW(shell.viewer_window(),WM_SETCURSOR,reinterpret_cast<WPARAM>(shell.viewer_window()),HTCLIENT);
                     hive::CursorState observed;require(hive::read_cursor_shape(GetCursor(),observed)&&observed.mask==cursor.mask&&observed.color==cursor.color,"viewer did not use remote native cursor");
-                    const int input_before=input_events.load();cursor.position_revision=1;cursor.x=32768;cursor.y=32768;
+                    const int input_before=input_events.load();cursor.position_revision=1;cursor.position_valid=true;cursor.x=32768;cursor.y=32768;
                     shell.update_cursor("demo-studio",cursor);KillTimer(driver,1);pump(40);SetTimer(driver,1,180,nullptr);
                     POINT position{};GetCursorPos(&position);
                     require(std::abs(position.x-GetSystemMetrics(SM_CXSCREEN)/2)<=3&&std::abs(position.y-GetSystemMetrics(SM_CYSCREEN)/2)<=3,"host pointer position was not mapped to the viewer");
@@ -296,7 +296,7 @@ struct Smoke {
             ++selected;
             auto it = std::find_if(peers.begin(), peers.end(), [&](const hive::Peer& peer) { return peer.id == id; });
             shell.set_remote_size(1600, 900);
-            shell.show_remote(id, it == peers.end() ? L"Demo computer" : std::wstring(it->name.begin(), it->name.end()));
+            shell.show_remote(id, it == peers.end() ? L"Demo computer" : std::wstring(it->name.begin(), it->name.end()),1);
             draw_demo(id);
         };
         callbacks.return_local = [this] { ++returned; };

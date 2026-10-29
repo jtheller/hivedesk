@@ -77,7 +77,8 @@ public:
     void update_thumbnail(const std::string& peer, Thumbnail);
     // JPEG decoding uses the shell worker, independent of connection startup.
     void update_snapshot(const std::string& peer, Snapshot);
-    void observe_cursor(const std::string& controller);
+    void observe_cursor(const std::string& controller,uint64_t session=0);
+    void cursor_input_applied(uint64_t session,uint64_t capture_us);
     void update_cursor(const std::string& peer, CursorState);
     void update_cursor_composition(const std::string& peer,uint64_t session,uint64_t sequence,CursorComposition);
     void update_health(const std::string& peer,const StreamHealth&);
@@ -91,6 +92,7 @@ public:
 #ifdef HIVEDESK_SHELL_TEST
     void taskbar_interaction_self_test();
     void quick_swap_interaction_self_test();
+    void cursor_sync_self_test();
 #endif
 private: struct Impl; Impl* impl_ = nullptr;
 };

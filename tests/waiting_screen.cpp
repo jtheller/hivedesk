@@ -256,6 +256,7 @@ int probe(){
     require(GetWindowLongPtrW(peek->window,GWL_EXSTYLE)&WS_EX_TOPMOST,"Live preview adoption lost fullscreen topmost");
     SendMessageW(owner,WM_TIMER,4,0);shell.show_peek(peek,media,old_epoch,true);
     require(shown(peek->window)&&!shown(waiting),"Delayed preview/fade event hid the adopted viewer");shell.show_local();
+    shell.cursor_sync_self_test();
     shell.close();require(!IsWindow(owner)&&!IsWindow(panel),"Explicit shell close retained native windows");shell.close();
     std::puts("PASS peek UI: hover authority isolation, stale completion rejection, direct live adoption, fade cancellation and explicit shutdown");
     return 0;

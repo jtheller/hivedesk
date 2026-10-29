@@ -25,6 +25,7 @@ struct InputCapture::Impl {
     uint64_t route=1,blocked_route=0;
     InputCaptureQueue<> queue;
     PhysicalPointer pointer;
+    uint64_t cursor_host_session=0,host_applied_us=0,local_mouse_us=0;
     InputCaptureDiagnostics stats;
     struct Delay {uint64_t at=0;uint32_t us=0;};
     std::array<Delay,256> delays{};size_t delay_index=0;
@@ -64,6 +65,8 @@ struct InputCapture::Impl {
         {
             std::lock_guard lock(mutex);
             if(stopping||target.id!=route||(blocked_route==route&&event.kind!=InputKind::ReleaseAll))return;
+            if(event.kind==InputKind::Absolute||event.kind==InputKind::Relative||event.kind==InputKind::Button||event.kind==InputKind::Wheel)
+                local_mouse_us=std::max(local_mouse_us,captured_us);
             ++stats.captured;overflow=!queue.push({event,route,captured_us});
         }
         if(overflow)fail_route(target,false);else wake.notify_one();
@@ -130,7 +133,8 @@ struct InputCapture::Impl {
         const auto now=input_now_us();const auto route=s->snapshot();s->observe_route(route.id);
         if((msg==WM_LBUTTONDOWN||msg==WM_RBUTTONDOWN)&&dismiss_panel_on_mouse_down(*route.state,m.pt,
             route.state->local_shell?GetAncestor(WindowFromPoint(m.pt),GA_ROOT):nullptr))s->post(CaptureAction::HidePanelAnimated,route.state->generation);
-        if(msg==WM_MOUSEMOVE){std::lock_guard lock(s->mutex);++s->pointer.revision;s->pointer.point=m.pt;s->pointer.motion_tick=GetTickCount64();}
+        if(msg==WM_MOUSEMOVE){std::lock_guard lock(s->mutex);++s->pointer.revision;s->pointer.point=m.pt;s->pointer.motion_tick=GetTickCount64();
+            s->pointer.host_session=s->cursor_host_session;s->pointer.host_input_us=s->host_applied_us;}
         if(!route.enabled)return CallNextHookEx(nullptr,code,msg,data);
         const int released=msg==WM_LBUTTONUP?1:msg==WM_RBUTTONUP?2:msg==WM_MBUTTONUP?3:msg==WM_XBUTTONUP?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;
         if(own_surface(*route.state,m.pt)||(route.state->windowed&&(!PtInRect(&route.state->viewer_rect,m.pt)||GetAncestor(WindowFromPoint(m.pt),GA_ROOTOWNER)!=route.state->viewer))) {
@@ -246,6 +250,20 @@ bool InputCapture::routing_self_test(std::string& result){
         mouse(WM_LBUTTONDOWN,{400,400},LLMHF_INJECTED);key(VK_ESCAPE,1,false,LLKHF_INJECTED);quiet();
         require(s.queue.size()==0,"Injected input was echoed to a remote");
         state.local_shell=false;set();
+        capture.cursor_host(71);capture.cursor_input_applied(71,500);
+        mouse(WM_MOUSEMOVE,{400,400});
+        auto physical=capture.physical_pointer();
+        require(physical.host_session==71&&physical.host_input_us==500,"Physical motion did not freeze input watermark");
+        capture.cursor_input_applied(71,900);
+        require(capture.physical_pointer().host_input_us==500,"Later ACK retroactively authorized an old position");
+        mouse(WM_MOUSEMOVE,{0,0},LLMHF_INJECTED);
+        require(capture.physical_pointer().revision==physical.revision,"Injected movement became host motion");
+        require(!capture.cursor_position_allowed(state.session,500),"Pending local mouse input was ignored");
+        require(capture.cursor_position_allowed(state.session,UINT64_MAX),"Current watermark rejected");
+        capture.cursor_host(72);capture.cursor_input_applied(71,999);
+        mouse(WM_MOUSEMOVE,{401,401});physical=capture.physical_pointer();
+        require(physical.host_session==72&&!physical.host_input_us,"Retired session ACK leaked into a new host");
+        quiet();s.queue.clear();
         require(key(VK_ESCAPE,1)==1,"Remote Hive Escape was not intercepted");action(CaptureAction::HidePanel);
         require(key(VK_ESCAPE,1,true)==1&&s.queue.size()==0,"Hive Escape key-up leaked to remote");quiet();
         state.panel_visible=state.panel_summoned=false;set();
@@ -263,6 +281,7 @@ bool InputCapture::routing_self_test(std::string& result){
         key(VK_OEM_3,0x29,true);key(VK_SHIFT,0x2a,true);
         require(key(VK_OEM_3,0x29)==1,"Escape chord was not intercepted");action(CaptureAction::ReturnLocal);
         require(!s.snapshot().enabled&&s.queue.size()==1&&s.queue.pop()->event.kind==InputKind::ReleaseAll,"Escape failed to revoke and release remote input immediately");
+        require(!capture.cursor_position_allowed(state.session,UINT64_MAX),"Escape retained cursor correction authority");
         key(VK_OEM_3,0x29,true);key(VK_MENU,0x38,true);key(VK_CONTROL,0x1d,true);quiet();
         result="actual hook callbacks: taskbar local pass-through, outside dismissal, drag exclusion, Escape down/up, injected-event exclusion, remote key/button edges, kick and emergency release";return true;
     }catch(const std::exception& e){result=e.what();return false;}
@@ -285,6 +304,7 @@ void InputCapture::update(InputCaptureState state){
     const bool same_session=next->generation==s.state->generation&&next->session==s.state->session&&next->peer==s.state->peer;
     const bool focus_changed=same_session&&((next->remote&&!next->local_shell)!=(s.state->remote&&!s.state->local_shell));
     if(!same_session||focus_changed){++s.route;s.queue.clear();}
+    if(!same_session)s.local_mouse_us=0;
     // Focus loss releases keys/buttons even without another physical event.
     // Also release on regain so a rapid deactivate/activate cannot discard it.
     if(focus_changed&&next->session){s.queue.push({{InputKind::ReleaseAll},s.route,input_now_us()});s.wake.notify_one();}
@@ -292,6 +312,18 @@ void InputCapture::update(InputCaptureState state){
 }
 bool InputCapture::raw_mouse_available()const{std::lock_guard lock(impl_->mutex);return impl_->raw_available;}
 PhysicalPointer InputCapture::physical_pointer()const{std::lock_guard lock(impl_->mutex);return impl_->pointer;}
+void InputCapture::cursor_host(uint64_t session){
+    std::lock_guard lock(impl_->mutex);impl_->cursor_host_session=session;impl_->host_applied_us=0;
+    impl_->pointer.host_session=impl_->pointer.host_input_us=0;
+}
+void InputCapture::cursor_input_applied(uint64_t session,uint64_t capture_us){
+    std::lock_guard lock(impl_->mutex);
+    if(session&&session==impl_->cursor_host_session)impl_->host_applied_us=std::max(impl_->host_applied_us,capture_us);
+}
+bool InputCapture::cursor_position_allowed(uint64_t session,uint64_t capture_us)const{
+    std::lock_guard lock(impl_->mutex);return !impl_->stopping&&impl_->state->remote&&!impl_->state->local_shell&&impl_->blocked_route!=impl_->route&&
+        session&&session==impl_->state->session&&capture_us>=impl_->local_mouse_us;
+}
 InputCaptureDiagnostics InputCapture::diagnostics()const{
     auto& s=*impl_;std::array<uint32_t,256> values{};size_t count=0;const auto now=input_now_us();InputCaptureDiagnostics result;
     {std::lock_guard lock(s.mutex);result=s.stats;result.coalesced=s.queue.coalesced();result.queue_depth=uint32_t(s.queue.size());result.queue_peak=uint32_t(s.queue.peak());

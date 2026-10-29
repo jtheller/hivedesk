@@ -112,7 +112,7 @@ public:
         };
         callbacks.cursor_changed=[this](const std::string& peer,const hive::CursorState& cursor) {
             const auto target=hosting_.load();
-            return !closing_&&target&&!target->revoked&&target->peer==peer&&transport_.send_cursor(peer,cursor);
+            return !closing_&&target&&!target->revoked&&!target->warming&&target->peer==peer&&target->session==cursor.session&&transport_.send_cursor(peer,cursor);
         };
         callbacks.stream_tick=[this] {
             if(!closing_&&clipboard_pending_&&GetTickCount64()-last_clipboard_retry_>=1000) {
@@ -490,7 +490,7 @@ private:
             shell_.update_snapshot(peer,std::move(snapshot));
         };
         callbacks.cursor=[this](const std::string& peer,hive::CursorState cursor) {
-            const auto target=active_.load();if(!closing_&&target&&*target==peer)shell_.update_cursor(peer,std::move(cursor));
+            const auto target=active_.load();if(!closing_&&target&&*target==peer&&(!cursor.session||cursor.session==active_session_))shell_.update_cursor(peer,std::move(cursor));
         };
         callbacks.feedback=[this](const std::string& peer,const hive::StreamFeedback& report) {
             const auto target=hosting_.load();if(!closing_&&target&&!target->revoked&&target->peer==peer&&target->session==report.session)host_.feedback(report);
@@ -542,7 +542,7 @@ private:
                 old->warming=false;old->previewing=false;apply_handoff(peer);
                 if(!host_.activate()){old->revoke();hosting_=nullptr;host_.stop();transport_.end_stream(peer,settings.session);return;}
                 std::string name=peer;for(const auto& item:transport_.peers())if(item.id==peer)name=item.name;
-                telemetry_.select(MonitorSide::Host,peer,settings.session,name);shell_.observe_cursor(peer);
+                telemetry_.select(MonitorSide::Host,peer,settings.session,name);shell_.observe_cursor(peer,settings.session);
                 hive::log("Warm host promoted: "+peer+" session="+std::to_string(settings.session));return;
             }
             // A pending local kick also rejects an automatic retry that arrives
@@ -576,12 +576,14 @@ private:
             },[this,control](const hive::SourceDiagnostics& value){
                 if(!closing_&&!control->revoked&&hosting_.load()==control){telemetry_.source(MonitorSide::Host,control->peer,value);telemetry_.video_send(control->peer,control->session,transport_.video_send_diagnostics(control->peer));transport_.send_diagnostics(control->peer,value);}
             },[this,control](const hive::InputAck& ack){
-                if(!closing_&&!control->revoked&&hosting_.load()==control&&ack.session==control->session)
+                if(!closing_&&!control->revoked&&hosting_.load()==control&&ack.session==control->session){
+                    if(ack.injected)shell_.cursor_input_applied(ack.session,ack.capture_time_us);
                     transport_.send_input_ack(control->peer,ack);
+                }
             })) {control->revoke();hosting_.store(nullptr);telemetry_.clear(MonitorSide::Host);status("Capture failed: "+error);}
             else if(!settings.warm) {
                 const auto peers=transport_.peers();
-                for(const auto& p:peers)if(p.id==peer&&(p.features&hive::FeatureDesktopAux))shell_.observe_cursor(peer);
+                for(const auto& p:peers)if(p.id==peer&&(p.features&hive::FeatureDesktopAux))shell_.observe_cursor(peer,settings.session);
                 status("Streaming primary display to a computer on your network.");
             }
         };

@@ -9,6 +9,7 @@
 #include "hivedesk/network_key.h"
 #include "hivedesk/desktop_aux.h"
 #include "hivedesk/cursor_composition.h"
+#include "cursor_position.h"
 #include "hivedesk/adaptive.h"
 #include "hivedesk/auto_rate.h"
 #include "hivedesk/gpu_policy_restart.h"
@@ -265,9 +266,15 @@ struct Shell::Impl {
     std::map<std::string,HBITMAP> prior_thumbnails;
     std::map<std::string,ULONGLONG> thumbnail_fades;
     std::string cursor_controller;
+    uint64_t cursor_host_session=0,physical_host_session=0,physical_host_input_us=0;
+    CursorPositionGate cursor_position_gate;
+    unsigned cursor_trace_count=0;
+#ifdef HIVEDESK_SHELL_TEST
+    std::function<void(const INPUT&)> cursor_position_test_sink;
+#endif
     HCURSOR sent_cursor{},remote_cursor{};
     bool cursor_sent=false,sent_cursor_visible=false,remote_cursor_visible=true,remote_cursor_received=false;
-    uint64_t pointer_revision=1,sent_pointer_revision=0,remote_pointer_revision=0;
+    uint64_t pointer_revision=1,sent_pointer_revision=0;
     CursorState remote_pointer;
     PresentedCursorComposition remote_cursor_composition;
     POINT physical_pointer{};
@@ -312,7 +319,8 @@ struct Shell::Impl {
     void publish_input(bool keep_taskbar_guard=false) {input_capture.update(input_state(keep_taskbar_guard));}
     void sample_physical_pointer() {
         const auto pointer=input_capture.physical_pointer();
-        if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;}
+        if(pointer.revision!=last_capture_pointer_revision){last_capture_pointer_revision=pointer.revision;++pointer_revision;physical_pointer=pointer.point;last_local_motion=pointer.motion_tick;
+            physical_host_session=pointer.host_session;physical_host_input_us=pointer.host_input_us;}
     }
     void hide_panel(bool animate=false,bool keep_taskbar=false) {
         end_peek(animate);
@@ -460,9 +468,10 @@ struct Shell::Impl {
         SetForegroundWindow(viewer);SetFocus(viewer);SetCursor(LoadCursorW(nullptr,IDC_ARROW));
     }
     void reset_remote_cursor() {
+        cursor_position_gate.reset(0);cursor_trace_count=0;
         stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;debug_pulses={};slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
         SetCursor(LoadCursorW(nullptr,IDC_ARROW));if(remote_cursor)DestroyCursor(remote_cursor);
-        remote_cursor=nullptr;remote_cursor_visible=true;remote_cursor_received=false;remote_pointer_revision=0;remote_pointer={};
+        remote_cursor=nullptr;remote_cursor_visible=true;remote_cursor_received=false;remote_pointer={};
         remote_cursor_composition.reset();
     }
     HCURSOR selected_remote_cursor() const {
@@ -478,8 +487,13 @@ struct Shell::Impl {
     void apply_remote_position() {
         sample_physical_pointer();
         if(!remote||relative_mode||!remote_cursor_received||!remote_width||!remote_height)return;
-        if(remote_pointer.position_revision==remote_pointer_revision)return;
-        remote_pointer_revision=remote_pointer.position_revision;
+        const auto decision=cursor_position_gate.observe(remote_pointer,input_capture.cursor_position_allowed(input_session,remote_pointer.input_capture_us));
+        if(decision!=CursorPositionGate::Result::Revision&&cursor_trace_count<8){
+            ++cursor_trace_count;log("Cursor position: session="+std::to_string(input_session)+" revision="+std::to_string(remote_pointer.position_revision)+
+                " decision="+std::to_string(int(decision))+" xy="+std::to_string(remote_pointer.x)+","+std::to_string(remote_pointer.y)+
+                " input_us="+std::to_string(remote_pointer.input_capture_us));
+        }
+        if(decision!=CursorPositionGate::Result::Allowed)return;
         POINT point{};GetCursorPos(&point);
         // Never pull against recent local movement or take the pointer out of our UI.
         if(own_surface(point)||GetTickCount64()-last_local_motion<100)return;
@@ -491,6 +505,9 @@ struct Shell::Impl {
         const double y=(height-remote_height*scale)/2+(remote_pointer.y/65535.0)*(remote_height-1)*scale;
         INPUT input{};input.type=INPUT_MOUSE;input.mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE;
         input.mi.dx=LONG((client.left+x+.5)*65536/GetSystemMetrics(SM_CXSCREEN));input.mi.dy=LONG((client.top+y+.5)*65536/GetSystemMetrics(SM_CYSCREEN));input.mi.dwExtraInfo=InputMarker;
+#ifdef HIVEDESK_SHELL_TEST
+        if(cursor_position_test_sink){cursor_position_test_sink(input);return;}
+#endif
         SendInput(1,&input,sizeof(input));
     }
     void sample_cursor() {
@@ -502,9 +519,12 @@ struct Shell::Impl {
         const bool shape_changed=!cursor_sent||info.hCursor!=sent_cursor;
         if(cursor_sent&&!shape_changed&&visible==sent_cursor_visible&&pointer_revision==sent_pointer_revision)return;
         CursorState state;state.visible=visible;state.position_revision=pointer_revision;
+        state.session=cursor_host_session;state.position_valid=cursor_sent&&cursor_host_session&&physical_host_session==cursor_host_session;
+        state.input_capture_us=state.position_valid?physical_host_input_us:0;
         // The revision and position describe physical/programmatic host motion,
         // not the delayed echo of this controller's injected mouse movement.
         const POINT position=cursor_sent?physical_pointer:info.ptScreenPos;
+        state.position_valid=state.position_valid&&cursor_on_primary(position.x,position.y,width,height);
         state.x=uint32_t(std::clamp(position.x,0L,LONG(std::max(1,width-1)))*65535LL/std::max(1,width-1));
         state.y=uint32_t(std::clamp(position.y,0L,LONG(std::max(1,height-1)))*65535LL/std::max(1,height-1));
         if(shape_changed&&info.hCursor&&!read_cursor_shape(info.hCursor,state))return;
@@ -547,7 +567,7 @@ struct Shell::Impl {
         cancel_connection_hint();reconnecting=false;InvalidateRect(health_badge,nullptr,FALSE);
         if(active_id!=id)previous_id=active_id;
         if(!remote&&!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
-        if(!remote||active_id!=id||input_session!=session)remote_cursor_composition.reset(session);
+        if(!remote||active_id!=id||input_session!=session){remote_cursor_composition.reset(session);cursor_position_gate.reset(session);cursor_trace_count=0;}
         active_id=id;input_session=session;remote=true;SetWindowTextW(viewer,(L"HiveDesk - "+label).c_str());
         if(waiting_visible&&!waiting_fading){
             waiting_fading=true;
@@ -1132,6 +1152,7 @@ void Shell::close(){if(impl_){delete impl_;impl_=nullptr;log("Shell shutdown: co
 #ifdef HIVEDESK_SHELL_TEST
 #include "../tests/shell_taskbar_regression.inc"
 #include "../tests/shell_corner_regression.inc"
+#include "../tests/shell_cursor_regression.inc"
 #endif
 bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks callbacks,std::string& error){return impl_->create(instance,config,std::move(callbacks),error);}
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
@@ -1235,12 +1256,15 @@ void Shell::update_thumbnail(const std::string& peer,Thumbnail thumbnail) {
 void Shell::update_snapshot(const std::string& peer,Snapshot snapshot) {
     impl_->enqueue([this,peer,snapshot=std::move(snapshot)]{update_thumbnail(peer,decode_snapshot(snapshot));});
 }
-void Shell::observe_cursor(const std::string& controller) {
-    impl_->dispatch([s=impl_,controller] {
+void Shell::observe_cursor(const std::string& controller,uint64_t session) {
+    impl_->dispatch([s=impl_,controller,session] {
+        s->sample_physical_pointer();s->cursor_host_session=controller.empty()?0:session;
+        s->input_capture.cursor_host(s->cursor_host_session);s->physical_host_session=s->physical_host_input_us=0;
         s->cursor_controller=controller;s->cursor_sent=false;s->sent_cursor=nullptr;s->sent_pointer_revision=0;
         ++s->pointer_revision;GetCursorPos(&s->physical_pointer);s->sample_cursor();
     });
 }
+void Shell::cursor_input_applied(uint64_t session,uint64_t capture_us){impl_->input_capture.cursor_input_applied(session,capture_us);}
 void Shell::update_health(const std::string& peer,const StreamHealth& health) {
     const auto generation=impl_->generation.load();
     impl_->dispatch([s=impl_,peer,health,generation] {
@@ -1261,8 +1285,11 @@ void Shell::update_input_diagnostics(const std::string& peer,const InputDiagnost
     const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id||value.session!=s->input_session)return;s->input_diagnostics=value;if(s->config.desktop.debug_overlay)InvalidateRect(s->health_badge,nullptr,FALSE);});
 }
 void Shell::update_cursor(const std::string& peer,CursorState cursor) {
-    impl_->dispatch([s=impl_,peer,cursor=std::move(cursor)] {
-        if(peer!=s->pending_id&&peer!=s->active_id)return;
+    const auto generation=impl_->generation.load();
+    impl_->dispatch([s=impl_,peer,cursor=std::move(cursor),generation] {
+        if(generation!=s->generation.load()||(peer!=s->pending_id&&peer!=s->active_id))return;
+        if(cursor.session&&s->remote&&cursor.session!=s->input_session)return;
+        if(cursor.session==s->remote_pointer.session&&cursor.position_revision<s->remote_pointer.position_revision)return;
         HCURSOR next=nullptr;
         if(cursor.width) {
             next=make_cursor(cursor);if(!next)return;

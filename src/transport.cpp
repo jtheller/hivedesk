@@ -52,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -214,7 +214,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -972,8 +972,13 @@ struct Transport::Impl {
             if(!(c.peer.features&FeatureDesktopAux)||!r.good||!snapshot.request||b.size()==r.at||b.size()-r.at>(snapshot.native?MaxNativeSnapshotBytes:MaxSnapshotBytes))return false;
             snapshot.jpeg.assign(b.begin()+r.at,b.end());if(callbacks.snapshot)callbacks.snapshot(c.peer.id,std::move(snapshot));return true;
         }
-        case Cursor: {
-            CursorState cursor;const auto visible=r.byte();cursor.visible=visible!=0;cursor.x=r.dword();cursor.y=r.dword();
+        case Cursor: case ScopedCursor: {
+            CursorState cursor;
+            if(b[0]==ScopedCursor){
+                cursor.session=r.qword();cursor.input_capture_us=r.qword();const auto position=r.byte();cursor.position_valid=position!=0;
+                if(!(c.peer.features&FeatureScopedCursor)||!cursor.session||position>1||!r.good)return false;
+            }
+            const auto visible=r.byte();cursor.visible=visible!=0;cursor.x=r.dword();cursor.y=r.dword();
             cursor.position_revision=r.qword();cursor.width=r.dword();cursor.height=r.dword();cursor.hotspot_x=r.dword();cursor.hotspot_y=r.dword();
             const auto colors=r.dword(),mask=r.dword();
             if(!(c.peer.features&FeatureDesktopAux)||!r.good||visible>1||colors>256*256*4||mask>256*256/4||size_t(colors)+mask!=b.size()-r.at)return false;
@@ -1441,7 +1446,12 @@ bool Transport::send_snapshot(const std::string& peer,const Snapshot& snapshot) 
 }
 bool Transport::send_cursor(const std::string& peer,const CursorState& cursor) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!valid_cursor(cursor))return false;
-    Bytes b{Cursor};b.push_back(cursor.visible?1:0);u32(b,cursor.x);u32(b,cursor.y);u64(b,cursor.position_revision);
+    const bool scoped=(c->peer.features&FeatureScopedCursor)&&cursor.session;
+    Bytes b{uint8_t(scoped?ScopedCursor:Cursor)};
+    if(scoped){u64(b,cursor.session);u64(b,cursor.input_capture_us);b.push_back(cursor.position_valid?1:0);}
+    // Old viewers have no causal/session gate. Preserve shape/visibility but
+    // use revision zero so they cannot warp to delayed positions during OTA.
+    b.push_back(cursor.visible?1:0);u32(b,cursor.x);u32(b,cursor.y);u64(b,scoped?cursor.position_revision:0);
     u32(b,cursor.width);u32(b,cursor.height);u32(b,cursor.hotspot_x);u32(b,cursor.hotspot_y);
     u32(b,uint32_t(cursor.color.size()));u32(b,uint32_t(cursor.mask.size()));
     b.insert(b.end(),cursor.color.begin(),cursor.color.end());b.insert(b.end(),cursor.mask.begin(),cursor.mask.end());return c->enqueue(std::move(b));
@@ -1491,6 +1501,25 @@ bool Transport::discovery_self_test(std::string& result){
     result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
 }
 bool Transport::self_test(std::string& result) {
+    {
+        Transport sender;auto& owner=*sender.impl_;
+        auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);control->ready=true;
+        control->peer.id="cursor-peer";control->peer.features=FeatureDesktopAux|FeatureScopedCursor;
+        owner.connected[control->peer.id]={control,{}};CursorState received;
+        owner.callbacks.cursor=[&](const std::string&,CursorState c){received=std::move(c);};
+        CursorState c;c.session=91;c.position_revision=7;c.input_capture_us=900;c.position_valid=true;c.x=123;c.y=456;
+        if(!sender.send_cursor("cursor-peer",c)||!owner.dispatch(*control,control->control.back())||
+           received.session!=91||received.input_capture_us!=900||!received.position_valid||received.position_revision!=7){result="Scoped cursor serialization failed";return false;}
+        const auto packet=control->control.back();auto malformed=packet;malformed[17]=2;
+        if(owner.dispatch(*control,malformed)){result="Invalid cursor position flag accepted";return false;}
+        malformed=packet;malformed.resize(17);
+        if(owner.dispatch(*control,malformed)){result="Truncated scoped cursor accepted";return false;}
+        malformed=packet;std::fill(malformed.begin()+1,malformed.begin()+9,0);
+        if(owner.dispatch(*control,malformed)){result="Zero cursor session accepted";return false;}
+        control->peer.features=FeatureDesktopAux;
+        if(owner.dispatch(*control,packet)||!sender.send_cursor("cursor-peer",c)||control->control.back()[0]!=Cursor||
+           !owner.dispatch(*control,control->control.back())||received.session||received.position_revision||received.position_valid||received.x!=123){result="Mixed-version cursor shape-only fallback failed";return false;}
+    }
     {
         // Real socket failures on isolated ephemeral ports: never close the
         // installed agent's listeners or change a physical NIC for this test.
@@ -2354,7 +2383,7 @@ bool Transport::self_test(std::string& result) {
     bcb.snapshot_request=[&](const std::string& peer,uint64_t request,bool native){b.send_snapshot(peer,{request,native?Bytes(1200*1024,42):Bytes({0xff,0xd8,42,0xff,0xd9}),native});};
     acb.snapshot=[&](const std::string&,Snapshot snapshot){std::lock_guard lock(mutex);++snapshot_count;got_snapshot=snapshot.request==901&&snapshot.native&&snapshot.jpeg==Bytes(1200*1024,42);cv.notify_all();};
     acb.cursor=[&](const std::string&,CursorState cursor){std::lock_guard lock(mutex);++cursor_count;
-        got_cursor=cursor.position_revision==77&&cursor.x==12345&&cursor.y==54321&&
+        got_cursor=cursor.session==91&&cursor.input_capture_us==123456&&cursor.position_valid&&cursor.position_revision==77&&cursor.x==12345&&cursor.y==54321&&
             (cursor_count==1?(cursor.visible&&cursor.width==2&&cursor.hotspot_x==1&&cursor.mask==Bytes(8,0xff)):
              (!cursor.visible&&cursor.width==0));cv.notify_all();};
     std::string error,id; TransportConfig acfg{"test-a","Transport A",key,0,false}, bcfg{"test-b","Transport B",key,0,false};
@@ -2368,7 +2397,7 @@ bool Transport::self_test(std::string& result) {
     TransportConfig wcfg{"test-wrong","Wrong key",wrong_key,0,false};
     if (!wrong.start(wcfg,{},error)) { result = "Wrong-key test setup failed."; return false; }
     if (wrong.connect("127.0.0.1",b.impl_->cfg.port,id,error) || !wrong.peers().empty()) { result = "Wrong Network Key was accepted."; return false; }
-    CursorState cursor;cursor.x=12345;cursor.y=54321;cursor.position_revision=77;cursor.width=2;cursor.height=1;cursor.hotspot_x=1;cursor.mask=Bytes(8,0xff);
+    CursorState cursor;cursor.session=91;cursor.input_capture_us=123456;cursor.position_valid=true;cursor.x=12345;cursor.y=54321;cursor.position_revision=77;cursor.width=2;cursor.height=1;cursor.hotspot_x=1;cursor.mask=Bytes(8,0xff);
     bool ok=a.request_snapshot("test-b",901)&&b.send_cursor("test-a",cursor)&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000});
     // Check both wire formats after delivery. Unsent diagnostic states now
     // intentionally coalesce; the separate queue test verifies that behavior.

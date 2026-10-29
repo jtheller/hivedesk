@@ -26,7 +26,7 @@ inline bool dismiss_panel_on_mouse_down(const InputCaptureState& s,POINT p,HWND 
     if(s.local_shell&&root&&root!=s.panel)return true;
     return !PtInRect(&s.panel_rect,p);
 }
-struct PhysicalPointer { POINT point{};uint64_t revision=0,motion_tick=0; };
+struct PhysicalPointer { POINT point{};uint64_t revision=0,motion_tick=0,host_session=0,host_input_us=0; };
 struct InputCaptureDiagnostics {
     uint64_t captured=0,dispatched=0,coalesced=0,overflows=0,expired=0;
     uint32_t queue_depth=0,queue_peak=0,dispatch_p95_us=0,dispatch_max_us=0;
@@ -41,6 +41,9 @@ public:
     void update(InputCaptureState);
     bool raw_mouse_available()const;
     PhysicalPointer physical_pointer()const;
+    void cursor_host(uint64_t session);
+    void cursor_input_applied(uint64_t session,uint64_t capture_us);
+    bool cursor_position_allowed(uint64_t session,uint64_t capture_us)const;
     InputCaptureDiagnostics diagnostics()const;
     // Headless regression: exercises the real worker and routing snapshots
     // with an in-memory sink; installs no hooks and never injects OS input.

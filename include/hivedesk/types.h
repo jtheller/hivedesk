@@ -46,6 +46,7 @@ constexpr uint32_t FeatureByteFeedback = 131072;
 constexpr uint32_t FeaturePathProbe = 262144;
 constexpr uint32_t FeatureDatagramVideo = 524288;
 constexpr uint32_t FeatureDatagramRecovery = 1048576;
+constexpr uint32_t FeatureScopedCursor = 2097152;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;
@@ -57,6 +58,8 @@ struct Thumbnail { std::vector<uint8_t> bgra; uint32_t width=SnapshotWidth,heigh
 // Shape pixels retain native alpha and monochrome AND/XOR masks. Position is
 // primary-display normalized; revision changes only for host-side pointer moves.
 struct CursorState {
+    uint64_t session=0,input_capture_us=0;
+    bool position_valid=false; // Only genuine host motion, never the initial snapshot.
     bool visible = true;
     uint32_t x = 0, y = 0;
     uint64_t position_revision = 0;
