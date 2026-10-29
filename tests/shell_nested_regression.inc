@@ -41,6 +41,28 @@ void Shell::nested_return_self_test(){
     viewing(14);s.return_begin();
     s.return_complete(s.nested_return.tick(GetTickCount64()+10001,s.return_view(),true));
     require(s.remote&&!s.nested_return.busy()&&!s.input_state().local_shell&&closes==4,"timeout closed or stranded outer desktop");
+    // Summon follows the active child while preserving every viewer. Return
+    // replies cannot complete a summon, even with a matching numeric identity.
+    viewing(15);s.peers[0].features|=FeatureRemoteHive;
+    s.toggle_panel();require(s.panel_mode==2,"outer Hive fixture did not open");
+    SendMessageW(s.owner,WM_HOTKEY,83,0);const auto summon=sent;
+    require(s.panel_closing,"outer Hive covered summoned child Hive");
+    require(summon.summon&&s.nested_return.busy()&&s.input_state().returning,"remote shortcut did not enter ordered operation");
+    returned("nested-child",{15,summon.id,ReturnResult::Leaf});require(s.nested_return.busy(),"return reply completed a summon");
+    returned("nested-child",{15,summon.id,ReturnResult::Returned,true});
+    require(s.remote&&closes==4&&!s.nested_return.busy(),"summon closed a viewer or left input blocked");
+    return_one("parent",{77,6,15,true},[]{return true;});const auto forwarded=sent;
+    require(forwarded.summon&&forwarded.hops==14,"remote summon lost mode or hop bound");
+    returned("nested-child",{15,forwarded.id,ReturnResult::Returned,true});
+    require(reply.summon&&reply.id==6&&reply.session==77&&reply.result==ReturnResult::Returned&&closes==4,"summon result did not return to parent");
+    s.peers[0].features=FeatureNestedReturn;const auto before_legacy=sends;
+    s.return_begin({}, {},true);require(s.remote&&sends==before_legacy&&!s.nested_return.busy(),"legacy summon closed viewer or waited indefinitely");
+    s.local(false);s.hide_panel(false);
+    return_one("parent",{77,7,15,true},[]{return false;});require(!s.panel_mode&&reply.result==ReturnResult::Stale,"revoked summon opened local Hive");
+    return_one("parent",{77,8,15,true},[]{return true;});require(s.panel_mode==2&&s.panel_summoned&&reply.summon&&reply.result==ReturnResult::Returned,"leaf summon did not show local Hive");
+    s.hide_panel(false);return_one("parent",{77,8,15,true},[]{return true;});require(!s.panel_mode,"duplicate summon reopened Hive");
+    SendMessageW(s.owner,WM_HOTKEY,83,0);require(s.panel_mode==2&&s.panel_summoned,"remote shortcut without viewer did not show local Hive");
+    SendMessageW(s.owner,WM_HOTKEY,83,0);require(s.panel_closing,"second remote shortcut did not dismiss local Hive");s.hide_panel(false);
     viewing(15);s.windowed=true;s.remote_width=1920;s.remote_height=1080;
     SetWindowPos(s.viewer,HWND_TOP,300,200,800,500,SWP_SHOWWINDOW);SetForegroundWindow(s.viewer);s.publish_input();
     auto relay_state=s.input_state();relay_state.remote=true;s.input_capture.update(relay_state);

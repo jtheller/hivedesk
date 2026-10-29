@@ -37,5 +37,19 @@ int main(){try{
     }
     ar=a.begin(ab,{},16,160);require(a.cancel().has_value()&&!a.busy(),"emergency cancel stuck");
     require(!a.reply("b",{11,ar.id,ReturnResult::Leaf},ab,true),"cancelled operation revived");
-    std::puts("PASS nested return: A-B-C single-level unwind, repeated presses, stale sessions/generations, revoked controller, timeout, cancellation, cycle/limit responses");return 0;
+    ar=a.begin(ab,{},16,200,true);br=b.begin(bc,{"a",ar},15,201,true);
+    require(!a.reply("b",{11,ar.id,ReturnResult::Returned},ab,true),"return reply completed remote summon");
+    bottom=b.reply("c",{22,br.id,ReturnResult::Returned,true},bc,true);
+    require(bottom&&bottom->summon&&!bottom->close,"remote summon closed intermediate viewer");
+    top=a.reply("b",{11,ar.id,bottom->result,true},ab,true);
+    require(top&&top->summon&&!top->close&&!a.busy(),"remote summon did not preserve outer viewer");
+    for(auto result:{ReturnResult::Leaf,ReturnResult::Busy,ReturnResult::Stale,ReturnResult::Limit,ReturnResult::Timeout}){
+        ar=a.begin(ab,{},16,210,true);top=a.reply("b",{11,ar.id,result,true},ab,true);
+        require(top&&top->summon&&!top->close,"summon result closed a viewer");
+    }
+    ar=a.begin(ab,{},16,220,true);top=a.tick(10220,ab,true);
+    require(top&&top->summon&&top->result==ReturnResult::Timeout&&!top->close,"summon timeout lost operation type");
+    ar=a.begin(ab,{},16,230,true);top=a.reply("b",{11,ar.id,ReturnResult::Returned,true},switched,true);
+    require(top&&top->result==ReturnResult::Stale&&!top->close,"summon crossed view generation");
+    std::puts("PASS nested return and remote summon: A-B-C, stale sessions/generations, separate reply types, timeout, cancellation and bounded errors");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

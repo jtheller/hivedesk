@@ -546,15 +546,16 @@ struct Shell::Impl {
         if(callbacks.return_finished)callbacks.return_finished(done->view.peer,done->view.session);
         if(done->close)local(true);
         else {publish_input();confine_mouse();}
-        log("Nested return: peer="+done->view.peer+" session="+std::to_string(done->view.session)+" result="+std::to_string(int(done->result))+" closed="+std::to_string(done->close));
+        log(std::string(done->summon?"Remote Hive: peer=":"Nested return: peer=")+done->view.peer+" session="+std::to_string(done->view.session)+" result="+std::to_string(int(done->result))+" closed="+std::to_string(done->close));
         if(!done->parent.peer.empty()) {
-            if(callbacks.return_reply)callbacks.return_reply(done->parent.peer,{done->parent.request.session,done->parent.request.id,done->result});
+            if(callbacks.return_reply)callbacks.return_reply(done->parent.peer,{done->parent.request.session,done->parent.request.id,done->result,done->summon});
         }else if(done->result!=ReturnResult::Returned){
-            status=L"Could not return one level. Ctrl+Alt+Backspace returns directly to this computer.";
+            status=done->summon?L"Remote Hive unavailable. Update every computer in the chain and try again.":L"Could not return one level. Ctrl+Alt+Backspace returns directly to this computer.";
         }
     }
-    void return_begin(NestedReturn::Parent parent={},std::function<bool()> authorized={}) {
-        const auto respond=[&](ReturnResult result){if(!parent.peer.empty()&&callbacks.return_reply)callbacks.return_reply(parent.peer,{parent.request.session,parent.request.id,result});};
+    void return_begin(NestedReturn::Parent parent={},std::function<bool()> authorized={},bool summon=false) {
+        summon=summon||parent.request.summon;
+        const auto respond=[&](ReturnResult result){if(!parent.peer.empty()&&callbacks.return_reply)callbacks.return_reply(parent.peer,{parent.request.session,parent.request.id,result,summon});};
         if(shutting_down||(authorized&&!authorized())){respond(ReturnResult::Stale);return;}
         if(!parent.peer.empty()){
             if(return_parent_peer!=parent.peer||return_parent_session!=parent.request.session){
@@ -566,7 +567,8 @@ struct Shell::Impl {
         if(nested_return.busy()){respond(ReturnResult::Busy);return;}
         const auto view=return_view();
         if(view.peer.empty()){
-            if(parent.peer.empty())local(true);else respond(ReturnResult::Leaf);
+            if(summon){toggle_panel();respond(ReturnResult::Returned);}
+            else if(parent.peer.empty())local(true);else respond(ReturnResult::Leaf);
             return;
         }
         const auto hops=parent.peer.empty()?16:parent.request.hops;
@@ -574,14 +576,21 @@ struct Shell::Impl {
         const auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==view.peer;});
         // Connecting has no active input lease yet. An old peer cannot report
         // a nested view; retain the pre-upgrade one-hop escape for that boundary.
-        if(!view.session||peer==peers.end()||!(peer->features&FeatureNestedReturn)){
+        if(summon&&(!view.session||peer==peers.end()||!(peer->features&FeatureRemoteHive))){
+            status=L"Remote Hive unavailable. Update every computer in the chain and try again.";
+            respond(ReturnResult::Stale);return;
+        }
+        if(!summon&&(!view.session||peer==peers.end()||!(peer->features&FeatureNestedReturn))){
             local(true);respond(ReturnResult::Returned);return;
         }
+        // Reveal the child beneath this layer's own Hive/Peek before asking
+        // the deepest layer to show its panel. Keep the active viewer alive.
+        if(summon)hide_panel(true);
         return_authorized=std::move(authorized);
-        const auto request=nested_return.begin(view,std::move(parent),uint8_t(hops-1),GetTickCount64());
+        const auto request=nested_return.begin(view,std::move(parent),uint8_t(hops-1),GetTickCount64(),summon);
         publish_input();ClipCursor(nullptr);
         if(!callbacks.return_request||!callbacks.return_request(view.peer,request))
-            return_complete(nested_return.reply(view.peer,{request.session,request.id,ReturnResult::Stale},return_view(),return_parent_valid()));
+            return_complete(nested_return.reply(view.peer,{request.session,request.id,ReturnResult::Stale,summon},return_view(),return_parent_valid()));
     }
     void local(bool notify) {
         return_complete(nested_return.cancel());
@@ -974,7 +983,8 @@ struct Shell::Impl {
             if(message==s->taskbar_created&&s->taskbar_created){s->tray_present=false;s->tray();return 0;}
             switch(message) {
             case WM_HOTKEY:
-                if(int(w)==s->hotkey_id)s->toggle_panel();return 0;
+                if(int(w)==s->hotkey_id)s->toggle_panel();
+                else if(w==83&&!s->recording_hotkey)s->return_begin({}, {},true);return 0;
             case CaptureActionMessage:{
                 const auto action=CaptureAction(w);
                 if(action==CaptureAction::KickController){if(!s->shutting_down&&s->callbacks.kick_controller)s->callbacks.kick_controller();return 0;}
@@ -986,6 +996,7 @@ struct Shell::Impl {
                 case CaptureAction::HidePanel:s->hide_panel();break;
                 case CaptureAction::HidePanelAnimated:s->hide_panel(true,s->taskbar_peek.active());break;
                 case CaptureAction::Summon:s->toggle_panel();break;
+                case CaptureAction::SummonRemote:s->return_begin({}, {},true);break;
                 default:break;
                 }return 0;
             }
@@ -1169,6 +1180,7 @@ struct Shell::Impl {
         },error))return false;
         hotkey_registered=RegisterHotKey(owner,hotkey_id,config.desktop.hotkey_modifiers|MOD_NOREPEAT,config.desktop.hotkey_key)!=FALSE;
         if(!hotkey_registered)log_hotkey_conflict();
+        if(!RegisterHotKey(owner,83,MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_NOREPEAT,'H'))log("Remote Hive shortcut Ctrl+Alt+Shift+H is already in use.");
         taskbar_created=RegisterWindowMessageW(L"TaskbarCreated");tray();SetTimer(owner,1,16,nullptr);read_clipboard(false);
         worker=std::thread([this]{for(;;){std::function<void()> f;{std::unique_lock lock(work_mutex);work_ready.wait(lock,[this]{return stop_worker||!work.empty();});if(stop_worker)break;f=std::move(work.front());work.pop_front();}
             try{f();}catch(const std::exception& e){std::wstring message=L"Operation failed: "+wide(e.what());dispatch([this,message]{status=message;InvalidateRect(panel,nullptr,FALSE);});}
@@ -1184,7 +1196,7 @@ struct Shell::Impl {
         log("Shell shutdown: background operations");
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
         log("Shell shutdown: native windows");
-        if(owner){UnregisterHotKey(owner,hotkey_id);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
+        if(owner){UnregisterHotKey(owner,hotkey_id);UnregisterHotKey(owner,83);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
         if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
         for(const auto& surface:retired_viewers)DestroyWindow(surface->window);
@@ -1333,7 +1345,8 @@ void Shell::observe_cursor(const std::string& controller,uint64_t session) {
 }
 void Shell::cursor_input_applied(uint64_t session,uint64_t capture_us){impl_->input_capture.cursor_input_applied(session,capture_us);}
 void Shell::return_one(const std::string& peer,ReturnRequest request,std::function<bool()> authorized){
-    impl_->dispatch([s=impl_,peer,request,authorized=std::move(authorized)]{s->return_begin({peer,request},authorized);});
+    const auto generation=impl_->generation.load();
+    impl_->dispatch([s=impl_,peer,request,generation,authorized=std::move(authorized)]{s->return_begin({peer,request},[s,generation,authorized]{return s->generation.load()==generation&&(!authorized||authorized());});});
 }
 void Shell::return_previous(){impl_->dispatch([s=impl_]{s->return_begin();});}
 RelayPlan Shell::route_remote(uint64_t host_session,const InputEvent& event,bool desktop_available,bool isolated_test){return impl_->input_capture.route_remote(host_session,event,desktop_available,isolated_test);}

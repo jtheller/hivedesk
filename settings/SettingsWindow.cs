@@ -83,7 +83,7 @@ internal sealed class SettingsWindow : Window
         heading.Children.Add(release); content.Children.Add(heading); content.Children.Add(Card(name));
         content.Children.Add(Card(Stack(12, startup, tray, Hint("With the icon hidden, open HiveDesk again for Settings."))));
         var tools = new Grid { ColumnSpacing = 24 }; tools.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); tools.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        tools.Children.Add(Stack(10, Label("Show Hive"), shortcut));
+        tools.Children.Add(Stack(10, Label("Show local Hive"), shortcut, Hint("Ctrl + Alt + Shift + H: remote Hive")));
         var mouseAndDebug = Stack(0, debug, relativeMouse); Grid.SetColumn(mouseAndDebug, 1); tools.Children.Add(mouseAndDebug);
         Id(relativeMouse, "RelativeMouse");
         relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
@@ -133,11 +133,11 @@ internal sealed class SettingsWindow : Window
         root.Loaded += async (_, _) => await ReadGpuPolicy();
         if (App.Arguments.Contains("--self-test")) root.Loaded += async (_, _) => await SelfTest(root);
     }
-    private static bool ValidHotkey(uint mods, uint code) => mods > 0 && mods <= 15 && (mods & 11) != 0 && ((code >= 65 && code <= 90) || (code >= 48 && code <= 57) || (code >= 112 && code <= 122));
+    private static bool ValidHotkey(uint mods, uint code) => !(mods == 7 && code == 72) && mods > 0 && mods <= 15 && (mods & 11) != 0 && ((code >= 65 && code <= 90) || (code >= 48 && code <= 57) || (code >= 112 && code <= 122));
     private string ShortcutText() => ((modifiers & 2) != 0 ? "Ctrl + " : "") + ((modifiers & 1) != 0 ? "Alt + " : "") + ((modifiers & 4) != 0 ? "Shift + " : "") + ((modifiers & 8) != 0 ? "Win + " : "") + (key >= 112 && key <= 122 ? "F" + (key - 111) : ((char)key).ToString());
     private void Load(Preferences value) { loadingPreferences = true; try { name.Text = value.Name; startup.IsOn = value.Startup; tray.IsOn = value.TrayIcon; debug.IsOn = value.DebugOverlay; relativeMouse.IsChecked = value.RelativeMouse; modifiers = value.HotkeyModifiers; key = value.HotkeyKey; shortcut.Content = ShortcutText(); savedPreferences = value; } finally { loadingPreferences = false; } }
     private void EndRecording() { if (!recording) return; recording = false; try { bridge.Send("record", "0"); } catch (Exception error) { Show(error.Message, InfoBarSeverity.Error); } shortcut.Content = ShortcutText(); }
-    private Preferences Values() { var text = name.Text.Trim(); if (string.IsNullOrWhiteSpace(text) || System.Text.Encoding.UTF8.GetByteCount(text) > 256) throw new InvalidOperationException("Enter a computer name of up to 256 UTF-8 bytes."); if (!ValidHotkey(modifiers, key)) throw new InvalidOperationException("Use Ctrl, Alt or Win with a letter, number, or F1-F11."); return new(text, startup.IsOn, tray.IsOn, modifiers, key, debug.IsOn, relativeMouse.IsChecked == true); }
+    private Preferences Values() { var text = name.Text.Trim(); if (string.IsNullOrWhiteSpace(text) || System.Text.Encoding.UTF8.GetByteCount(text) > 256) throw new InvalidOperationException("Enter a computer name of up to 256 UTF-8 bytes."); if (!ValidHotkey(modifiers, key)) throw new InvalidOperationException("Use Ctrl, Alt or Win with a letter, number, or F1-F11. Ctrl+Alt+Shift+H is reserved for remote Hive."); return new(text, startup.IsOn, tray.IsOn, modifiers, key, debug.IsOn, relativeMouse.IsChecked == true); }
     private void Show(string message, InfoBarSeverity severity) { feedback.ActionButton = null; feedback.Message = message; feedback.Severity = severity; feedback.IsOpen = true; }
     private void QueueSave(bool debounce = false) {
         if (!preferencesReady || loadingPreferences || closed || changingGpuPolicy) return;

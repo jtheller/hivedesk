@@ -73,6 +73,7 @@ int main(){try {
         require(released.size()==3,"old session modifiers leaked into a new session");
     }
     require(!hive::valid_hive_hotkey(3,0xc0)&&!hive::valid_hive_hotkey(7,0xc0),"configurable summon stole a fixed shortcut");
+    require(!hive::valid_hive_hotkey(7,'H')&&hive::valid_hive_hotkey(3,'H'),"local summon stole remote Hive shortcut");
     std::puts("PASS fixed physical shortcuts: left/right modifiers, kick vs escape, repeat and key-up, injected input isolation, layout independence, modifier release, reserved chords.");
     return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

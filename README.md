@@ -158,6 +158,7 @@ impersonator. No universal shared password is embedded in the application.
 - Nested keyboard/mouse control is supported from 0.11.0: A -> B -> C routes input to C when B's active viewer is under control. Upgrade all computers in the chain. B's own UI and secure desktop remain local input destinations; forwarded presses are not injected a second time into B. Absolute coordinates are mapped through windowed viewers; raw relative movement is preserved.
 - Ctrl+Alt+physical backtick returns one remote level: A -> B -> C first returns to B, then to A.
 - Ctrl+Alt+Backspace returns directly to the computer at your keyboard, without waiting for the network.
+- Ctrl+Alt+Shift+H toggles Hive on the deepest controlled computer (0.13.0+ throughout the chain). Ctrl+Alt+H, or your configured local shortcut, still toggles Hive on the physical local computer. Without a remote view, both act locally.
 - Nested return requires 0.10.0 or later along the chain. At an older-version boundary, it retains the previous local-return behavior.
 - Ctrl+Shift+Alt+physical backtick disconnects the controller of this computer.
   This fixed shortcut accepts physical keyboard input on the normal desktop,
@@ -282,12 +283,18 @@ icon** control background startup and tray visibility. With the tray hidden, ope
 HiveDesk.exe again to bring up Settings; only one agent runs per user session.
 Double-click the tray icon to open Settings. Single-click opens the computer list.
 
-**Ctrl+Alt+H** toggles the computer list. Click the shortcut button in Settings,
-press a new combination, then Save. Ctrl, Alt or Win plus a letter, digit or
+**Ctrl+Alt+H** toggles the local computer list. Click the shortcut button in Settings
+and press a new combination; it saves automatically. Ctrl, Alt or Win plus a letter, digit or
 F1-F11 is supported; occupied shortcuts are rejected without replacing the
 previous one. A summoned list stays open while you move to it; Escape, the same
 shortcut, a selection, or an outside click dismisses it. The top-left gesture
 keeps its normal pointer-leave dismissal.
+
+**Ctrl+Alt+Shift+H** toggles Hive on the deepest computer in the current control
+chain. For A -> B -> C, it opens C's list while the local shortcut opens A's.
+Return one level first to open B's list. This fixed chord is reserved; it sends
+an explicit command, so remote shortcuts can differ. Every computer in the
+chain needs 0.13.0 or later. Lock/login screens do not open a hidden user's Hive.
 
 TCP uses port 47980 for separate control/video/input connections (input requires
 alpha.25 on both endpoints). From 0.8.0, the video connection also negotiates an

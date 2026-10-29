@@ -13,7 +13,7 @@ struct DesktopPreferences {
     bool relative_mouse=false;
 };
 inline bool valid_hive_hotkey(uint32_t modifiers,uint32_t key){
-    return modifiers>0&&modifiers<=15&&(modifiers&11)&&
+    return !(modifiers==7&&key=='H')&&modifiers>0&&modifiers<=15&&(modifiers&11)&&
         ((key>='A'&&key<='Z')||(key>='0'&&key<='9')||(key>=0x70&&key<=0x7a));
 }
 struct Peer {
@@ -50,6 +50,7 @@ constexpr uint32_t FeatureScopedCursor = 2097152;
 constexpr uint32_t FeatureNestedReturn = 4194304;
 constexpr uint32_t FeatureInputRelay = 8388608;
 constexpr uint32_t FeatureViewRoute = 16777216;
+constexpr uint32_t FeatureRemoteHive = 33554432;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;

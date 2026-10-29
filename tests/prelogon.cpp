@@ -64,6 +64,7 @@ int main(){try{
 
         require(viewer.send_return_request(peer,{51,2,15}),"Prelogon return request");await([&]{return leaves==1;},"Prelogon did not report leaf");
         require(viewer.send_return_request(peer,{52,3,15}),"Wrong-session return request");await([&]{return stale_returns==2;},"Wrong session received return authority");
+        require(viewer.send_return_request(peer,{51,4,15,true}),"Prelogon summon request");await([&]{return stale_returns==3;},"Prelogon summon was not answered as unavailable");
         const auto before=FakeHost::stops.load();viewer.cancel_warm(peer,51);Sleep(50);require(FakeHost::stops==before,"Late warm cancellation stopped promoted control");
         viewer.stop_stream(peer);await([&]{return FakeHost::stops>before;},"Stop did not release broker");
         require(viewer.connection_token(peer)!=0,"Stopping host unnecessarily broke network pair");

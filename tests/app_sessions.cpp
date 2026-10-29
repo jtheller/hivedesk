@@ -10,7 +10,7 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic events on interactive station");
     const auto profile=std::filesystem::temp_directory_path()/(L"HiveDesk-AppSessions-"+std::to_wstring(GetCurrentProcessId()));std::filesystem::create_directories(profile);SetEnvironmentVariableW(L"LOCALAPPDATA",profile.c_str());
     auto encoded=hive::media_generated_test_frame();
-    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0;std::atomic<uint64_t> relay_acked=0;std::vector<hive::InputPacket> relayed;bool hold_relay=false;std::atomic<unsigned> releases=0;};
+    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0,summons=0;std::atomic<uint64_t> relay_acked=0;std::vector<hive::InputPacket> relayed;bool hold_relay=false;std::atomic<unsigned> releases=0;};
     std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0,previews=0,preview_stops=0,visible_previews=0;std::atomic<bool> bad_handoff=false;
     for(unsigned i=0;i<3;++i){auto& p=peers[i];hive::TransportCallbacks cb;
         cb.clipboard=[&p](const std::string&,const std::wstring&){std::lock_guard lock(p.mutex);p.handoff=true;};
@@ -28,7 +28,7 @@ int probe(){
             p.net.send_input_ack(id,{in.session,in.sequence,in.capture_time_us,0,0,true});
         };
         cb.input_ack=[&p](const std::string&,const hive::InputAck& ack){if(ack.session==701&&ack.injected)p.relay_acked=ack.sequence;};
-        cb.return_request=[&p](const std::string& id,const hive::ReturnRequest& r){const auto count=++p.returns;p.net.send_return_reply(id,{r.session,r.id,count==1?hive::ReturnResult::Returned:hive::ReturnResult::Leaf});};
+        cb.return_request=[&p](const std::string& id,const hive::ReturnRequest& r){if(r.summon){++p.summons;p.net.send_return_reply(id,{r.session,r.id,hive::ReturnResult::Returned,true});return;}const auto count=++p.returns;p.net.send_return_reply(id,{r.session,r.id,count==1?hive::ReturnResult::Returned:hive::ReturnResult::Leaf});};
         std::string error;require(p.net.start({"peer-"+std::to_string(i),"Generated peer "+std::to_string(i),"stress-key",uint16_t(48190+i),false,true},cb,error),error.c_str());
     }
     hive::AppConfig config;config.device_id="isolated-viewer";config.name=L"Isolated viewer";config.group_key="stress-key";config.port=48194;config.first_run=false;config.desktop.tray_icon=false;
@@ -105,6 +105,21 @@ int probe(){
             require(app.test_surface()!=old,"Recovery reused the failed renderer's HWND");
         }
         std::puts("PASS 72 rapid Peek transitions and three same-peer recoveries with blocked retirement; final frames verified");
+        {
+            auto& p=peers[0];{std::lock_guard lock(p.mutex);p.hold_release=true;p.held_release={};}
+            // Queue behind show_remote's UI handoff. SendMessage can overtake
+            // it after test_ready observes the network worker's ready flag.
+            PostMessageW(owner,WM_HOTKEY,83,0);
+            hive::InputPacket barrier;
+            for(unsigned n=0;n<200;++n){{std::lock_guard lock(p.mutex);barrier=p.held_release;}if(barrier.sequence)break;Sleep(5);}
+            if(!barrier.sequence||!app.test_return_pending()||p.summons)std::fprintf(stderr,"summon fixture: barrier=%llu pending=%d requests=%u\n",(unsigned long long)barrier.sequence,int(app.test_return_pending()),p.summons.load());
+            require(barrier.sequence&&app.test_return_pending()&&!p.summons,"Remote summon missing release barrier or crossed unacknowledged release");
+            {std::lock_guard lock(p.mutex);p.hold_release=false;}
+            require(p.net.send_input_ack(p.client,{barrier.session,barrier.sequence,barrier.capture_time_us,0,0,true}),"Summon barrier ACK");
+            for(unsigned n=0;n<200&&(!p.summons||app.test_return_pending());++n)Sleep(5);
+            require(p.summons==1&&!app.test_return_pending()&&app.test_ready("peer-0"),"Remote summon did not release barrier and preserve active video");
+            std::puts("PASS actual App remote summon: encrypted command waits for broker release ACK, preserves video and resumes input");
+        }
         auto recovery=app.test_recovery_guards();
         require(recovery.wait_for(std::chrono::seconds(3))==std::future_status::ready&&recovery.get(),"Graphics watchdog interrupted a healthy session or failed to request idle recovery");
         std::puts("PASS aged-retirement watchdog: healthy viewer/controller/preview protected; idle recovery requested (process helper tested separately)");
