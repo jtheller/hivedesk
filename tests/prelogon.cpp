@@ -11,6 +11,7 @@ void require(bool value,const char* text){if(!value)throw std::runtime_error(tex
 template<class F>void await(F predicate,const char* text){const auto until=GetTickCount64()+3000;while(!predicate()&&GetTickCount64()<until)Sleep(10);require(predicate(),text);}
 struct FakeHost {
     static inline std::atomic<int> starts=0,stops=0,promotions=0,inputs=0,previews=0;
+    static inline std::atomic<hive::InputKind> last_kind=hive::InputKind::ReleaseAll;
     std::function<void(const hive::InputAck&)> acknowledge;
     bool start(const hive::StreamSettings&,std::function<void(hive::EncodedFrame)>,std::string&,
         std::function<bool()>,std::function<void(const hive::StreamHealth&)>,std::function<void(const hive::SourceDiagnostics&)>,
@@ -19,7 +20,7 @@ struct FakeHost {
     void request_keyframe(){}void feedback(const hive::StreamFeedback&){}void notify_ready(){}
     bool activate(){++promotions;return true;}bool preview(bool){++previews;return true;}
     bool input(const hive::InputEvent&){++inputs;return true;}
-    bool input(const hive::InputPacket& p){++inputs;hive::InputAck a;a.session=p.session;a.sequence=p.sequence;a.capture_time_us=p.capture_time_us;a.injected=true;acknowledge(a);return true;}
+    bool input(const hive::InputPacket& p){last_kind=p.event.kind;++inputs;hive::InputAck a;a.session=p.session;a.sequence=p.sequence;a.capture_time_us=p.capture_time_us;a.injected=true;acknowledge(a);return true;}
 };
 }
 int main(){try{
@@ -57,6 +58,10 @@ int main(){try{
         require(viewer.send_input(peer,packet),"Synthetic input enqueue");await([&]{return acks==1;},"Independent ACK not returned");
         // FakeHost consumes this event; no SendInput or desktop changes occur.
         require(FakeHost::inputs==1,"Unexpected injected-event count");
+        packet.sequence=2;packet.capture_time_us=input_now_us();input_append(packet,input_node(peer));
+        require(viewer.send_input(peer,packet),"Prelogon loop send");await([&]{return acks==2;},"Prelogon loop release ACK");
+        require(FakeHost::inputs==2&&FakeHost::last_kind==InputKind::ReleaseAll,"Prelogon repeated node injected the original key");
+
         require(viewer.send_return_request(peer,{51,2,15}),"Prelogon return request");await([&]{return leaves==1;},"Prelogon did not report leaf");
         require(viewer.send_return_request(peer,{52,3,15}),"Wrong-session return request");await([&]{return stale_returns==2;},"Wrong session received return authority");
         const auto before=FakeHost::stops.load();viewer.cancel_warm(peer,51);Sleep(50);require(FakeHost::stops==before,"Late warm cancellation stopped promoted control");

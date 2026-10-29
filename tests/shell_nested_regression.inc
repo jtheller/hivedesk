@@ -41,4 +41,19 @@ void Shell::nested_return_self_test(){
     viewing(14);s.return_begin();
     s.return_complete(s.nested_return.tick(GetTickCount64()+10001,s.return_view(),true));
     require(s.remote&&!s.nested_return.busy()&&!s.input_state().local_shell&&closes==4,"timeout closed or stranded outer desktop");
+    viewing(15);s.windowed=true;s.remote_width=1920;s.remote_height=1080;
+    SetWindowPos(s.viewer,HWND_TOP,300,200,800,500,SWP_SHOWWINDOW);SetForegroundWindow(s.viewer);s.publish_input();
+    auto relay_state=s.input_state();relay_state.remote=true;s.input_capture.update(relay_state);
+    const auto bounds=s.viewer_client();const POINT center{(bounds.left+bounds.right)/2,(bounds.top+bounds.bottom)/2};
+    const auto absolute=[&](POINT p){return InputEvent{InputKind::Absolute,int32_t((int64_t(p.x)*65536)/GetSystemMetrics(SM_CXSCREEN)),int32_t((int64_t(p.y)*65536)/GetSystemMetrics(SM_CYSCREEN))};};
+    auto mapped=route_remote(501,absolute(center),true,true);
+    require(mapped.forward&&mapped.local&&std::abs(mapped.event.a-32768)<300&&std::abs(mapped.event.b-32768)<300,"Nested window center/letterbox coordinate mapping");
+    // Local broker positioning has not run. Button hit testing must use the
+    // preceding authenticated absolute packet, not the old Windows cursor.
+    mapped=route_remote(501,{InputKind::Button,1,0},true,true);require(mapped.forward&&!mapped.local,"Nested button used stale intermediate OS position");
+    mapped=route_remote(501,absolute({0,0}),true,true);require(mapped.forward&&mapped.event.a==0&&mapped.event.b==0,"Nested drag escaped its captured viewer");
+    mapped=route_remote(501,{InputKind::Button,1,1},true,true);require(mapped.forward&&!mapped.local,"Nested drag release lost outside window");
+    mapped=route_remote(501,absolute({0,0}),true,true);require(!mapped.forward&&mapped.local,"Local desktop pointer forwarded to nested viewer");
+    mapped=route_remote(501,{InputKind::Key,30,0},false,true);require(!mapped.forward&&mapped.local,"Secure desktop input forwarded behind lock screen");
+    route_remote(501,{InputKind::ReleaseAll},true,true);s.windowed=false;
 }

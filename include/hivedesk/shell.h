@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 namespace hive {
+struct RelayPlan;
 class MediaViewer;
 // The renderer holds this lease until its worker/swap chain has stopped. Shell
 // hides retired windows immediately and destroys them only after lease release.
@@ -87,6 +88,7 @@ public:
     // thread and again before applying a delayed downstream reply.
     void return_one(const std::string& peer,ReturnRequest,std::function<bool()> authorized);
     void return_previous();
+    RelayPlan route_remote(uint64_t host_session,const InputEvent&,bool desktop_available,bool isolated_test=false);
     void returned(const std::string& peer,ReturnReply);
     void update_cursor(const std::string& peer, CursorState);
     void update_cursor_composition(const std::string& peer,uint64_t session,uint64_t sequence,CursorComposition);

@@ -13,6 +13,7 @@
 #include "hivedesk/gpu_policy_restart.h"
 #include "hivedesk/recovery.h"
 #include "task_lane.h"
+#include "input_relay.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <algorithm>
@@ -49,6 +50,13 @@ public:
     void test_stop_viewer(){viewer_.load()->request_stop();}
     void test_return_previous(){shell_.return_previous();}
     bool test_return_pending(){const std::lock_guard lock(view_intent_mutex_);return return_barrier_.has_value();}
+    void test_relay_controller(const std::string& peer,uint64_t session,std::function<void(const hive::InputPacket&)> sink){
+        USEROBJECTFLAGS flags{};DWORD size=0;
+        if(!GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)||(flags.dwFlags&WSF_VISIBLE))throw std::runtime_error("Relay fixture requires invisible station");
+        const std::lock_guard lock(host_mutex_);test_relay_sink_=std::move(sink);
+        if(auto old=hosting_.load())old->revoke();
+        hosting_=session?std::make_shared<hive::HostControl>(peer,session,transport_.connection_token(peer)):nullptr;input_ready_=session!=0;
+    }
     void test_delay_retirement(DWORD duration){retire_lane_.post([duration]{Sleep(duration);});}
     void test_report()const{const auto v=viewer_.load();const auto active=active_.load();const auto d=v->diagnostics();std::fprintf(stderr,"viewer test: active=%s ready=%d frame=%d presented=%d received=%llu state=%s input=%d decode_mhz=%u present_mhz=%u map_us=%u convert_us=%u depth=%u expired=%llu overflow=%llu skipped=%llu\n",active?active->c_str():"none",int(view_ready_.load()),v->has_frame(),v->has_presented_frame(),(unsigned long long)received_frames_.load(),v->stats().c_str(),active&&transport_.input_ready(*active,active_session_),d.decoded_millihz,d.presented_millihz,d.nvdec_map_us,d.convert_us,d.queue_depth,(unsigned long long)d.age_expired,(unsigned long long)d.queue_overflows,(unsigned long long)d.skipped);std::fflush(stderr);}
     std::future<bool> test_recovery_guards(){
@@ -135,6 +143,7 @@ public:
             return !closing_&&target&&!target->revoked&&!target->warming&&target->peer==peer&&target->session==cursor.session&&transport_.send_cursor(peer,cursor);
         };
         callbacks.stream_tick=[this] {
+            relay_tick();
             if(!closing_&&clipboard_pending_&&GetTickCount64()-last_clipboard_retry_>=1000) {
                 last_clipboard_retry_=GetTickCount64();enqueue([this]{
                     const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
@@ -168,6 +177,7 @@ public:
             if(active_dedicated_input_){
                 hive::InputPacket packet;packet.session=session;packet.sequence=++input_sequence_;
                 packet.capture_time_us=captured_us;packet.event=input;
+                hive::input_append(packet,input_node_id_);
                 transport_.send_input(peer,packet);
             }else transport_.send_input(peer,input);
         };
@@ -225,6 +235,87 @@ public:
         return result;
     }
 private:
+    void relay_deliver(const std::shared_ptr<hive::HostControl>& control,const std::vector<hive::InputAck>& acks){
+        if(closing_||!control||control->revoked||hosting_.load()!=control)return;
+        for(const auto& ack:acks){if(ack.injected)shell_.cursor_input_applied(ack.session,ack.capture_time_us);transport_.send_input_ack(control->peer,ack);}
+    }
+    void relay_local_ack(const std::shared_ptr<hive::HostControl>& control,const hive::InputAck& ack){
+        std::vector<hive::InputAck> ready;
+        {const std::lock_guard lock(relay_mutex_);if(relay_control_!=control)return;relay_ledger_.local(ack);ready=relay_ledger_.drain();}
+        relay_deliver(control,ready);
+    }
+    void relay_remote_ack(const std::string& peer,const hive::InputAck& ack){
+        std::vector<hive::InputAck> ready;std::shared_ptr<hive::HostControl> control;
+        {const std::lock_guard lock(relay_mutex_);control=relay_control_;relay_ledger_.remote(peer,ack);ready=relay_ledger_.drain();}
+        relay_deliver(control,ready);
+    }
+    void relay_tick(){
+        std::vector<hive::InputAck> ready;std::shared_ptr<hive::HostControl> control;
+        {
+            const std::lock_guard view_lock(view_intent_mutex_);
+            const std::lock_guard lock(relay_mutex_);control=relay_control_;
+            const bool host_lost=control&&(control->revoked||hosting_.load()!=control);
+            const bool view_lost=relay_child_&&(view_control_!=relay_child_||relay_child_->generation!=generation_);
+            if(host_lost&&relay_child_&&view_control_==relay_child_&&view_ready_&&active_dedicated_input_){
+                hive::InputPacket release;release.session=relay_child_->session;release.sequence=++input_sequence_;
+                release.capture_time_us=hive::input_now_us();release.event={hive::InputKind::ReleaseAll};hive::input_append(release,input_node_id_);
+                transport_.send_input(relay_child_->peer,release);
+            }
+            if(host_lost){relay_control_.reset();relay_child_.reset();relay_ledger_.reset();}
+            else if(view_lost){relay_child_.reset();relay_ledger_.cancel_remote();ready=relay_ledger_.drain();}
+        }
+        relay_deliver(control,ready);
+    }
+    void relay_receive(const std::shared_ptr<hive::HostControl>& control,const hive::InputPacket& packet){
+        relay_tick();
+        hive::RelayPlan plan;hive::InputPacket onward;std::vector<hive::InputAck> ready;
+        bool queued=true,full=false;
+        {
+            const std::lock_guard view_lock(view_intent_mutex_);
+            if(closing_||control->revoked||hosting_.load()!=control)return;
+            const auto node=input_node_id_;
+            // Repeat nodes consume input, not connections. This also keeps
+            // a relayed cursor from warping the physical origin in A-B-A.
+            if(hive::input_visited(packet,node)||packet.path_size>=packet.path.size())plan.local=false;
+            else {
+                bool available=view_control_&&view_ready_&&view_control_->generation==generation_&&hive::input_desktop_name()==L"Default";
+#ifdef HIVEDESK_APP_SESSION_TEST
+                if(test_relay_sink_)plan=shell_.route_remote(control->session,packet.event,true,true);
+                else
+#endif
+                plan=shell_.route_remote(control->session,packet.event,available);
+            }
+            const auto target=view_control_;
+            if(plan.forward&&(!target||!view_ready_||!active_dedicated_input_||target->generation!=generation_||
+                target->peer!=plan.route.peer||target->session!=plan.route.session||
+                (return_barrier_&&return_barrier_->view==target&&packet.event.kind!=hive::InputKind::ReleaseAll))){
+                plan.forward=false;plan.local=false; // Never retarget a stale selection to the local desktop.
+            }
+            if(plan.forward){
+                onward=packet;if(!onward.path_size)hive::input_append(onward,hive::input_node(control->peer));
+                if(!hive::input_append(onward,node)){plan.forward=plan.local=false;}
+                else {onward.session=target->session;onward.sequence=++input_sequence_;onward.capture_time_us=hive::input_now_us();onward.received_time_us=0;onward.event=plan.event;}
+            }
+            {
+                const std::lock_guard lock(relay_mutex_);
+                if(relay_control_!=control){relay_control_=control;relay_ledger_.reset();relay_child_.reset();}
+                if(plan.forward)relay_child_=target;
+                full=!relay_ledger_.push(packet,plan.local,plan.forward?plan.route:hive::RelayRoute{},plan.forward?onward.sequence:0);
+            }
+            if(!full&&plan.forward)queued=transport_.send_input(target->peer,onward);
+        }
+        if(full){transport_.end_stream(control->peer,control->session);return;}
+        if(!queued)relay_remote_ack(plan.route.peer,{onward.session,onward.sequence,onward.capture_time_us,0,0,false});
+        if(plan.local){
+#ifdef HIVEDESK_APP_SESSION_TEST
+            if(test_relay_sink_){test_relay_sink_(packet);relay_local_ack(control,{packet.session,packet.sequence,packet.capture_time_us,0,0,true});return;}
+#endif
+            if(!host_.input(packet))relay_local_ack(control,{packet.session,packet.sequence,packet.capture_time_us,0,0,false});
+        }else {
+            {const std::lock_guard lock(relay_mutex_);if(relay_control_==control)ready=relay_ledger_.drain();}
+            relay_deliver(control,ready);
+        }
+    }
     void apply_handoff(const std::string& peer) {
         const auto cached=staged_clipboards_.find(peer);if(cached==staged_clipboards_.end())return;
         // The secure desktop has no user clipboard. Keep its handoff in memory
@@ -258,6 +349,7 @@ private:
             // Notify before joining: slow driver teardown must not let the
             // viewer's automatic recovery create a new intent in the meantime.
             const bool notified=transport_.end_stream(target->peer,target->session);
+            relay_tick();
             {
                 const std::lock_guard lock(host_mutex_);
                 if(hosting_.load()!=target)continue;
@@ -467,7 +559,7 @@ private:
                     host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();
                 }
             }
-            shell_.update_peers(transport_.peers());wake_.notify_one();
+            relay_tick();shell_.update_peers(transport_.peers());wake_.notify_one();
         }};
         callbacks.status=[this](const std::string& text){status(text);};
         callbacks.frame_ready=[this](const std::string& peer){
@@ -518,6 +610,7 @@ private:
             const auto target=hosting_.load();if(!closing_&&target&&!target->revoked&&target->peer==peer&&target->session==report.session)host_.feedback(report);
         };
         callbacks.input_ack=[this](const std::string& peer,const hive::InputAck& ack){
+            relay_remote_ack(peer,ack);
             std::optional<hive::ReturnRequest> failed;
             {
                 const std::lock_guard lock(view_intent_mutex_);
@@ -625,8 +718,7 @@ private:
                 if(!closing_&&!control->revoked&&hosting_.load()==control){telemetry_.source(MonitorSide::Host,control->peer,value);telemetry_.video_send(control->peer,control->session,transport_.video_send_diagnostics(control->peer));transport_.send_diagnostics(control->peer,value);}
             },[this,control](const hive::InputAck& ack){
                 if(!closing_&&!control->revoked&&hosting_.load()==control&&ack.session==control->session){
-                    if(ack.injected)shell_.cursor_input_applied(ack.session,ack.capture_time_us);
-                    transport_.send_input_ack(control->peer,ack);
+                    relay_local_ack(control,ack);
                 }
             })) {control->revoke();hosting_.store(nullptr);telemetry_.clear(MonitorSide::Host);status("Capture failed: "+error);}
             else if(!settings.warm) {
@@ -651,9 +743,10 @@ private:
         };
         callbacks.stop_stream=[this](const std::string& peer) {
             if(closing_)return;
-            const std::lock_guard lock(host_mutex_);
+            {const std::lock_guard lock(host_mutex_);
             const auto target=hosting_.load();
-            if(target&&target->peer==peer) {target->revoke();input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);shell_.observe_cursor({});staged_clipboards_.erase(peer);host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();status("Remote control released.");}
+            if(target&&target->peer==peer) {target->revoke();input_ready_=false;clipboard_pending_=false;hosting_.store(nullptr);shell_.observe_cursor({});staged_clipboards_.erase(peer);host_.stop();telemetry_.clear(MonitorSide::Host);hive::release_injected_input();status("Remote control released.");}}
+            relay_tick();
         };
         callbacks.frame_credit=[this](const std::string& peer,uint64_t session){
             if(closing_)return true;
@@ -703,11 +796,7 @@ private:
                 // an injection failure that would tear down a reciprocal stream.
                 if(!closing_)transport_.end_stream(peer,packet.session);return;
             }
-            if(!host_.input(packet)){
-                hive::InputAck ack;ack.session=packet.session;ack.sequence=packet.sequence;ack.capture_time_us=packet.capture_time_us;
-                transport_.send_input_ack(peer,ack);
-                if(!target->input_error_reported.exchange(true))status("Dedicated desktop input connection failed.");
-            }
+            relay_receive(target,packet);
         };
         callbacks.input=[this](const std::string& peer,const hive::InputEvent& event) {
             const std::lock_guard lock(host_mutex_);
@@ -989,6 +1078,7 @@ private:
     std::vector<std::shared_ptr<const hive::ViewerSurface>> warm_visible_;
     std::string peek_peer_;uint64_t peek_epoch_=0;std::atomic<bool> peek_requested_{false},warm_dirty_{false};
     hive::AppConfig config_;
+    const uint64_t input_node_id_=hive::input_node(config_.device_id);
     hive::Shell shell_;
     hive::Transport transport_;
     hive::ClipboardTransfer clipboard_transfer_{transport_};
@@ -1004,6 +1094,12 @@ private:
     std::atomic<std::shared_ptr<const std::string>> active_,last_controlled_;
     std::atomic<std::shared_ptr<hive::HostControl>> hosting_;
     std::shared_ptr<const hive::ViewControl> view_control_; // Protected by view_intent_mutex_.
+    std::mutex relay_mutex_;hive::RelayLedger relay_ledger_;
+    std::shared_ptr<hive::HostControl> relay_control_;
+    std::shared_ptr<const hive::ViewControl> relay_child_;
+#ifdef HIVEDESK_APP_SESSION_TEST
+    std::function<void(const hive::InputPacket&)> test_relay_sink_;
+#endif
     struct ReturnBarrier {std::shared_ptr<const hive::ViewControl> view;hive::ReturnRequest request;uint64_t sequence=0;bool sent=false;};
     std::optional<ReturnBarrier> return_barrier_;uint64_t input_after_return_us_=0; // view_intent_mutex_
     std::map<std::string,uint64_t> legacy_kicked_; // Protected by host_mutex_.

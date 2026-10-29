@@ -308,6 +308,7 @@ struct Shell::Impl {
     }
     InputCaptureState input_state(bool keep_taskbar_guard=false) {
         InputCaptureState state;state.generation=generation.load();state.session=input_session;state.peer=active_id;
+        state.returning=nested_return.busy();
         if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
         state.local_shell=nested_return.busy()||taskbar_peek.active()||taskbar_focus_guard||!peek_id.empty()||!fading_peeks.empty();
         state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
@@ -787,7 +788,7 @@ struct Shell::Impl {
         }
         const bool corner=p.x>=0&&p.x<=px(3)&&p.y>=0&&p.y<=px(3);
         // Start the fade on the first corner sample; no hover dwell before showing it.
-        if(!panel_mode){if(corner)show_panel(1);return;}
+        if(!panel_mode){if(corner&&!input_capture.remote_pointer_active())show_panel(1);return;}
         if(panel_closing){if(!taskbar_peek.active()&&p.x>=0&&p.x<panel_width&&p.y>=0&&p.y<panel_height)show_panel(panel_mode);return;}
         if(panel_mode==1&&p.x>=0&&p.x<px(42)&&p.y>px(32))show_panel(2);
         if(pressed_card>=0){
@@ -1323,6 +1324,7 @@ void Shell::return_one(const std::string& peer,ReturnRequest request,std::functi
     impl_->dispatch([s=impl_,peer,request,authorized=std::move(authorized)]{s->return_begin({peer,request},authorized);});
 }
 void Shell::return_previous(){impl_->dispatch([s=impl_]{s->return_begin();});}
+RelayPlan Shell::route_remote(uint64_t host_session,const InputEvent& event,bool desktop_available,bool isolated_test){return impl_->input_capture.route_remote(host_session,event,desktop_available,isolated_test);}
 void Shell::returned(const std::string& peer,ReturnReply reply){
     impl_->dispatch([s=impl_,peer,reply]{s->return_complete(s->nested_return.reply(peer,reply,s->return_view(),s->return_parent_valid()));});
 }

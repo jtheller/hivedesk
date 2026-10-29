@@ -22,7 +22,8 @@ public:
         if(!session_||packet.session!=session_||!packet.sequence||packet.sequence<=last_enqueued_||!packet.capture_time_us)return false;
         ++totals_.enqueued;last_enqueued_=packet.sequence;
         const auto moving=[](InputKind kind){return kind==InputKind::Absolute||kind==InputKind::Relative;};
-        if(!pending_.empty()&&moving(packet.event.kind)&&pending_.back().packet.event.kind==packet.event.kind) {
+        if(!pending_.empty()&&moving(packet.event.kind)&&pending_.back().packet.event.kind==packet.event.kind&&
+           pending_.back().packet.path_size==packet.path_size&&pending_.back().packet.path==packet.path) {
             auto& previous=pending_.back();
             if(packet.event.kind==InputKind::Relative) {
                 packet.event.a=int32_t(std::clamp<int64_t>(int64_t(previous.packet.event.a)+packet.event.a,INT32_MIN,INT32_MAX));

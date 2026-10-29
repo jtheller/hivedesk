@@ -52,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -167,8 +167,8 @@ bool valid_input(const InputEvent& e) {
     }
 }
 Bytes input_bytes(const InputPacket& packet) {
-    Bytes b{InputData};u64(b,packet.session);u64(b,packet.sequence);u64(b,packet.capture_time_us);
-    u32(b,uint32_t(packet.event.kind));u32(b,uint32_t(packet.event.a));u32(b,uint32_t(packet.event.b));u32(b,uint32_t(packet.event.c));return b;
+    Bytes b{packet.path_size?RoutedInput:InputData};u64(b,packet.session);u64(b,packet.sequence);u64(b,packet.capture_time_us);
+    u32(b,uint32_t(packet.event.kind));u32(b,uint32_t(packet.event.a));u32(b,uint32_t(packet.event.b));u32(b,uint32_t(packet.event.c));if(packet.path_size){b.push_back(packet.path_size);for(unsigned i=0;i<packet.path_size;++i)u64(b,packet.path[i]);}return b;
 }
 bool send_all(SOCKET s, const uint8_t* p, size_t n) {
     // A blocking send can wait for the whole supplied buffer. Bound each write
@@ -214,7 +214,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -865,7 +865,7 @@ struct Transport::Impl {
         if(type==ClipboardData){if(b.size()<2||b.size()>ClipboardChunk+64)return false;if(callbacks.clipboard_packet)callbacks.clipboard_packet(c.peer.id,Bytes(b.begin()+1,b.end()));return true;}
         if(type==RichClipboard){ClipboardOffer offer;if(c.channel!=0||!(c.peer.features&FeatureRichClipboard)||!decode_clipboard_offer(Bytes(b.begin()+1,b.end()),offer))return false;if(callbacks.clipboard_offer)callbacks.clipboard_offer(c.peer.id,offer);else if(callbacks.clipboard)callbacks.clipboard(c.peer.id,offer.text);return true;}
         if ((c.channel == 1) != (type == Frame||type==AutoFrame||type==AutoFrameTimed||type==FrameCursor||type==ProbePayload)) return false;
-        const bool input_message=type==InputReady||type==InputData||type==InputComplete||type==InputRevoke;
+        const bool input_message=type==InputReady||type==InputData||type==RoutedInput||type==InputComplete||type==InputRevoke;
         if((c.channel==2)!=input_message)return false;
         if(type==ProbeStart||type==ProbeReady||type==ProbeDone||type==ProbePayload)return dispatch_probe(c,type,r);
         switch (type) {
@@ -889,9 +889,13 @@ struct Transport::Impl {
             }}
             c.queue_cv.notify_all();return true;
         }
-        case InputData: {
+        case InputData: case RoutedInput: {
             InputPacket packet;packet.session=r.qword();packet.sequence=r.qword();packet.capture_time_us=r.qword();
             packet.event.kind=InputKind(r.dword());packet.event.a=int32_t(r.dword());packet.event.b=int32_t(r.dword());packet.event.c=int32_t(r.dword());
+            if(type==RoutedInput){
+                packet.path_size=r.byte();if(!(c.peer.features&FeatureInputRelay)||!packet.path_size||packet.path_size>packet.path.size())return false;
+                for(unsigned i=0;i<packet.path_size;++i){packet.path[i]=r.qword();if(!packet.path[i])return false;for(unsigned j=0;j<i;++j)if(packet.path[i]==packet.path[j])return false;}
+            }
             if(!packet.session||!packet.sequence||!packet.capture_time_us||!valid_input(packet.event)||!r.end())return false;
             {std::lock_guard lock(c.queue_mutex);if(packet.session!=c.input_receive_session||packet.sequence<=c.input_receive_sequence)return true;c.input_receive_sequence=packet.sequence;}
             packet.received_time_us=input_now_us();
@@ -1401,11 +1405,14 @@ bool Transport::input_ready(const std::string& peer,uint64_t session) const {
     std::lock_guard lock(input->queue_mutex);return !input->closed&&input->input_enabled&&!input->input_ending&&input->input_send.session()==session;
 }
 bool Transport::send_input(const std::string& peer,const InputPacket& packet) {
-    if(!valid_input(packet.event)||!packet.session||!packet.sequence||!packet.capture_time_us)return false;
+    if(!valid_input(packet.event)||!packet.session||!packet.sequence||!packet.capture_time_us||packet.path_size>packet.path.size())return false;
     auto input=impl_->find_input(peer);if(!input)return false;bool queued=false;
     {std::lock_guard lock(input->queue_mutex);
         if(input->closed||!input->input_enabled||input->input_ending||input->input_send.session()!=packet.session||packet.sequence<=input->input_send.last_sequence())return false;
-        queued=input->input_send.enqueue(packet,input_now_us());}
+        auto wire=packet;
+        // Old endpoints terminate input locally; do not send an unknown opcode.
+        if(!(input->peer.features&FeatureInputRelay)){wire.path_size=0;wire.path.fill(0);}
+        queued=input->input_send.enqueue(wire,input_now_us());}
     if(queued)input->queue_cv.notify_one();
     else {impl_->status("Input edge queue exceeded its bound; releasing remote control.");input->close(true);}
     return queued;
@@ -1858,12 +1865,39 @@ bool Transport::self_test(std::string& result) {
         if(queue.enqueue({72,129,2000,{InputKind::Key,30,1}},2000)){result="Input edge queue exceeded its fixed bound";return false;}
     }
     {
+        Impl owner;Impl::Conn c(&owner,INVALID_SOCKET);c.channel=2;c.ready=true;
+        c.peer.id="relay-origin";c.peer.features=FeatureDedicatedInput|FeatureInputRelay;c.input_receive_session=701;
+        unsigned received=0;InputPacket observed;
+        owner.callbacks.input_packet=[&](const std::string&,const InputPacket& packet){++received;observed=packet;};
+        InputPacket packet{701,1,input_now_us(),{InputKind::Key,30,0}};
+        input_append(packet,input_node("a"));input_append(packet,input_node("b"));
+        const auto valid=input_bytes(packet);
+        if(!owner.dispatch(c,valid)||received!=1||observed.path_size!=2||observed.path!=packet.path){result="Routed input serialization failed";return false;}
+        auto malformed=valid;malformed.pop_back();
+        if(owner.dispatch(c,malformed)){result="Truncated input route accepted";return false;}
+        malformed=valid;malformed.push_back(0);
+        if(owner.dispatch(c,malformed)){result="Trailing input route data accepted";return false;}
+        packet.path[1]=packet.path[0];
+        if(owner.dispatch(c,input_bytes(packet))){result="Duplicate input route node accepted";return false;}
+        packet.path[1]=0;
+        if(owner.dispatch(c,input_bytes(packet))){result="Zero input route node accepted";return false;}
+        // Header is type + three u64s + four u32s; route count follows it.
+        malformed=valid;malformed[41]=17;
+        if(owner.dispatch(c,malformed)){result="Oversized input route accepted";return false;}
+        malformed=valid;malformed[41]=0;malformed.resize(42);
+        if(owner.dispatch(c,malformed)){result="Empty routed input accepted";return false;}
+        c.peer.features=FeatureDedicatedInput;
+        if(owner.dispatch(c,valid)||received!=1){result="Unnegotiated input route accepted";return false;}
+        packet.path_size=0;packet.sequence=2;
+        if(!owner.dispatch(c,input_bytes(packet))||received!=2||observed.path_size){result="Legacy input format regressed";return false;}
+    }
+    {
         // Real encrypted third-channel loopback. The control reader is held
         // inside a clipboard callback; input must still complete and ACK. No
         // Windows input APIs are called by this test.
         std::mutex guard;std::condition_variable changed;
         bool clipboard=false,started=false,blocked=false,unblock=false,ordered=false;
-        unsigned packets=0,acks=0;uint64_t last_sequence=0;bool received_clock=true;
+        unsigned packets=0,acks=0;uint64_t last_sequence=0;bool received_clock=true,received_route=true;
         Transport sender,receiver;
         struct Release {std::mutex& guard;std::condition_variable& cv;bool& flag;~Release(){std::lock_guard lock(guard);flag=true;cv.notify_all();}} release{guard,changed,unblock};
         TransportCallbacks outgoing,incoming;
@@ -1874,7 +1908,7 @@ bool Transport::self_test(std::string& result) {
         incoming.start_stream=[&](const std::string&,const StreamSettings& settings){std::lock_guard lock(guard);started=settings.session==901;};
         incoming.input_begin=[&](const std::string&,uint64_t session){std::lock_guard lock(guard);ordered=clipboard&&started&&session==901;return ordered;};
         incoming.input_packet=[&](const std::string& peer,const InputPacket& packet){
-            {std::lock_guard lock(guard);++packets;last_sequence=packet.sequence;received_clock=received_clock&&packet.received_time_us&&packet.received_time_us<=input_now_us();changed.notify_all();}
+            {std::lock_guard lock(guard);++packets;last_sequence=packet.sequence;received_clock=received_clock&&packet.received_time_us&&packet.received_time_us<=input_now_us();if(packet.sequence<=11)received_route=received_route&&packet.path_size==2&&packet.path[0]==input_node("input-a")&&packet.path[1]==input_node("relay");changed.notify_all();}
             // Model cross-region RTT / temporary host scheduling delay without
             // injecting real desktop input. It must not revoke the session.
             if(packet.sequence==10)Sleep(400);
@@ -1892,9 +1926,9 @@ bool Transport::self_test(std::string& result) {
         while(!sender.input_ready(id,901)&&Clock::now()<ready_deadline)Sleep(1);
         if(!sender.input_ready(id,901)||!sender.send_clipboard(id,L"hold control")){result="Input handshake did not follow clipboard/start";return false;}
         {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(2),[&]{return blocked;})){result="Control isolation setup failed";return false;}}
-        auto packet=InputPacket{901,10,input_now_us(),{InputKind::Key,30,0}};packet.received_time_us=UINT64_MAX;
+        auto packet=InputPacket{901,10,input_now_us(),{InputKind::Key,30,0}};packet.received_time_us=UINT64_MAX;input_append(packet,input_node("input-a"));input_append(packet,input_node("relay"));
         bool ok=sender.send_input(id,packet);packet.sequence=11;packet.capture_time_us=input_now_us();packet.event.b=1;ok=sender.send_input(id,packet)&&ok;
-        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(1),[&]{return acks==2;})&&ok;ok=ok&&packets==2&&last_sequence==11&&ordered&&received_clock;unblock=true;changed.notify_all();}
+        {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(1),[&]{return acks==2;})&&ok;ok=ok&&packets==2&&last_sequence==11&&ordered&&received_clock&&received_route;unblock=true;changed.notify_all();}
         auto stats=sender.input_diagnostics(id);
         ok=ok&&stats.ready&&stats.dedicated&&stats.sent==2&&stats.acknowledged==2&&stats.samples==2&&stats.host_queue_p95_us==7&&stats.inject_p95_us==11;
         ok=ok&&sender.end_input(id,901)&&!sender.input_ready(id,901)&&!sender.send_input(id,packet);

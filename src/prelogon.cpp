@@ -14,7 +14,7 @@ namespace hive {
 // still owns capture, desktop transitions and independent input injection.
 template<class Host=HostBridge> class Prelogon {
     Transport transport_;Host host_;
-    std::mutex lifecycle_;
+    std::mutex lifecycle_;uint64_t node_=0;
     std::atomic<bool> stopping_{false};
     std::atomic<std::shared_ptr<HostControl>> current_;
     void stop_host(){
@@ -64,7 +64,11 @@ public:
         };
         cb.input_packet=[this](const std::string& peer,const InputPacket& packet){
             auto c=current_.load();if(!current(c)||c->warming||!c->input_enabled||c->peer!=peer||c->session!=packet.session){transport_.end_stream(peer,packet.session);return;}
-            if(!host_.input(packet)){InputAck ack;ack.session=packet.session;ack.sequence=packet.sequence;ack.capture_time_us=packet.capture_time_us;transport_.send_input_ack(peer,ack);}
+            auto local=packet;
+            // Terminate a repeated/exhausted route through the ordered broker
+            // lane. An immediate cumulative ACK could overtake older injection.
+            if(input_visited(packet,node_)||packet.path_size>=packet.path.size())local.event={InputKind::ReleaseAll};
+            if(!host_.input(local)){InputAck ack;ack.session=packet.session;ack.sequence=packet.sequence;ack.capture_time_us=packet.capture_time_us;transport_.send_input_ack(peer,ack);}
         };
         cb.input=[this](const std::string& peer,const InputEvent& event){auto c=current_.load();if(current(c)&&!c->warming&&!c->input_enabled&&c->peer==peer)host_.input(event);};
         cb.feedback=[this](const std::string& peer,const StreamFeedback& feedback){auto c=current_.load();if(current(c)&&c->peer==peer&&c->session==feedback.session)host_.feedback(feedback);};
@@ -75,7 +79,7 @@ public:
             // The callback owns a transport reader thread, never a UI thread.
             try{InputDesktop desktop;desktop.attach();transport_.send_snapshot(peer,capture_snapshot(request,native));}catch(const std::exception& e){update::log(std::string("Prelogon snapshot: ")+e.what());}
         };
-        return transport_.start({narrow(identity.id),narrow(identity.name),"",port,discovery,true},std::move(cb),error);
+        node_=input_node(narrow(identity.id));return transport_.start({narrow(identity.id),narrow(identity.name),"",port,discovery,true},std::move(cb),error);
     }
     bool update_idle(){
         std::lock_guard lock(lifecycle_);auto c=current_.load();

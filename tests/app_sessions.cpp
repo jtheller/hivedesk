@@ -10,7 +10,7 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic events on interactive station");
     const auto profile=std::filesystem::temp_directory_path()/(L"HiveDesk-AppSessions-"+std::to_wstring(GetCurrentProcessId()));std::filesystem::create_directories(profile);SetEnvironmentVariableW(L"LOCALAPPDATA",profile.c_str());
     auto encoded=hive::media_generated_test_frame();
-    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0;};
+    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0;std::atomic<uint64_t> relay_acked=0;std::vector<hive::InputPacket> relayed;bool hold_relay=false;std::atomic<unsigned> releases=0;};
     std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0,previews=0,preview_stops=0,visible_previews=0;std::atomic<bool> bad_handoff=false;
     for(unsigned i=0;i<3;++i){auto& p=peers[i];hive::TransportCallbacks cb;
         cb.clipboard=[&p](const std::string&,const std::wstring&){std::lock_guard lock(p.mutex);p.handoff=true;};
@@ -21,9 +21,13 @@ int probe(){
         cb.feedback=[&p](const std::string&,const hive::StreamFeedback& f){std::lock_guard lock(p.mutex);if(f.session==p.session&&f.recover&&!p.remaining)p.remaining=1;};
         cb.input_begin=[&p,&bad_handoff](const std::string&,uint64_t){if(p.warm){bad_handoff=true;return false;}return true;};
         cb.input_packet=[&p](const std::string& id,const hive::InputPacket& in){
-            {std::lock_guard lock(p.mutex);if(p.hold_release&&in.event.kind==hive::InputKind::ReleaseAll){p.held_release=in;return;}}
+            if(in.event.kind==hive::InputKind::ReleaseAll)++p.releases;
+            {std::lock_guard lock(p.mutex);
+                if(in.path_size==2&&in.path[0]==hive::input_node("peer-1")){p.relayed.push_back(in);if(p.hold_relay)return;}
+                if(p.hold_release&&in.event.kind==hive::InputKind::ReleaseAll){p.held_release=in;return;}}
             p.net.send_input_ack(id,{in.session,in.sequence,in.capture_time_us,0,0,true});
         };
+        cb.input_ack=[&p](const std::string&,const hive::InputAck& ack){if(ack.session==701&&ack.injected)p.relay_acked=ack.sequence;};
         cb.return_request=[&p](const std::string& id,const hive::ReturnRequest& r){const auto count=++p.returns;p.net.send_return_reply(id,{r.session,r.id,count==1?hive::ReturnResult::Returned:hive::ReturnResult::Leaf});};
         std::string error;require(p.net.start({"peer-"+std::to_string(i),"Generated peer "+std::to_string(i),"stress-key",uint16_t(48190+i),false,true},cb,error),error.c_str());
     }
@@ -104,6 +108,45 @@ int probe(){
         auto recovery=app.test_recovery_guards();
         require(recovery.wait_for(std::chrono::seconds(3))==std::future_status::ready&&recovery.get(),"Graphics watchdog interrupted a healthy session or failed to request idle recovery");
         std::puts("PASS aged-retirement watchdog: healthy viewer/controller/preview protected; idle recovery requested (process helper tested separately)");
+        {
+            auto& origin=peers[1];auto& leaf=peers[0];std::atomic<unsigned> local_edges=0;
+            app.test_relay_controller("peer-1",701,[&](const hive::InputPacket& p){
+                if(p.event.kind!=hive::InputKind::Absolute&&p.event.kind!=hive::InputKind::ReleaseAll)++local_edges;
+            });
+            require(origin.net.begin_input("isolated-viewer",701),"Relay origin admission");
+            for(unsigned n=0;n<200&&!origin.net.input_ready("isolated-viewer",701);++n)Sleep(5);
+            require(origin.net.input_ready("isolated-viewer",701),"Relay origin not ready");
+            {std::lock_guard lock(leaf.mutex);leaf.hold_relay=true;leaf.relayed.clear();}
+            const auto send=[&](uint64_t sequence,hive::InputEvent event){
+                hive::InputPacket p{701,sequence,hive::input_now_us(),event};hive::input_append(p,hive::input_node("peer-1"));
+                require(origin.net.send_input("isolated-viewer",p),"Relay origin send");
+            };
+            send(1,{hive::InputKind::Absolute,32768,32768});
+            send(2,{hive::InputKind::Button,1,0});send(3,{hive::InputKind::Button,1,1});
+            send(4,{hive::InputKind::Key,30,0});send(5,{hive::InputKind::Key,30,1});
+            send(6,{hive::InputKind::Wheel,120,0});send(7,{hive::InputKind::Relative,17,-8});send(8,{hive::InputKind::ReleaseAll});
+            hive::InputPacket last;size_t received=0;
+            for(unsigned n=0;n<300&&received!=8;++n){{std::lock_guard lock(leaf.mutex);received=leaf.relayed.size();if(received)last=leaf.relayed.back();}Sleep(5);}
+            require(received==8,"Actual App did not relay keyboard/button/wheel/absolute/relative/release to innermost peer");
+            require(!local_edges&&!origin.relay_acked,"Intermediate desktop received edges or ACK preceded leaf acceptance");
+            {std::lock_guard lock(leaf.mutex);leaf.hold_relay=false;
+                require(leaf.relayed[0].path[1]==hive::input_node("isolated-viewer")&&leaf.relayed[6].event.a==17&&leaf.relayed[6].event.b==-8,"Relay route/raw delta changed");}
+            require(leaf.net.send_input_ack(leaf.client,{last.session,last.sequence,last.capture_time_us,0,0,true}),"Leaf release ACK");
+            for(unsigned n=0;n<300&&origin.relay_acked!=8;++n)Sleep(5);
+            require(origin.relay_acked==8,"Leaf cumulative ACK did not reach origin in order");
+            hive::InputPacket cycle{701,9,hive::input_now_us(),{hive::InputKind::Key,31,0}};
+            hive::input_append(cycle,hive::input_node("peer-1"));hive::input_append(cycle,hive::input_node("isolated-viewer"));
+            require(origin.net.send_input("isolated-viewer",cycle),"Cycle fixture send");
+            for(unsigned n=0;n<200&&origin.relay_acked!=9;++n)Sleep(5);
+            require(origin.relay_acked==9&&!local_edges,"Repeated node injected a key or stranded ACK");
+            {std::lock_guard lock(leaf.mutex);require(leaf.relayed.size()==8,"Loop packet forwarded again");}
+            const auto prior=leaf.releases.load();
+            origin.net.stop_stream("isolated-viewer");
+            for(unsigned n=0;n<200&&leaf.releases==prior;++n)Sleep(5);
+            require(leaf.releases>prior&&app.test_ready("peer-0"),"Parent stop did not release child input while preserving its viewer");
+            app.test_relay_controller({},0,{});
+            std::puts("PASS actual App A-B-C relay: all input kinds, no duplicate local edges, downstream ACK gating, raw relative deltas, bounded A-B-A input loop, parent-stop release without closing child view");
+        }
         {
             auto& p=peers[0];{std::lock_guard lock(p.mutex);p.hold_release=true;p.held_release={};}
             app.test_return_previous();

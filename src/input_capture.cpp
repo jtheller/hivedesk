@@ -25,6 +25,8 @@ struct InputCapture::Impl {
     uint64_t route=1,blocked_route=0;
     InputCaptureQueue<> queue;
     PhysicalPointer pointer;
+    RelayRouter relay_router;uint64_t relay_host=0,remote_pointer_revision=0;bool remote_pointer_seen=false;
+    POINT relay_point{};bool relay_point_valid=false;
     uint64_t cursor_host_session=0,host_applied_us=0,local_mouse_us=0;
     InputCaptureDiagnostics stats;
     struct Delay {uint64_t at=0;uint32_t us=0;};
@@ -310,6 +312,7 @@ void InputCapture::update(InputCaptureState state){
     auto next=std::make_shared<InputCaptureState>(std::move(state));auto& s=*impl_;std::lock_guard lock(s.mutex);
     const bool same_session=next->generation==s.state->generation&&next->session==s.state->session&&next->peer==s.state->peer;
     const bool focus_changed=same_session&&((next->remote&&!next->local_shell)!=(s.state->remote&&!s.state->local_shell));
+    if(focus_changed)s.relay_router.invalidate_remote();
     if(!same_session||focus_changed){++s.route;s.queue.clear();}
     if(!same_session)s.local_mouse_us=0;
     // Focus loss releases keys/buttons even without another physical event.
@@ -336,6 +339,42 @@ InputCaptureDiagnostics InputCapture::diagnostics()const{
     {std::lock_guard lock(s.mutex);result=s.stats;result.coalesced=s.queue.coalesced();result.queue_depth=uint32_t(s.queue.size());result.queue_peak=uint32_t(s.queue.peak());
         for(const auto& sample:s.delays)if(sample.at&&now>=sample.at&&now-sample.at<=2000000)values[count++]=sample.us;}
     if(count){std::sort(values.begin(),values.begin()+count);result.dispatch_max_us=values[count-1];result.dispatch_p95_us=values[(count*95+99)/100-1];}return result;
+}
+RelayPlan InputCapture::route_remote(uint64_t host_session,const InputEvent& event,bool desktop_available,bool isolated_test){
+    // Noninteractive stations have no foreground HWND. Explicit fixture input
+    // supplies that condition only after verifying the station is invisible.
+    if(isolated_test){USEROBJECTFLAGS flags{};DWORD bytes=0;
+        if(!GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)||(flags.dwFlags&WSF_VISIBLE))
+            throw std::runtime_error("Relay fixture requires an isolated station");}
+    auto& s=*impl_;std::lock_guard lock(s.mutex);
+    if(s.relay_host!=host_session){s.relay_host=host_session;s.relay_router.reset();s.remote_pointer_seen=false;s.relay_point_valid=false;}
+    const auto& state=*s.state;
+    RelayRoute target{state.peer,state.session,state.generation};
+    if(s.blocked_route==s.route||s.stopping||!desktop_available)target={};
+    POINT point=s.relay_point;if(!s.relay_point_valid)GetCursorPos(&point);
+    if(event.kind==InputKind::Absolute){
+        point={LONG((int64_t(event.a)*state.screen_width)/65536),LONG((int64_t(event.b)*state.screen_height)/65536)};
+        s.relay_point=point;s.relay_point_valid=true;
+    }
+    if(event.kind==InputKind::Absolute||event.kind==InputKind::Relative){s.remote_pointer_seen=true;s.remote_pointer_revision=s.pointer.revision;}
+    bool candidate=bool(target)&&state.remote&&!state.local_shell&&!state.settings_visible&&(isolated_test||GetForegroundWindow()==state.viewer);
+    InputEvent mapped=event;
+    if(event.kind!=InputKind::Key&&event.kind!=InputKind::ReleaseAll){
+        const bool dragging=s.relay_router.remote_drag(target);
+        if(s.relay_router.local_drag())candidate=false;
+        else if(dragging)candidate=bool(target);
+        else candidate=candidate&&!Impl::own_surface(state,point)&&
+            (!state.windowed||(PtInRect(&state.viewer_rect,point)&&(isolated_test||GetAncestor(WindowFromPoint(point),GA_ROOTOWNER)==state.viewer)));
+        if(event.kind==InputKind::Absolute){const bool inside=Impl::map_absolute(state,point,mapped);candidate=candidate&&(inside||dragging);}
+    }
+    auto plan=s.relay_router.plan(event,target,candidate,state.returning);
+    if(event.kind==InputKind::Relative&&plan.local)s.relay_point_valid=false;
+    if(plan.forward&&event.kind==InputKind::Absolute)plan.event=mapped;
+    return plan;
+}
+bool InputCapture::remote_pointer_active()const{
+    const auto& s=*impl_;std::lock_guard lock(s.mutex);
+    return s.cursor_host_session&&s.remote_pointer_seen&&s.relay_host==s.cursor_host_session&&s.remote_pointer_revision==s.pointer.revision;
 }
 bool InputCapture::worker_self_test(std::string& result){
     try{

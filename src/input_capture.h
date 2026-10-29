@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include "input_relay.h"
 
 namespace hive {
 // Posted to the owner; never executes UI, clipboard, or network work in a hook.
@@ -14,6 +15,7 @@ struct InputCaptureState {
     std::string peer;
     bool remote=false,relative=false,settings_visible=false,panel_visible=false,panel_summoned=false,recording_hotkey=false;
     bool windowed=false,panel_dragging=false,local_shell=false;HWND viewer{},panel{};
+    bool returning=false;
     RECT panel_rect{},settings_rect{},viewer_rect{};
     uint32_t screen_width=1,screen_height=1,remote_width=0,remote_height=0;
     uint32_t hotkey_key=0,hotkey_modifiers=0;
@@ -45,6 +47,8 @@ public:
     void cursor_input_applied(uint64_t session,uint64_t capture_us);
     bool cursor_position_allowed(uint64_t session,uint64_t capture_us)const;
     InputCaptureDiagnostics diagnostics()const;
+    RelayPlan route_remote(uint64_t host_session,const InputEvent&,bool desktop_available,bool isolated_test=false);
+    bool remote_pointer_active()const;
     // Headless regression: exercises the real worker and routing snapshots
     // with an in-memory sink; installs no hooks and never injects OS input.
     static bool worker_self_test(std::string& result);
