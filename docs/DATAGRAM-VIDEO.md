@@ -33,7 +33,14 @@ One unsent frame feeds a paced, bounded packet window across multiple frames.
 The congestion window starts at 32 packets, grows on delivery when utilized,
 and decreases on sustained RTT inflation or substantial repair traffic. Small
 isolated losses use selective retransmission; they do not each halve the rate.
-RTT is measured only on packets that were not retransmitted. The timeout has
+RTT is measured only on packets that were not retransmitted. From 0.8.4 its
+baseline is the minimum over ten seconds of samples, not the connection's
+lifetime minimum. Short queue growth still reduces the window; persistent path
+changes eventually replace the old baseline without resetting congestion credit.
+Timeout episodes exponentially back off the RTO (at most once per timeout
+interval, capped at one second), until unambiguous ACKs supply a fresh RTT.
+This prevents a longer path from making every new packet a retransmission and
+therefore preventing RTT measurement indefinitely. The timeout has
 room for a full RTT plus jitter, rather than mistaking every queue fluctuation
 for loss. This is a custom controller, not an implementation of BBR or WebRTC.
 
@@ -58,9 +65,33 @@ requires a new IDR, with bounded repeat reset requests until a new epoch arrives
 
 UDP establishment has a 3 s limit. A retained frame has a 2 s transport lifetime.
 A blocked sender switches to TCP and requires an IDR, without disconnecting the
-independent reciprocal stream. Receiving the first TCP frame permanently fences
-late UDP pictures on that direction. Stop wakes the worker, joins it outside the
+independent reciprocal stream. Send and receive expiration counters are separate;
+only an outgoing frame expiry triggers local sender fallback. Receiving the first
+TCP frame fences late UDP pictures on that direction. Stop wakes the worker, joins it outside the
 connection-map lock and releases the socket before final Winsock cleanup.
+
+### Recovery on the same connection (0.8.4)
+
+`FeatureDatagramRecovery` (1048576) must be advertised by both peers. Older peers
+retain their previous one-way fallback behavior. While using TCP, authenticated
+UDP challenge/reply packets prove round-trip reachability. Recovery requires
+three fresh replies after a five-second cooldown; failed attempts back off up to
+sixty seconds. Thirty seconds of resumed UDP with actual ACK progress resets
+that backoff. Small probes establish reachability, not bulk capacity.
+
+After successful probes, new video admission pauses and message 36 carries a
+unique reference epoch on the existing encrypted TCP video lane. It follows
+already-submitted TCP frames, replaces only the unsent tail, and cannot expire
+under the picture's 50 ms freshness rule. The receiver processes that barrier
+after prior TCP frames, discards older UDP epochs, and echoes the permitted epoch
+in authenticated probe replies. Only that acknowledgement permits a fresh UDP
+IDR; subsequent P-frames cannot depend on the old TCP chain. Each direction has
+its own handoff and the same control/input connections remain active.
+
+An unacknowledged barrier times out after three seconds and restores TCP with a
+new IDR. Late replies cannot activate an abandoned attempt; late barriers remain
+ordered before subsequent TCP frames, which fence UDP again. No graphics pipeline
+or source resolution/quality setting is changed by recovery.
 
 Unique authenticated fragment bytes update receiver progress, including an
 incomplete IDR. Retransmitted duplicates do not inflate measured goodput.
@@ -68,7 +99,9 @@ incomplete IDR. Retransmitted duplicates do not inflate measured goodput.
 RTT, congestion window, in-flight ownership and expirations. Its TCP counters
 continue describing the TCP sockets, not the UDP payload rate.
 Local telemetry also records these as separate `packet_*` fields;
-`packet_transport` is 0 absent, 1 negotiating, 2 UDP, 3 TCP fallback. TCP write
+`packet_transport` is 0 absent, 1 negotiating, 2 UDP, 3 TCP fallback, 4 recovering.
+`packet_send_expired` and `packet_receive_expired` distinguish the failing
+direction; `packet_expired` remains their total for existing consumers. TCP write
 timings must not be interpreted as UDP send latency.
 
 ## Validation and limits

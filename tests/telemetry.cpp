@@ -34,6 +34,7 @@ int main(){
             send.tcp_available=true;send.tcp_sample_age_us=12000;send.tcp_rtt_us=105000;send.tcp_min_rtt_us=100000;
             send.tcp_ideal_bytes=1250000;send.tcp_cwnd_bytes=1500000;send.tcp_send_window_bytes=2000000;send.tcp_inflight_bytes=700000;
             send.packet_transport=2;send.packet_rtt_us=140000;send.packet_window=300;send.packet_retransmitted=7;
+            send.packet_send_expired=2;send.packet_receive_expired=3;
             monitor.video_send("outbound",90,send);
             auto obsolete=send;obsolete.completed_packets=999;
             monitor.video_send("outbound",89,obsolete);monitor.video_send("different",90,obsolete);
@@ -61,6 +62,7 @@ int main(){
             require(value.find("\"write_limit\":32,\"owned_bytes\":800000,\"write_budget_bytes\":1250000")!=std::string::npos,"Missing adaptive byte ownership");
             require(value.find("\"packet_transport\":2,\"packet_rtt_ms\":140.000")!=std::string::npos&&
                 value.find("\"packet_window\":300")!=std::string::npos&&value.find("\"packet_retransmitted\":7")!=std::string::npos,"UDP transport evidence missing or mixed with TCP timings");
+            require(value.find("\"packet_send_expired\":2,\"packet_receive_expired\":3")!=std::string::npos,"Directional UDP expiry evidence missing");
             require(value.find("\"tcp_available\":true,\"tcp_rtt_ms\":105.000,\"tcp_min_rtt_ms\":100.000")!=std::string::npos&&
                 value.find("\"tcp_ideal_bytes\":1250000,\"tcp_cwnd_bytes\":1500000,\"tcp_send_window_bytes\":2000000,\"tcp_inflight_bytes\":700000,\"tcp_sample_age_ms\":12.000")!=std::string::npos,"TCP observation units or windows missing");
             require(value.find("\"dedicated\":true,\"ready\":true,\"session\":9")!=std::string::npos&&value.find("\"acknowledged\":999")==std::string::npos,"Input diagnostics session isolation failed");

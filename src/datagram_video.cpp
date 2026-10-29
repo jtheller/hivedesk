@@ -6,6 +6,7 @@
 #include <bcrypt.h>
 #include "datagram_video.h"
 #include "datagram_window.h"
+#include "datagram_recovery.h"
 #include "frame_timer.h"
 #include <mutex>
 #include <thread>
@@ -64,13 +65,16 @@ struct Crypto {
 }
 
 struct DatagramVideo::Impl {
+    enum : uint8_t {Probe=4,ProbeReply=5};
     Hooks hooks;std::shared_ptr<std::atomic<uint64_t>> progress;
     SOCKET socket=INVALID_SOCKET;WSAEVENT readable=WSA_INVALID_EVENT;uint16_t local_port=0,remote_port=0;
     sockaddr_in remote{};Crypto tx,rx;FrameTimer timer;
     mutable std::mutex mutex;std::mutex delivery_mutex;datagram::Window window;
     std::atomic<bool> stopping=false;bool receive_tcp=false,offered=false,tcp_key=false;Route mode=Route::Negotiating;
     std::thread worker;uint64_t started=0,last_hello=0,last_received=0,invalid=0;
-    Impl(const std::string& address,const Key& root,bool outbound,std::shared_ptr<std::atomic<uint64_t>> bytes,Hooks h,const std::string& local_address):hooks(std::move(h)),progress(std::move(bytes)) {
+    bool recovery_enabled=false;datagram::Recovery recovery;
+    uint64_t resume_epoch=0,resume_at=0,receive_resume_epoch=0,stable_at=0,stable_sent=0;
+    Impl(const std::string& address,const Key& root,bool outbound,std::shared_ptr<std::atomic<uint64_t>> bytes,Hooks h,const std::string& local_address,bool recover):hooks(std::move(h)),progress(std::move(bytes)),recovery_enabled(recover) {
         remote.sin_family=AF_INET;
         if(inet_pton(AF_INET,address.c_str(),&remote.sin_addr)!=1||!tx.init(root,outbound)||!rx.init(root,!outbound))throw std::runtime_error("UDP video key initialization failed");
         sockaddr_in local{};local.sin_family=AF_INET;int length=sizeof(local);
@@ -89,7 +93,11 @@ struct DatagramVideo::Impl {
     ~Impl(){stop();if(worker.joinable())worker.join();if(socket!=INVALID_SOCKET)closesocket(socket);if(readable!=WSA_INVALID_EVENT)WSACloseEvent(readable);}
     void stop(){stopping=true;timer.notify();}
     void say(const std::string& text){if(hooks.status)hooks.status(text);}
-    bool fallback_locked() {if(mode==Route::Tcp)return false;mode=Route::Tcp;window.abandon();return true;}
+    bool fallback_locked() {
+        if(mode==Route::Tcp)return false;
+        mode=Route::Tcp;tcp_key=false;window.abandon();resume_epoch=0;
+        recovery.fallback(now_us());return true;
+    }
     void send_wire(const Bytes& plain) {
         Bytes wire;if(!tx.seal(plain,wire))throw std::runtime_error("UDP video encryption failed");
         const auto sent=sendto(socket,reinterpret_cast<const char*>(wire.data()),int(wire.size()),0,reinterpret_cast<sockaddr*>(&remote),sizeof(remote));
@@ -101,7 +109,7 @@ struct DatagramVideo::Impl {
         started=now_us();
         try {
             while(!stopping) {
-                bool credit=false,key=false,fallback=false,activated=false;uint64_t wake=0;
+                bool credit=false,key=false,fallback=false,activated=false;uint64_t wake=0,commit_epoch=0;
                 {
                     std::lock_guard lock(mutex);const auto now=now_us();
                     const bool before=mode==Route::Datagram&&window.ready();
@@ -113,6 +121,21 @@ struct DatagramVideo::Impl {
                         if(n<0)break;
                         if(!remote_port||from.sin_addr.s_addr!=remote.sin_addr.s_addr||from.sin_port!=remote.sin_port)continue;
                         Bytes plain;if(!rx.open(Bytes(buffer.begin(),buffer.begin()+n),plain)){++invalid;continue;}
+                        if(recovery_enabled&&(plain[0]==Probe||plain[0]==ProbeReply)){
+                            datagram::Reader probe{plain,1};const auto id=probe.get(8);
+                            if(!id||!probe.good||(plain[0]==Probe?plain.size()!=9:plain.size()!=17)){++invalid;continue;}
+                            if(plain[0]==Probe){
+                                Bytes reply{ProbeReply};datagram::put(reply,id,8);
+                                datagram::put(reply,receive_tcp?0:receive_resume_epoch,8);send_wire(reply);
+                            }else{
+                                const auto epoch=probe.get(8);
+                                if(recovery.reply(id,now)&&mode==Route::Recovering&&epoch==resume_epoch){
+                                    mode=Route::Datagram;activated=true;stable_at=now;stable_sent=window.stats().acknowledged;
+                                    window.abandon();
+                                }
+                            }
+                            continue;
+                        }
                         if(receive_tcp&&plain[0]==datagram::Window::Data)continue;
                         const auto bytes=window.stats().received_bytes;
                         if(!window.receive(plain,now)){++invalid;continue;}
@@ -124,12 +147,33 @@ struct DatagramVideo::Impl {
                         if(now-last_hello>=(mode==Route::Negotiating?100000:1000000)) {send_wire(Bytes{datagram::Window::Hello});last_hello=now;}
                         const auto prior=window.stats();
                         for(unsigned i=0;i<256;++i){auto packet=window.poll(now);if(!packet)break;send_wire(*packet);}
-                        if(prior.owned&&window.stats().expired>prior.expired)fallback=fallback_locked();
+                        if(window.stats().send_expired>prior.send_expired)fallback=fallback_locked();
+                        if(recovery_enabled){
+                            if(mode==Route::Recovering&&now-resume_at>=datagram::Recovery::CommitTimeout)fallback=fallback_locked();
+                            if(mode==Route::Tcp||mode==Route::Recovering){
+                                if(mode==Route::Tcp&&hooks.resume&&recovery.ready(now)){
+                                    mode=Route::Recovering;resume_at=now;commit_epoch=resume_epoch=window.resume_sender();recovery.committing(now);
+                                }
+                                if(const auto id=recovery.probe(now,mode==Route::Recovering)){
+                                    Bytes probe{Probe};datagram::put(probe,id,8);send_wire(probe);
+                                }
+                            }else if(mode==Route::Datagram&&stable_at&&now-stable_at>=30000000&&
+                                     window.stats().acknowledged>stable_sent){recovery.stable();stable_at=0;}
+                        }
                     }
                     key=window.take_key_request();
                     credit=activated||fallback||(!before&&mode==Route::Datagram&&window.ready());
                     wake=std::min(window.next_wake(now),now+1000000);
                     if(mode==Route::Negotiating)wake=std::min(wake,now+100000);
+                    if(recovery_enabled&&remote_port&&(mode==Route::Tcp||mode==Route::Recovering)){
+                        wake=std::min(wake,recovery.wake());
+                        if(mode==Route::Recovering)wake=std::min(wake,resume_at+datagram::Recovery::CommitTimeout);
+                    }
+                }
+                if(commit_epoch){
+                    if(!hooks.resume(commit_epoch)){
+                        std::lock_guard lock(mutex);fallback=fallback_locked();key=window.take_key_request();credit=true;
+                    }else say("Video packet path recovered; fencing TCP before a fresh UDP reference.");
                 }
                 if(activated)say("Video packet transport ready (authenticated UDP).");
                 if(fallback)say("Video packet path unavailable; continuing with TCP and a fresh reference frame.");
@@ -161,8 +205,8 @@ struct DatagramVideo::Impl {
     }
 };
 
-DatagramVideo::DatagramVideo(const std::string& address,const Key& key,bool outbound,std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks,const std::string& local_address):
-    impl_(std::make_unique<Impl>(address,key,outbound,std::move(progress),std::move(hooks),local_address)){}
+DatagramVideo::DatagramVideo(const std::string& address,const Key& key,bool outbound,std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks,const std::string& local_address,bool recovery):
+    impl_(std::make_unique<Impl>(address,key,outbound,std::move(progress),std::move(hooks),local_address,recovery)){}
 DatagramVideo::~DatagramVideo()=default;
 uint16_t DatagramVideo::port()const{return impl_->local_port;}
 bool DatagramVideo::offer(uint16_t port){
@@ -194,18 +238,25 @@ bool DatagramVideo::send(Bytes bytes,bool key,uint64_t session){
 bool DatagramVideo::accept_tcp(bool key){std::lock_guard lock(impl_->mutex);if(impl_->mode!=Route::Tcp)return false;if(key)impl_->tcp_key=true;return impl_->tcp_key;}
 void DatagramVideo::cancel(uint64_t session){std::lock_guard lock(impl_->mutex);impl_->window.cancel(session);impl_->timer.notify();}
 void DatagramVideo::tcp_received(){std::lock_guard delivery(impl_->delivery_mutex);std::lock_guard lock(impl_->mutex);impl_->receive_tcp=true;impl_->window.discard_received(true);}
+bool DatagramVideo::resume_received(uint64_t epoch){
+    std::lock_guard delivery(impl_->delivery_mutex);std::lock_guard lock(impl_->mutex);
+    if(!impl_->recovery_enabled||!epoch||epoch<=impl_->receive_resume_epoch)return false;
+    impl_->window.resume_receiver(epoch);impl_->receive_resume_epoch=epoch;impl_->receive_tcp=false;impl_->timer.notify();return true;
+}
 std::string DatagramVideo::diagnostics()const{
     std::lock_guard lock(impl_->mutex);auto s=impl_->window.stats();std::ostringstream out;
-    out<<" media="<<(impl_->mode==Route::Datagram?"udp":impl_->mode==Route::Tcp?"tcp-fallback":"udp-negotiating")
+    out<<" media="<<(impl_->mode==Route::Datagram?"udp":impl_->mode==Route::Tcp?"tcp-fallback":impl_->mode==Route::Recovering?"udp-recovering":"udp-negotiating")
        <<" udp_tx="<<s.sent<<" rtx="<<s.retransmitted<<" rx="<<s.received<<" invalid="<<impl_->invalid
-       <<" rtt_us="<<s.srtt<<" cwnd="<<size_t(s.cwnd)<<" flight="<<s.flight<<" owned="<<s.owned<<" expired="<<s.expired;return out.str();
+       <<" rtt_us="<<s.srtt<<" cwnd="<<size_t(s.cwnd)<<" flight="<<s.flight<<" owned="<<s.owned<<" expired="<<s.expired
+       <<" tx_expired="<<s.send_expired<<" rx_expired="<<s.receive_expired;return out.str();
 }
 void DatagramVideo::diagnostics(VideoSendDiagnostics& result)const{
     std::lock_guard lock(impl_->mutex);auto s=impl_->window.stats();
-    result.packet_transport=impl_->mode==Route::Datagram?2:impl_->mode==Route::Tcp?3:1;
+    result.available=true;result.packet_transport=impl_->mode==Route::Datagram?2:impl_->mode==Route::Tcp?3:impl_->mode==Route::Recovering?4:1;
     result.packet_rtt_us=uint32_t(std::min<uint64_t>(s.srtt,UINT32_MAX));result.packet_min_rtt_us=uint32_t(std::min<uint64_t>(s.min_rtt,UINT32_MAX));
     result.packet_window=uint32_t(s.cwnd);result.packet_inflight=uint32_t(s.flight);result.packet_owned_bytes=s.owned;
     result.packet_sent=s.sent;result.packet_retransmitted=s.retransmitted;result.packet_received=s.received;result.packet_invalid=impl_->invalid;result.packet_expired=s.expired;
+    result.packet_send_expired=s.send_expired;result.packet_receive_expired=s.receive_expired;
 }
 bool DatagramVideo::self_test(std::string& result){
     Key key{};for(size_t i=0;i<key.size();++i)key[i]=uint8_t(i+1);

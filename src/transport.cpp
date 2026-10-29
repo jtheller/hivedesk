@@ -52,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -214,8 +214,8 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo;
-    const auto advertised=cfg.datagram_video?features:features&~FeatureDatagramVideo;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery;
+    const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
 bool parse_hello(const Bytes& b, Peer& peer, uint8_t& channel,bool automatic=false) {
@@ -255,6 +255,8 @@ struct Transport::Impl {
         std::atomic<uint64_t> video_owned_bytes{0};
         std::shared_ptr<std::atomic<uint64_t>> received_bytes=std::make_shared<std::atomic<uint64_t>>(0);
         std::unique_ptr<DatagramVideo> datagram;
+        std::mutex media_route_mutex; // Serialize TCP enqueue with a recovery barrier.
+        std::optional<Bytes> video_resume; // queue_mutex; ordered, never freshness-expired.
         bool datagram_negotiated=false;
         uint64_t feedback_session=0,feedback_connection=0,feedback_origin_bytes=0,feedback_origin_us=0,feedback_sequence=0;
         uint64_t feedback_expected_session=0; // Last successfully queued Start; stale reports cannot replace its baseline.
@@ -464,7 +466,9 @@ struct Transport::Impl {
                     std::optional<Bytes> payload;Clock::time_point queued_at{};bool taken=false;
                     {
                         std::lock_guard lock(queue_mutex);
-                        if(video&&budget.admits(pending.size(),owned_bytes,uint64_t(video->payload.size())+28)){taken=true;payload=take_video(Clock::now(),&queued_at);video_credit=false;}
+                        if(video_resume&&budget.admits(pending.size(),owned_bytes,video_resume->size()+28)){
+                            taken=true;payload=std::move(video_resume);video_resume.reset();queued_at=Clock::now();video_credit=false;
+                        }else if(video&&budget.admits(pending.size(),owned_bytes,uint64_t(video->payload.size())+28)){taken=true;payload=take_video(Clock::now(),&queued_at);video_credit=false;}
                     }
                     if(taken){
                         if(!payload){
@@ -694,7 +698,17 @@ struct Transport::Impl {
                 hooks.credit=[&c]{if(!c.closed)c.notify_ready();};
                 hooks.keyframe=[&c]{if(!c.closed)c.request_fresh_frame();};
                 hooks.status=[this,&c](const std::string& text){status(c.peer.name+": "+text);};
-                auto datagram=std::make_unique<DatagramVideo>(c.peer.address,c.pair_key,client,c.received_bytes,std::move(hooks),c.local_ipv4());
+                const bool recovery=(c.peer.features&FeatureDatagramRecovery)!=0;
+                if(recovery)hooks.resume=[&c](uint64_t epoch){
+                    std::lock_guard route(c.media_route_mutex);std::lock_guard queue(c.queue_mutex);
+                    if(c.closed||!c.ready||c.video_resume)return false;
+                    // Submitted TCP frames stay ordered before the barrier.
+                    // Drop only its unsent tail; the UDP continuation needs IDR.
+                    c.video.reset();c.wait_keyframe=true;
+                    Bytes barrier{DatagramResume};u64(barrier,epoch);c.video_resume=std::move(barrier);
+                    if(c.video_wake)SetEvent(c.video_wake);return true;
+                };
+                auto datagram=std::make_unique<DatagramVideo>(c.peer.address,c.pair_key,client,c.received_bytes,std::move(hooks),c.local_ipv4(),recovery);
                 {std::lock_guard lock(c.queue_mutex);if(c.closed)return false;c.datagram=std::move(datagram);}
             }catch(const std::exception& e){status(std::string("Video will use TCP: ")+e.what());}
         }
@@ -839,6 +853,10 @@ struct Transport::Impl {
 #include "path_probe.inl"
     bool dispatch(Conn& c, const Bytes& b,uint64_t udp_started=0,uint64_t udp_completed=0,bool udp=false) {
         Reader r{b}; uint8_t type = r.byte();
+        if(type==DatagramResume){
+            const auto epoch=r.qword();
+            return c.channel==1&&!udp&&(c.peer.features&FeatureDatagramRecovery)&&c.datagram&&r.end()&&c.datagram->resume_received(epoch);
+        }
         if(type==DatagramOffer){
             const auto port=r.word();if(c.channel!=1||!c.datagram_negotiated||!r.end())return false;
             return !c.datagram||c.datagram->offer(port);
@@ -1225,6 +1243,7 @@ bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
     if(cursor||timed)u64(b,timed?frame.source_ready_us:0);
     if(cursor)b.push_back(uint8_t(frame.cursor_composition));
     b.insert(b.end(),frame.data.begin(),frame.data.end());
+    const std::lock_guard route_lock(c->media_route_mutex);
     if(c->datagram){
         const auto route=c->datagram->route();
         if(route==DatagramVideo::Route::Datagram)return c->datagram->send(std::move(b),frame.keyframe,frame.session);
@@ -2256,6 +2275,34 @@ bool Transport::self_test(std::string& result) {
         if(!packet_lane||!packet_lane->datagram||packet_lane->datagram->route()!=DatagramVideo::Route::Datagram){result="UDP did not preserve the authenticated TCP local address";return false;}
         bool ok=left.send_clipboard(id,L"keyless")&&left.send_frame(id,picture);
         {std::unique_lock lock(guard);ok=changed.wait_for(lock,std::chrono::seconds(3),[&]{return text&&frame&&renamed&&ready_notified&&version_received&&reverse_version;})&&ok;}
+        if(!ok){result="Initial datagram delivery failed";return false;}
+        // Exercise the actual TCP writer/reader barrier, not a mock callback.
+        // Refuse one direction's UDP until its bounded fallback fires, while
+        // the authenticated control/input/video connections remain unchanged.
+        const auto receiver=right.impl_->find("lan-a",true);
+        if(!receiver||!receiver->datagram){result="Recovery receiver missing";return false;}
+        receiver->datagram->tcp_received();++picture.sequence;
+        if(!left.send_frame(id,picture)){result="Recovery black-hole setup failed";return false;}
+        auto until=Clock::now()+std::chrono::seconds(3);
+        while(packet_lane->datagram->route()!=DatagramVideo::Route::Tcp&&Clock::now()<until)Sleep(1);
+        if(packet_lane->datagram->route()!=DatagramVideo::Route::Tcp){result="UDP black hole did not fall back";return false;}
+        {std::lock_guard lock(guard);frame=false;}
+        ++picture.sequence;
+        if(!left.send_frame(id,picture)){result="TCP fallback IDR rejected";return false;}
+        {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(2),[&]{return frame;})){result="TCP fallback picture not delivered";return false;}}
+        until=Clock::now()+std::chrono::seconds(11);
+        while(packet_lane->datagram->route()!=DatagramVideo::Route::Datagram&&Clock::now()<until)Sleep(1);
+        if(packet_lane->datagram->route()!=DatagramVideo::Route::Datagram||left.impl_->find(id,true)!=packet_lane||
+           right.impl_->find("lan-a",true)!=receiver){result="Recovery did not restore UDP on the same connection";return false;}
+        {std::lock_guard lock(guard);frame=false;}
+        ++picture.sequence;picture.keyframe=false;
+        if(left.send_frame(id,picture)){result="Recovered UDP accepted dependent TCP reference";return false;}
+        picture.keyframe=true;
+        if(!left.send_frame(id,picture)){result="Recovered UDP IDR rejected";return false;}
+        {std::unique_lock lock(guard);if(!changed.wait_for(lock,std::chrono::seconds(2),[&]{return frame;})){result="Recovered UDP picture not delivered";return false;}}
+        // An old/duplicate barrier cannot reopen a fenced receive direction.
+        receiver->datagram->tcp_received();
+        if(receiver->datagram->resume_received(1)){result="Old UDP recovery barrier accepted";return false;}
         Transport legacy;const auto old_key=generate_group_key();
         if(!legacy.start({"legacy","Legacy",old_key,0,false},{},error)||legacy.connect("127.0.0.1",right.impl_->cfg.port,id,error))ok=false;
         if(!ok){result="Keyless encrypted channels, bidirectional version, live rename, or legacy isolation failed";return false;}

@@ -33,7 +33,7 @@ public:
     struct Picture { Bytes bytes; uint64_t started=0,completed=0; };
     struct Stats {
         uint64_t sent=0,retransmitted=0,received=0,duplicates=0,expired=0,delivered=0;
-        uint64_t received_bytes=0,srtt=0,min_rtt=0; size_t flight=0,owned=0;
+        uint64_t received_bytes=0,srtt=0,min_rtt=0,send_expired=0,receive_expired=0,acknowledged=0; size_t flight=0,owned=0;
         double cwnd=32;
     };
     bool ready() const {
@@ -53,6 +53,11 @@ public:
     void cancel(uint64_t session) { if(session_==session) { clear_sender();need_key_=true; } }
     bool take_key_request() { return std::exchange(request_key_,false); }
     void abandon() { clear_sender();need_key_=true;request_key_=true; }
+    // A unique boundary even when an earlier recovery never sent a picture.
+    uint64_t resume_sender() { abandon();return ++next_frame_; }
+    void resume_receiver(uint64_t epoch) {
+        discard_received(true);receive_epoch_=next_receive_=epoch;
+    }
     Stats stats() const { auto s=stats_;s.flight=flight_.size();s.owned=owned_;s.cwnd=cwnd_;s.srtt=srtt_;s.min_rtt=min_rtt_;return s; }
     const Picture* front_picture()const{return pictures_.empty()?nullptr:&pictures_.front();}
     std::optional<Picture> take_picture(){
@@ -76,10 +81,10 @@ public:
     }
     std::optional<Bytes> poll(uint64_t now) {
         if(!frames_.empty()&&now-frames_.front()->at>=Deadline) {
-            ++stats_.expired; abandon(); congestion(now,true);
+            ++stats_.expired;++stats_.send_expired; abandon(); congestion(now,true);
         }
         if((!assembly_.empty()&&now-assembly_.begin()->second.at>=Deadline)||(!pictures_.empty()&&now-pictures_.front().completed>=Deadline)) {
-            reset_epoch_=receive_epoch_;discard_received();receive_wait_key_=true;++stats_.expired;
+            reset_epoch_=receive_epoch_;discard_received();receive_wait_key_=true;++stats_.expired;++stats_.receive_expired;
         }
         if(receive_wait_key_&&now-reset_sent_at_>=250000)reset_epoch_=receive_epoch_;
         if(reset_epoch_) {Bytes b{Reset};put(b,std::exchange(reset_epoch_,0),8);reset_sent_at_=now;return b;}
@@ -94,6 +99,10 @@ public:
         }
         if(!timers_.empty()&&now>=timers_.begin()->first) {
             const auto id=timers_.begin()->second;auto& p=flight_.at(id);timers_.erase(p.timer);
+            // RTT can jump above the old RTO. Back off once per timeout
+            // interval, not per packet, so newly sent packets can yield an
+            // unambiguous RTT sample again (retransmitted ACKs cannot do so).
+            if(now>=backoff_at_){const auto previous=rto();rto_backoff_=std::min<uint64_t>(1000000,previous*2);backoff_at_=now+previous;}
             loss_sample(now);p.at=now;p.timer=timers_.emplace(now+rto(),id);
             ++p.tries;++stats_.retransmitted;pace(now);return packet(id,p);
         }
@@ -113,6 +122,7 @@ public:
             const bool window_limited=flight_.size()>=size_t(cwnd_*.75);
             for(size_t i=0;i<count;++i) {
                 const auto id=r.get(8);auto p=flight_.find(id);if(p==flight_.end())continue;
+                ++stats_.acknowledged;
                 if(p->second.tries==1&&now>p->second.at)sample_rtt(now-p->second.at,now);
                 auto& bin=loss_bins_[(now/50000)%loss_bins_.size()];
                 if(bin.epoch!=now/50000){bin={};bin.epoch=now/50000;}++bin.acked;
@@ -175,15 +185,17 @@ private:
     uint64_t next_frame_=1,next_packet_=1,epoch_=0,session_=0,receive_epoch_=0,next_receive_=0,reset_epoch_=0;
     uint64_t reset_sent_at_=0;
     uint64_t pace_due_=0,ack_due_=0,srtt_=0,variance_=0,min_rtt_=0,congested_at_=0;
+    uint64_t rto_backoff_=0,backoff_at_=0;
     double cwnd_=32,threshold_=MaxFlight;Stats stats_;
     struct LossBin {uint64_t epoch=0,acked=0,retries=0;};std::array<LossBin,20> loss_bins_{};
+    struct RttBin {uint64_t epoch=0,minimum=0;};std::array<RttBin,10> rtt_bins_{};
     void clear_sender(){
         // Cancel payload ownership, not congestion credit. Packets already on
         // the wire still occupy the path until ACK or timeout. Otherwise rapid
         // IDR/session changes could repeatedly bypass the congestion window.
         for(auto& [id,p]:flight_)p.frame.reset();frames_.clear();owned_=0;
     }
-    uint64_t rto()const{return srtt_?std::clamp<uint64_t>(std::max(srtt_*2,srtt_+4*variance_),30000,1000000):300000;}
+    uint64_t rto()const{return std::max(rto_backoff_,srtt_?std::clamp<uint64_t>(std::max(srtt_*2,srtt_+4*variance_),30000,1000000):300000);}
     void ack(uint64_t id,uint64_t now) {
         if(acks_.empty())ack_due_=now+1000;
         if(acks_.size()<1024)acks_.push_back(id); // A lost ACK is repaired by RTX.
@@ -203,9 +215,19 @@ private:
         if(retries>=3&&retries*20>=acked+retries)congestion(now,true);
     }
     void sample_rtt(uint64_t value,uint64_t now) {
-        min_rtt_=min_rtt_?std::min(min_rtt_,value):value;
+        // Ten seconds of observed minima, not the lifetime minimum of a TCP
+        // pair. A persistent path change must eventually replace its old floor.
+        // Keep cwnd/SRTT/loss history: changing the baseline is not permission
+        // to burst or to forget actual congestion. Lower RTTs take effect now.
+        const auto epoch=now/1000000;
+        auto& bin=rtt_bins_[epoch%rtt_bins_.size()];
+        if(bin.epoch!=epoch){bin={epoch,value};}else bin.minimum=bin.minimum?std::min(bin.minimum,value):value;
+        min_rtt_=value;
+        for(const auto& sample:rtt_bins_)if(sample.minimum&&epoch>=sample.epoch&&epoch-sample.epoch<rtt_bins_.size())
+            min_rtt_=std::min(min_rtt_,sample.minimum);
         if(!srtt_){srtt_=value;variance_=value/2;}
         else {variance_=(3*variance_+(srtt_>value?srtt_-value:value-srtt_))/4;srtt_=(7*srtt_+value)/8;}
+        rto_backoff_=backoff_at_=0;
         if(srtt_>min_rtt_+std::max<uint64_t>(8000,min_rtt_/8))congestion(now,false);
     }
     void pace(uint64_t now) {

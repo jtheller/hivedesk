@@ -115,7 +115,8 @@ struct Telemetry::Impl {
             out<<",\"packet_transport\":"<<s.packet_transport<<",\"packet_rtt_ms\":"<<s.packet_rtt_us/1000.0<<",\"packet_min_rtt_ms\":"<<s.packet_min_rtt_us/1000.0
                <<",\"packet_window\":"<<s.packet_window<<",\"packet_inflight\":"<<s.packet_inflight<<",\"packet_owned_bytes\":"<<s.packet_owned_bytes
                <<",\"packet_sent\":"<<s.packet_sent<<",\"packet_retransmitted\":"<<s.packet_retransmitted<<",\"packet_received\":"<<s.packet_received
-               <<",\"packet_invalid\":"<<s.packet_invalid<<",\"packet_expired\":"<<s.packet_expired<<'}';
+               <<",\"packet_invalid\":"<<s.packet_invalid<<",\"packet_expired\":"<<s.packet_expired
+               <<",\"packet_send_expired\":"<<s.packet_send_expired<<",\"packet_receive_expired\":"<<s.packet_receive_expired<<'}';
         }
         out<<",\"input_age_ms\":"<<age(now,e.input_at)<<",\"input\":";
         if(!e.input_at||!e.input.available)out<<"null";

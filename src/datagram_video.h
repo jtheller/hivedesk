@@ -18,11 +18,14 @@ public:
         std::function<void(Bytes,uint64_t,uint64_t)> picture;
         std::function<bool(const Bytes&)> receive_ready;
         std::function<void()> credit,keyframe;
+        // Queue an ordered TCP video barrier after all previously submitted
+        // frames. New media is paused until the peer acknowledges this epoch.
+        std::function<bool(uint64_t)> resume;
         std::function<void(const std::string&)> status;
     };
-    enum class Route { Negotiating, Datagram, Tcp };
+    enum class Route { Negotiating, Datagram, Tcp, Recovering };
     DatagramVideo(const std::string& address,const std::array<uint8_t,32>& pair_key,bool outbound,
-                  std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks,const std::string& local_address="0.0.0.0");
+                  std::shared_ptr<std::atomic<uint64_t>> progress,Hooks hooks,const std::string& local_address="0.0.0.0",bool recovery=false);
     ~DatagramVideo();
     DatagramVideo(const DatagramVideo&)=delete;
     DatagramVideo& operator=(const DatagramVideo&)=delete;
@@ -36,7 +39,8 @@ public:
     bool send(Bytes bytes,bool key,uint64_t session);
     bool accept_tcp(bool key);
     void cancel(uint64_t session);
-    void tcp_received(); // Permanently fence late UDP pictures after TCP fallback.
+    void tcp_received(); // Fence UDP until a newer ordered recovery barrier.
+    bool resume_received(uint64_t epoch);
     std::string diagnostics() const;
     void diagnostics(VideoSendDiagnostics&) const;
     static bool self_test(std::string& result);

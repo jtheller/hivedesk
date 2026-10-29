@@ -7,9 +7,10 @@ namespace hive {
 // A successful WSASend completion is not a receiver/display acknowledgement.
 struct VideoSendDiagnostics {
     bool available=false;
-    uint32_t packet_transport=0; // 0 absent, 1 negotiating, 2 UDP, 3 TCP fallback.
+    uint32_t packet_transport=0; // 0 absent, 1 negotiating, 2 UDP, 3 TCP fallback, 4 recovering.
     uint32_t packet_rtt_us=0,packet_min_rtt_us=0,packet_window=0,packet_inflight=0;
     uint64_t packet_owned_bytes=0,packet_sent=0,packet_retransmitted=0,packet_received=0,packet_invalid=0,packet_expired=0;
+    uint64_t packet_send_expired=0,packet_receive_expired=0;
     uint64_t connection=0;
     uint64_t submitted_packets=0,completed_packets=0,completed_bytes=0,failed_packets=0,queue_expired=0;
     uint32_t samples=0,sample_age_us=UINT32_MAX;

@@ -46,6 +46,7 @@ constexpr uint32_t FeatureLivePeek = 65536;
 constexpr uint32_t FeatureByteFeedback = 131072;
 constexpr uint32_t FeaturePathProbe = 262144;
 constexpr uint32_t FeatureDatagramVideo = 524288;
+constexpr uint32_t FeatureDatagramRecovery = 1048576;
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
 constexpr size_t MaxSnapshotBytes = 256 * 1024;
 constexpr size_t MaxNativeSnapshotBytes = 2 * 1024 * 1024;
