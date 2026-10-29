@@ -7,6 +7,7 @@
 #include "hivedesk/host_bridge.h"
 #include "hivedesk/desktop_session.h"
 #include "hivedesk/telemetry.h"
+#include "hivedesk/experience_trace.h"
 #include "hivedesk/reconnect.h"
 #include "hivedesk/session_control.h"
 #include "hivedesk/update.h"
@@ -35,7 +36,11 @@ class App {
     struct WarmView;
 public:
     explicit App(hive::AppConfig config): config_(std::move(config)) {
-        telemetry_.enabled(config_.desktop.debug_overlay);
+        // Routine diagnostics are independent of the visual overlay. Per-frame
+        // tracing is a separate, explicit developer opt-in because it also
+        // queries display timing on the render path.
+        wchar_t trace[2]{};
+        hive::experience_enabled(GetEnvironmentVariableW(L"HIVEDESK_EXPERIENCE_TRACE",trace,2)==1&&trace[0]==L'1');
         video_restart_pending_=hive::gpu_policy_restart::pending_request(video_restart_marker_);
     }
     ~App() {
@@ -155,8 +160,8 @@ public:
             const auto peer=active_.load();if(!peer||closing_)return;
             auto report=viewer_.load()->feedback();if(!report.session)report.session=active_session_;
             if(report.session&&report.session==active_session_)transport_.send_feedback(*peer,report);
-            if(shell_.debug_enabled()&&GetTickCount64()-last_debug_tick_>=250){
-                last_debug_tick_=GetTickCount64();const auto size=remote_size_.load();
+            if(GetTickCount64()-last_telemetry_tick_>=250){
+                last_telemetry_tick_=GetTickCount64();const auto size=remote_size_.load();
                 const auto stats=viewer_.load()->diagnostics();const auto input=transport_.input_diagnostics(*peer);
                 telemetry_.viewer(*peer,stats,uint32_t(size>>32),uint32_t(size));
                 telemetry_.input(*peer,active_session_,input);
@@ -195,7 +200,7 @@ public:
             auto next=config_;next.name=name;next.desktop=desktop;
             try {hive::set_startup(desktop.startup);hive::save_config(next);}
             catch(const std::exception& e){try{hive::set_startup(config_.desktop.startup);}catch(...){}status(e.what());return false;}
-            config_=std::move(next);telemetry_.enabled(desktop.debug_overlay);transport_.rename(hive::narrow(name));return true;
+            config_=std::move(next);transport_.rename(hive::narrow(name));return true;
         };
         callbacks.restart_video=[this] {
             {
@@ -1131,7 +1136,7 @@ private:
     bool input_ready_=false; // Protected by host_mutex_; belongs only to hosting_.
     bool input_error_reported_=false;
     std::atomic<bool> clipboard_pending_=false;ULONGLONG last_clipboard_retry_=0;
-    ULONGLONG last_debug_tick_=0;
+    ULONGLONG last_telemetry_tick_=0;
     std::map<std::string,hive::Clipboard> staged_clipboards_; // Protected by host_mutex_.
     std::atomic<uint64_t> generation_=0;
     std::atomic<uint64_t> remote_size_=0;

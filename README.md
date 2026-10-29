@@ -223,7 +223,7 @@ impersonator. No universal shared password is embedded in the application.
   rejection remain active, and obsolete pictures can still skip conversion.
   A compact, non-interactive top-left indicator
   appears after the cap stays below 80% of the negotiated target for one second:
-  Device busy or Slow connection. It clears after three healthy seconds.
+  Reduced frame rate or Slow connection. It clears after three healthy seconds.
   Idle desktop frame counts do not trigger the indicator.
 - Alpha.14 adds a saved **Debug overlay** toggle (off by default). During remote viewing,
   a click-through top-left panel shows target/cap FPS, receive/decode/present FPS,
@@ -258,9 +258,14 @@ impersonator. No universal shared password is embedded in the application.
   These are software-stage measurements, not one-way latency, application
   consumption, USB polling latency or input-to-photon latency. The feature adds
   no performance settings and retains alpha.24 video/refresh/quality behavior.
-- Alpha.18 writes local performance counters while Debug overlay is enabled:
+- From 0.13.1, local performance counters are recorded by default, independently
+  of Debug overlay. Active sessions write roughly once per second; idle logging
+  waits for state changes. The overlay toggle only controls on-screen statistics:
   `%LOCALAPPDATA%/HiveDesk/diagnostics.json` is the atomic latest snapshot;
   `diagnostics.jsonl` plus `diagnostics.previous.jsonl` retain up to 4 MiB of history.
+  Detailed per-frame CSV tracing is separate and off by default; developers can
+  launch the agent with `HIVEDESK_EXPERIENCE_TRACE=1` to enable it for that process.
+  Turning the overlay on or off does not change either logging mode.
   Sampling is once per second plus session/state changes, on a dedicated writer.
   No image, clipboard or input-event content is recorded. Run
   `scripts/watch-diagnostics.ps1 -Seconds 60` in a source checkout to follow it.

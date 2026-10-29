@@ -1,4 +1,5 @@
 #include "hivedesk/telemetry.h"
+#include "hivedesk/experience_trace.h"
 #include <windows.h>
 #include <fstream>
 #include <iostream>
@@ -17,7 +18,12 @@ int main(){
         {std::ofstream file(directory/L"diagnostics.jsonl",std::ios::binary);file<<std::string(2*1024*1024,'x');}
         const auto latest=directory/L"diagnostics.json";
         {
-            hive::Telemetry monitor(directory);monitor.enabled(true);monitor.select(hive::Telemetry::Side::View,"peer",9,"Peer \"quoted\"\n");
+            hive::Telemetry monitor(directory);
+            require(!hive::experience_enabled(),"Routine telemetry enabled expensive per-frame tracing");
+            wait([&]{return read(latest).find("\"status\":\"idle\"")!=std::string::npos;});
+            const auto idle=read(latest);std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+            require(read(latest)==idle,"Idle logger kept rewriting unchanged snapshots");
+            monitor.select(hive::Telemetry::Side::View,"peer",9,"Peer \"quoted\"\n");
             monitor.health(hive::Telemetry::Side::View,"peer",{9,144000,40000,hive::PressureEncode});
             hive::SourceDiagnostics source{9,40000,22500,100,0,1000,200,2500,20000,10000,true};
             source.rate_details=true;source.automatic_cbr=true;source.target_bitrate_bps=120000000;source.actual_bitrate_bps=115500000;source.average_qp=19;source.quality_limited=true;source.rate_reason=2;

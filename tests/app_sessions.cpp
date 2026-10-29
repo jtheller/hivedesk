@@ -2,6 +2,7 @@
 #include "../src/main.cpp"
 #include <cstdio>
 #include <future>
+#include <fstream>
 #include <utility>
 namespace hive {EncodedFrame media_generated_test_frame();}
 void require(bool v,const char* m){if(!v)throw std::runtime_error(m);}
@@ -98,6 +99,19 @@ int probe(){
         })));
         const auto await_ready=[&]{const auto until=GetTickCount64()+7000;while(!app.test_ready("peer-0")&&GetTickCount64()<until)Sleep(10);const bool ready=app.test_ready("peer-0");if(!ready)app.test_report();return ready;};
         require(await_ready(),"Final selection after rapid Peek never presented a desktop");
+        // Real timer/collector path, with the default overlay still disabled.
+        // Routine viewer/input diagnostics must not depend on a visible panel.
+        SendMessageW(owner,WM_TIMER,1,0);
+        bool recorded=false;
+        for(unsigned n=0;n<250&&!recorded;++n){
+            std::ifstream file(profile/L"HiveDesk"/L"diagnostics.json",std::ios::binary);
+            const std::string json{std::istreambuf_iterator<char>(file),{}};
+            file.close(); // Permit the logger's atomic replacement during polling.
+            recorded=json.find("\"status\":\"streaming\"")!=std::string::npos&&json.find("\"viewer\":{")!=std::string::npos&&json.find("\"input\":{")!=std::string::npos;
+            if(!recorded)Sleep(10);
+        }
+        require(recorded&&!hive::experience_enabled(),"Overlay-off App failed to record lightweight diagnostics or enabled per-frame tracing");
+        std::puts("PASS actual App diagnostics with overlay off: active viewer/input counters, independent lightweight logging, no per-frame tracing");
         for(unsigned n=0;n<3;++n){
             const auto old=app.test_surface();
             app.test_delay_retirement(2000);app.test_stop_viewer();

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 namespace hive {
+// Enabled by default, independent of the visual overlay and per-frame trace.
 // Local diagnostic counters only. No images, clipboard contents or input events.
 class Telemetry {
 public:

@@ -86,6 +86,7 @@ internal sealed class SettingsWindow : Window
         tools.Children.Add(Stack(10, Label("Show local Hive"), shortcut, Hint("Ctrl + Alt + Shift + H: remote Hive")));
         var mouseAndDebug = Stack(0, debug, relativeMouse); Grid.SetColumn(mouseAndDebug, 1); tools.Children.Add(mouseAndDebug);
         Id(relativeMouse, "RelativeMouse");
+        ToolTipService.SetToolTip(debug, "Show live performance statistics on screen. Local diagnostic logs are recorded independently.");
         relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
         content.Children.Add(Card(Stack(8, tools, Stack(0, gpuPerformance, gpuPolicyHint))));
         var footer = new Grid { ColumnSpacing = 16 }; footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });

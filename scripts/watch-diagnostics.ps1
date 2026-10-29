@@ -54,7 +54,7 @@ while([DateTime]::UtcNow -lt $deadline){
                         $inputStats.queued,$inputStats.inflight,$inputStats.samples,(Number $inputStats.sample_age_ms))
                 }
             }
-        }elseif($age -gt 5 -and $sample.status -in @('streaming','idle') -and -not $staleShown){Write-Output 'STALE: no new diagnostics for more than 5 seconds';$staleShown=$true}
-    }catch{if($last -ne 'unavailable'){Write-Output 'Waiting for local diagnostics (enable Debug overlay in Settings).';$last='unavailable'}}
+        }elseif($age -gt 5 -and $sample.status -eq 'streaming' -and -not $staleShown){Write-Output 'STALE: no new diagnostics for more than 5 seconds';$staleShown=$true}
+    }catch{if($last -ne 'unavailable'){Write-Output 'Waiting for local diagnostics (recorded automatically by HiveDesk 0.13.1 or later).';$last='unavailable'}}
     Start-Sleep -Milliseconds 500
 }

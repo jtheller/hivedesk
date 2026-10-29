@@ -1,5 +1,4 @@
 #include "hivedesk/telemetry.h"
-#include "hivedesk/experience_trace.h"
 #include "hivedesk/config.h"
 #include "hivedesk/auto_rate.h"
 #include <windows.h>
@@ -36,7 +35,7 @@ struct Telemetry::Impl {
     };
     std::filesystem::path directory;
     std::mutex mutex;std::condition_variable changed;
-    bool enabled=false,stopping=false,dirty=true,error_reported=false;
+    bool enabled=true,stopping=false,dirty=true,error_reported=false;
     Endpoint view,host;
     std::thread worker;
     explicit Impl(std::filesystem::path path):directory(std::move(path)),worker([this]{run();}){}
@@ -165,7 +164,7 @@ struct Telemetry::Impl {
     void run(){
         for(;;){
             std::unique_lock lock(mutex);
-            if(!dirty&&!stopping){if(enabled)changed.wait_for(lock,std::chrono::seconds(1),[this]{return dirty||stopping;});else changed.wait(lock,[this]{return dirty||stopping;});}
+            if(!dirty&&!stopping){if(enabled&&(view.active||host.active))changed.wait_for(lock,std::chrono::seconds(1),[this]{return dirty||stopping;});else changed.wait(lock,[this]{return dirty||stopping;});}
             const auto line=snapshot();const bool done=stopping;dirty=false;lock.unlock();
             try {write(line);error_reported=false;}
             catch(const std::exception& e){if(!error_reported){log(std::string("Local diagnostics: ")+e.what());error_reported=true;}}
@@ -175,7 +174,7 @@ struct Telemetry::Impl {
 };
 Telemetry::Telemetry(std::filesystem::path directory):impl_(std::make_unique<Impl>(std::move(directory))){}
 Telemetry::~Telemetry()=default;
-void Telemetry::enabled(bool value){experience_enabled(value);std::lock_guard lock(impl_->mutex);if(impl_->enabled==value)return;impl_->enabled=value;impl_->dirty=true;impl_->changed.notify_one();}
+void Telemetry::enabled(bool value){std::lock_guard lock(impl_->mutex);if(impl_->enabled==value)return;impl_->enabled=value;impl_->dirty=true;impl_->changed.notify_one();}
 void Telemetry::select(Side side,const std::string& peer,uint64_t session,const std::string& name){std::lock_guard lock(impl_->mutex);auto& e=impl_->endpoint(side);e={};e.active=true;e.peer=peer;e.name=name;e.session=session;if(impl_->enabled){impl_->dirty=true;impl_->changed.notify_one();}}
 void Telemetry::clear(Side side){std::lock_guard lock(impl_->mutex);auto& e=impl_->endpoint(side);if(!e.active)return;e={};if(impl_->enabled){impl_->dirty=true;impl_->changed.notify_one();}}
 void Telemetry::disconnected(const std::string& peer){std::lock_guard lock(impl_->mutex);for(auto* e:{&impl_->view,&impl_->host})if(e->active&&e->peer==peer)e->connected=false;if(impl_->enabled){impl_->dirty=true;impl_->changed.notify_one();}}

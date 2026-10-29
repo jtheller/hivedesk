@@ -1,4 +1,4 @@
-#define AppVersion "0.13.0"
+#define AppVersion "0.13.1"
 #define RepoRoot SourcePath + ".."
 [Setup]
 AppId={{DFA5DE34-4EA9-4ECC-B99A-8F79EE9357C8}
@@ -6,7 +6,7 @@ AppName=HiveDesk
 AppVersion={#AppVersion}
 AppPublisher=HiveDesk
 AppComments=Personal LAN desktop switching
-VersionInfoVersion=0.13.0.0
+VersionInfoVersion=0.13.1.0
 VersionInfoDescription=HiveDesk Setup
 VersionInfoProductName=HiveDesk
 SetupIconFile={#RepoRoot}\resources\HiveDesk.ico

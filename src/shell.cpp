@@ -746,7 +746,7 @@ struct Shell::Impl {
         RECT rect{};GetClientRect(health_badge,&rect);DebugRows rows;
         if(reconnecting)rows={{{waiting_retry?L"Reconnecting...  Ctrl + Alt + ` to cancel":L"Connecting...  Ctrl + Alt + ` to cancel",DiagnosticTone::Warning}}};
         else if(config.desktop.debug_overlay)rows=debug_rows();
-        else rows={{{(stream_health.pressure&PressureNetwork)?L"Slow connection":L"Device busy",DiagnosticTone::Warning}}};
+        else rows={{{(stream_health.pressure&PressureNetwork)?L"Slow connection":L"Reduced frame rate",DiagnosticTone::Warning}}};
         if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
     }
     void timer() {
@@ -763,7 +763,7 @@ struct Shell::Impl {
             if(remote&&!waiting_visible&&(reconnecting?connection_hint_visible:(warning||config.desktop.debug_overlay))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
                 const auto client=viewer_client();
-                const int width=std::min(px(reconnecting?280:config.desktop.debug_overlay?460:136),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&config.desktop.debug_overlay?474:30),std::max(px(30),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
+                const int width=std::min(px(reconnecting?280:config.desktop.debug_overlay?460:184),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&config.desktop.debug_overlay?474:30),std::max(px(30),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
                 const int left=client.left+px(16),top=client.top+px(16);
                 if(!IsWindowVisible(health_badge)||bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOP,left,top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);InvalidateRect(health_badge,nullptr,FALSE);}
                 if(config.desktop.debug_overlay||reconnecting)InvalidateRect(health_badge,nullptr,FALSE);
