@@ -28,7 +28,8 @@ int main(int argc,char** argv){
  WNDCLASSW c{};c.lpfnWndProc=proc;c.hInstance=GetModuleHandleW(nullptr);c.lpszClassName=L"HiveDesk.ReadonlyRemote";RegisterClassW(&c);
  HWND window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_NOREDIRECTIONBITMAP|WS_EX_TRANSPARENT,c.lpszClassName,L"Read-only render diagnostic",WS_POPUP,GetSystemMetrics(SM_CXSCREEN)-340,GetSystemMetrics(SM_CYSCREEN)-220,320,180,nullptr,nullptr,c.hInstance,nullptr);
  SetPropW(window,L"HiveDesk.PeekSurface",reinterpret_cast<HANDLE>(1));
- auto opening=std::async(std::launch::async,[&]{return viewer->open(window,error,{},true);});while(opening.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump();
+ const bool force_software=argc>3&&std::string(argv[3])=="--software";
+ auto opening=std::async(std::launch::async,[&]{return viewer->open(window,error,{},true,{},force_software);});while(opening.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump();
  if(!opening.get()){std::printf("FAIL open %s\n",error.c_str());client.stop();DestroyWindow(window);return 1;}
  hive::StreamSettings settings;settings.session=session;settings.receiver_millihz=60000;settings.warm=true;
  std::printf("REQUEST t=%llu session=%llu\n",GetTickCount64()-began,session);

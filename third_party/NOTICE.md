@@ -35,3 +35,8 @@ does not replace them.
 
 Intel VPL API and dispatcher sources (MIT), commit 674d015bcb294bc39fa276e99a652ea045423e82, are statically linked only into HiveDeskMediaProbe. See onevpl/SOURCE.md and onevpl/LICENSE.
 AMD AMF public headers (MIT and standards notice), commit 57ee0cfb0e1a08d9041f77435653794c1b012be0, are used only by the probe. See amf/SOURCE.md and amf/LICENSE.txt. No AMD or Intel driver runtime is redistributed.
+# FFmpeg software decoder
+
+The avcodec/avutil DLLs are unmodified FFmpeg 9.0.2, LGPL 2.1-or-later,
+configured for HEVC decoding only. Corresponding source, license and build
+recipe are included under licenses/ffmpeg. See third_party/ffmpeg/SOURCE.md.

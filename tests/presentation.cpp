@@ -20,8 +20,13 @@ int main(int argc,char** argv){
     // Observe only this probe's focus events. The user may change applications
     // during verification; that is not evidence that a generated window activated.
     const auto focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,foreground_event,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
-    const bool peek_only=argc==2&&std::strcmp(argv[1],"--peek-only")==0;
-    const bool warm_only=argc==2&&std::strcmp(argv[1],"--warm-only")==0;
+    bool peek_only=false,warm_only=false,software=false;
+    for(int i=1;i<argc;++i){
+        if(std::strcmp(argv[i],"--peek-only")==0)peek_only=true;
+        else if(std::strcmp(argv[i],"--warm-only")==0)warm_only=true;
+        else if(std::strcmp(argv[i],"--software")==0)software=true;
+        else return 2;
+    }
     try{
         if(!focus_hook)throw std::runtime_error("Cannot observe probe foreground events");
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -51,8 +56,9 @@ int main(int argc,char** argv){
         composition.finish_cards();
         }
         if(peek_only)SetPropW(video,L"HiveDesk.PeekSurface",reinterpret_cast<HANDLE>(1));
-        hive::experience_enabled(true);hive::MediaViewer viewer;auto open=std::async(std::launch::async,[&]{std::string error;if(!viewer.open(video,error,{},true))throw std::runtime_error(error);});
+        hive::experience_enabled(true);hive::MediaViewer viewer;auto open=std::async(std::launch::async,[&]{std::string error;if(!viewer.open(video,error,{},true,{},software))throw std::runtime_error(error);});
         while(open.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(5);open.get();
+        if(viewer.diagnostics().software_decode!=software)throw std::runtime_error("Unexpected decoder backend in generated probe");
         auto frame=hive::media_generated_test_frame();
         frame.capture_time_us=frame.source_ready_us=0;
         viewer.submit(frame);unsigned warm_refreshes=0;
@@ -92,6 +98,10 @@ int main(int argc,char** argv){
         const auto samples=[&]{std::array<COLORREF,3> colors{};HDC screen=GetDC(nullptr);
             colors[0]=GetPixel(screen,x+160,y+30);colors[1]=GetPixel(screen,x+60,y+90);colors[2]=GetPixel(screen,x+260,y+146);ReleaseDC(nullptr,screen);return colors;};
         const auto stable=samples();
+        const COLORREF expected[]={RGB(80,42,127),RGB(80,127,47),RGB(80,206,207)};
+        for(size_t i=0;i<3;++i)if(std::abs(int(GetRValue(stable[i]))-int(GetRValue(expected[i])))>6||
+            std::abs(int(GetGValue(stable[i]))-int(GetGValue(expected[i])))>6||std::abs(int(GetBValue(stable[i]))-int(GetBValue(expected[i])))>6)
+            throw std::runtime_error("Presented pixels differ from generated full-range BT.709 colors");
         pump(200);const auto idle_presents=viewer.diagnostics().presented_frames;
         if(!idle_presents)throw std::runtime_error("Missing successful presentation count");
         unsigned mismatches=0;
@@ -145,7 +155,7 @@ int main(int argc,char** argv){
                 struct WindowLease{HWND value;~WindowLease(){DestroyWindow(value);}} lease{next};
                 SetPropW(next,L"HiveDesk.PeekSurface",reinterpret_cast<HANDLE>(1));
                 hive::MediaViewer replacement;std::string error;
-                auto opening=std::async(std::launch::async,[&]{return replacement.open(next,error,{},true);});
+                auto opening=std::async(std::launch::async,[&]{return replacement.open(next,error,{},true,{},software);});
                 while(opening.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)pump(2);
                 if(!opening.get())throw std::runtime_error(error);
                 SetWindowPos(next,HWND_TOPMOST,x,y,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);replacement.preview(true);

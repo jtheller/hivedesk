@@ -120,6 +120,7 @@ inline bool valid_feedback(const StreamFeedback& f){
     return f.session&&f.service_us<=1000000&&(!f.rate_details||f.received_millihz<=4000000);
 }
 struct ViewerDiagnostics {
+    bool software_decode=false;
     uint64_t session=0,discarded=0,skipped=0,presented_frames=0;
     uint32_t received_millihz=0,decoded_millihz=0,presented_millihz=0,receive_kbps=0;
     uint32_t decode_us=0,render_us=0,present_us=0,service_p90_us=0,queue_us=0,queue_depth=0;

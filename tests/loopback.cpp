@@ -39,7 +39,7 @@ bool pump_until(const std::function<bool()>& ready, Clock::time_point deadline) 
 }
 struct Finally { std::function<void()> action; ~Finally() { action(); } };
 
-int run(bool automatic,bool feedback_delay=false,bool background=false,bool baseline=false) {
+int run(bool automatic,bool feedback_delay=false,bool background=false,bool baseline=false,bool software=false) {
     Winsock winsock;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -81,7 +81,8 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
     Finally cleanup_guard{cleanup};
 
     std::string error;
-    if (!viewer.open(window,error)) throw std::runtime_error("Hidden viewer initialization failed: " + error);
+    if (!viewer.open(window,error,{},false,{},software)) throw std::runtime_error("Hidden viewer initialization failed: " + error);
+    if(viewer.diagnostics().software_decode!=software)throw std::runtime_error("Loopback decoder backend differs from requested mode");
     if (viewer.has_frame()) throw std::runtime_error("Viewer reported a frame before receiving video");
     const std::string group_key = hive::Transport::generate_group_key();
     if (group_key.empty()) throw std::runtime_error("Pairing-key generation failed");
@@ -147,11 +148,14 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
             if(background)host.request_keyframe(); // No visible stimulus; exercise even a static desktop.
             auto feedback=viewer.feedback();
             if(feedback.session){
-                if(feedback_delay)feedback.service_us=1000; // Isolate feedback transport delay from decoder capacity.
-                else if(elapsed>=2000&&elapsed<3000)feedback.service_us=60000;
-                else if(elapsed>=3000)feedback.service_us=1000; // Explicit healthy-capacity injection for bounded recovery test.
-                if(feedback_delay||elapsed>=2000)feedback.service_sample_age_us=0; // Inject a fresh measured sample, not a cached old P90.
-                if(!feedback_delay&&elapsed>=2200&&!requested_recovery){before_recovery=keys.load();feedback.recover=true;requested_recovery=true;}
+                // Software mode preserves real CPU service capacity and backlog.
+                if(!software){
+                    if(feedback_delay)feedback.service_us=1000; // Isolate feedback transport delay from decoder capacity.
+                    else if(elapsed>=2000&&elapsed<3000)feedback.service_us=60000;
+                    else if(elapsed>=3000)feedback.service_us=1000; // Explicit healthy-capacity injection for bounded recovery test.
+                    if(feedback_delay||elapsed>=2000)feedback.service_sample_age_us=0; // Inject a fresh sample, not cached old P90.
+                    if(!feedback_delay&&elapsed>=2200&&!requested_recovery){before_recovery=keys.load();feedback.recover=true;requested_recovery=true;}
+                }
                 if(feedback_delay){pending_feedback=feedback;feedback_due=now+std::chrono::milliseconds(elapsed>=1000?35:0);}
                 else if(!client_transport.send_feedback(peer,feedback))fail("Feedback was not queued");
                 // A stale session must not overwrite the active feedback or request a new IDR.
@@ -176,16 +180,22 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
     if (!get_failure().empty()) throw std::runtime_error(get_failure());
     if (!encoded || !received || rendered_stats.empty()) throw std::runtime_error("No complete capture-to-render frame reached the hidden viewer");
     if(automatic){
-        if(feedback_delay){
+        if(software){
+            if(negotiated!=target||!final_rate||final_rate>target||!measured.presented_millihz||!measured.presented_frames)
+                throw std::runtime_error("Software decode did not sustain valid adaptive presentation");
+            std::cout<<"PASS software decode with real CPU feedback: final cap="<<final_rate<<" mHz, presented="<<measured.presented_frames
+                     <<", expired="<<measured.age_expired<<", overflow="<<measured.queue_overflows<<"; no hardware-speed assertion.\n";
+        }else if(feedback_delay){
             if(negotiated!=target||final_rate<target*8/10)throw std::runtime_error("Feedback-only delay collapsed the cap: target="+std::to_string(target)+", final="+std::to_string(final_rate));
             std::cout<<"PASS 35 ms delayed feedback with flowing video: final cap="<<final_rate<<" mHz.\n";
         }else if(negotiated!=target||lowest>=target*8/10||final_rate<=lowest||keys<=before_recovery||!requested_recovery)throw std::runtime_error("Automatic overload/recovery/session feedback failed: target="+std::to_string(target)+", low="+std::to_string(lowest)+", final="+std::to_string(final_rate));
         if(hive::primary_refresh_millihz()!=source_refresh)throw std::runtime_error("Display refresh changed during test");
-        if(!feedback_delay)std::cout<<"PASS automatic wire/session negotiation, injected decoder pressure, recovery IDR, stale-session rejection, upward recovery; target="<<target<<", low="<<lowest<<", final="<<final_rate<<" mHz; physical refresh unchanged.\n";
+        if(!software&&!feedback_delay)std::cout<<"PASS automatic wire/session negotiation, injected decoder pressure, recovery IDR, stale-session rejection, upward recovery; target="<<target<<", low="<<lowest<<", final="<<final_rate<<" mHz; physical refresh unchanged.\n";
         if(background)std::cout<<"Background integration: periodic IDRs replace visible stimulus; these frame counts are not a throughput benchmark.\n";
     }
     std::cout << "PASS: single-machine loopback only (not a two-computer LAN latency measurement).\n"
-              << "Primary-screen NVENC HEVC 4:4:4 -> authenticated negotiated video transport -> NVDEC -> hidden D3D11 renderer.\n"
+              << "Primary-screen NVENC HEVC 4:4:4 -> authenticated negotiated video transport -> "
+              << (software?"Software CPU":"NVDEC") << " -> hidden D3D11 renderer.\n"
               << "Encoded=" << encoded.load() << ", received=" << received.load() << ", bytes=" << bytes.load()
               << ", backpressure=" << rejected.load() << ", dimensions=" << width.load() << 'x' << height.load() << '\n'
               << rendered_stats << '\n';
@@ -193,6 +203,8 @@ int run(bool automatic,bool feedback_delay=false,bool background=false,bool base
 }
 }
 int main(int argc,char** argv) {
-    try { const std::string mode=argc>1?argv[1]:"";const bool background=mode.starts_with("--background-");return run(background||mode=="--automatic"||mode=="--feedback-delay",mode=="--feedback-delay"||mode=="--background-feedback-delay",background,mode=="--background-cqp-baseline"); }
+    try { const std::string mode=argc>1?argv[1]:"";const bool background=mode.starts_with("--background-");
+        if(argc>2)throw std::runtime_error("Choose --background-software for real CPU feedback; other modes assume hardware capacity");
+        return run(background||mode=="--automatic"||mode=="--feedback-delay",mode=="--feedback-delay"||mode=="--background-feedback-delay",background,mode=="--background-cqp-baseline",mode=="--background-software"); }
     catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
 }

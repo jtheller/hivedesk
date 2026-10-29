@@ -10,6 +10,12 @@ Existing alpha installations can upgrade through the same signed, idle-only OTA.
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+0.9.0 adds automatic HEVC 4:4:4 software decoding when the viewer's hardware
+backend is unavailable. CPU decoding keeps full chroma, then uses vendor-neutral
+D3D11 upload/color conversion and the existing latest-picture presentation path.
+NVDEC remains preferred. Debug identifies CPU/NVDEC, and serial CPU service time
+feeds the existing automatic frame-rate controller. No decoder setting is needed.
+
 0.4.3 warms the visible Hive computers before selection, retains their media
 resources after a single decoded picture, and promotes the selected session
 without rebuilding its decoder/window. Debug adds bounded per-frame and input
@@ -72,11 +78,14 @@ impersonator. No universal shared password is embedded in the application.
 
 ## Current scope
 
-- Windows x64; NVIDIA HEVC 4:4:4 encode/decode capable hardware on both endpoints.
+- Windows x64. Hosting still requires NVIDIA HEVC 4:4:4 encoding hardware;
+  its primary display must be attached to that adapter. Viewing prefers NVDEC,
+  with automatic CPU HEVC 4:4:4 fallback and a D3D11-capable display adapter.
+  This fallback is also the receive path for Intel/AMD until their hardware
+  decoders are integrated; it does not implement their encoding backends.
   Alpha.8 targets early R500-series and newer drivers: NVENC/NVDEC API 11.1,
   driver-loaded PTX 6.4, and no CUDA runtime dependency. R500 hardware validation
-  remains pending; current-driver RTX 5060 checks pass. The primary display must
-  be attached to the NVIDIA adapter.
+  remains pending; current-driver RTX 5060 checks pass.
 - Primary display only, SDR, HEVC 4:4:4. No silent 4:2:0 fallback.
 - Automatic discovery across active IPv4 interfaces; on-link connections only, encrypted control and video.
   Alpha.25 peers also negotiate a separate encrypted input connection on the same TCP port.
@@ -300,6 +309,9 @@ target clipboard once available.
 Install VS Build Tools with MSVC x64, Windows SDK and CMake/Ninja, and the .NET 10
 SDK for the WinUI settings helper. The script checks the per-user
 TRG/Toolchains/dotnet10 installation first, then dotnet on PATH.
+Git for Windows and 7-Zip are needed to build the pinned, minimal FFmpeg HEVC
+decoder. Source, GNU make and NASM archives are hash-checked; the DLLs, license,
+exact source archive and build recipe are included in distributable packages.
 Neither building nor running requires the CUDA Toolkit. The source pins public
 NVIDIA codec API 11.1 headers; driver binaries are loaded from Windows, never bundled.
 Run scripts/build.ps1 -Package in PowerShell. Inno Setup 7 is required to build Setup.exe.

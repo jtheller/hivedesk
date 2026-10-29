@@ -35,7 +35,7 @@ public:
     // noninteractive tests; production callers leave it empty.
     bool open(HWND window, std::string& error,
         std::function<void(const CursorPresentation&)> presented={},bool warm=false,
-        std::function<HRESULT()> present_for_test={});
+        std::function<HRESULT()> present_for_test={},bool software_for_test=false);
     // Prewarm prepares pixels without touching the hidden swapchain. Selection
     // enables presentation after the UI has assigned its final window/style.
     void activate();

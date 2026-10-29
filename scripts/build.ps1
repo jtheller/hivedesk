@@ -13,6 +13,7 @@ $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Comp
 if (-not $vsRoot) { throw 'MSVC C++ x64 tools were not found.' }
 Import-Module (Join-Path $vsRoot 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+& (Join-Path $PSScriptRoot 'build-codec.ps1')
 cmake -S $projectRoot -B (Join-Path $projectRoot 'build') -G Ninja -DCMAKE_BUILD_TYPE=Release
 if ($LASTEXITCODE) { throw 'CMake configuration failed.' }
 cmake --build (Join-Path $projectRoot 'build') --parallel 4

@@ -20,7 +20,7 @@ class ViewerServiceWindow {
 public:
     void clear(){samples_.clear();}
     void add(uint64_t now,uint32_t cost){expire(now);samples_.push_back({now,cost});if(samples_.size()>64)samples_.pop_front();}
-    uint32_t p90(uint64_t now){expire(now);if(samples_.size()<8)return 0;std::vector<uint32_t> costs;for(const auto& s:samples_)costs.push_back(s.cost);std::sort(costs.begin(),costs.end());return costs[(costs.size()-1)*9/10];}
+    uint32_t p90(uint64_t now,size_t minimum_samples=8){expire(now);if(samples_.empty()||samples_.size()<minimum_samples)return 0;std::vector<uint32_t> costs;for(const auto& s:samples_)costs.push_back(s.cost);std::sort(costs.begin(),costs.end());return costs[(costs.size()-1)*9/10];}
     uint32_t sample_age(uint64_t now){expire(now);return samples_.empty()?UINT32_MAX:uint32_t(std::min<uint64_t>(UINT32_MAX,now>=samples_.back().at?now-samples_.back().at:0));}
 };
 
@@ -100,6 +100,9 @@ public:
     struct Pending {
         EncodedFrame frame;
         uint64_t arrival = 0, epoch = 0;
+        // Local-only synchronous CPU codec work; never accepted from the wire.
+        // It is intrinsic service latency, not queued playback. NVDEC stays 0.
+        uint32_t serial_decode_us=0;
     };
 private:
     std::deque<Pending> frames_;
@@ -237,7 +240,8 @@ public:
     }
     bool output_fresh(const Pending& pending, uint64_t now) {
         if (pending.epoch != epoch_ || waiting_keyframe_) return false;
-        if (age(pending,now) > MaxReferenceAgeUs || (now>=pending.arrival && now-pending.arrival>MaxAgeUs)) {
+        if (age(pending,now) > MaxReferenceAgeUs ||
+            (now>=pending.arrival && now-pending.arrival>MaxAgeUs+std::min<uint64_t>(pending.serial_decode_us,MaxReferenceAgeUs))) {
             // Mapping and presentation run independently. A late old Present
             // retry cannot re-arm recovery after the mapper has already made a
             // newer picture ready. That newer output still enforces its own age.

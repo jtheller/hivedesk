@@ -219,7 +219,20 @@ void slow_assembly_watchdog_and_clocks(){
     require(rejected&&q.recovering(),"Unbounded slow replay accepted");
 }
 }
+void software_service_is_not_playback_backlog(){
+    hive::ViewerQueue q;require(q.push(picture(0,Source,true),Local),"CPU baseline rejected");
+    auto cpu=q.pop(Local);require(cpu&&q.admit(*cpu,Local),"CPU reference admission failed");
+    cpu->serial_decode_us=150000;
+    require(q.mark_output_ready(*cpu,Local+151000),"Intrinsic CPU decode time expired the first picture");
+    require(!q.output_fresh(*cpu,Local+200001),"CPU decode allowance excused subsequent display backlog");
+    q.reset();require(q.push(picture(1,Source,true),Local),"CPU severe baseline rejected");cpu=q.pop(Local);cpu->serial_decode_us=1000000;
+    require(!q.output_fresh(*cpu,Local+1000001),"CPU allowance bypassed absolute severe-stall limit");
+    hive::ViewerServiceWindow samples;samples.add(Local,200000);
+    require(samples.p90(Local)==0&&samples.p90(Local,1)==200000,"Slow CPU service requires unreachable eight-sample rate");
+    require(samples.p90(Local+1000001,1)==0,"Idle CPU service did not expire");
+}
 int main(){try{
+software_service_is_not_playback_backlog();
 service_samples_expire();present_gap_samples();normal_and_idle();decoded_expiry_static_refresh_and_epochs();older_presenter_cannot_rearm_newer_ready_output();epochs_and_reference_gaps();session_and_legacy();
 intact_references_and_latest_presentation();severe_backlog_and_queue_budget();source_timing_and_session_integrity();slow_assembly_watchdog_and_clocks();
 std::puts("PASS viewer: intact late references, latest local presentation deadline, bounded decode catch-up, severe backlog/overflow recovery, session/epoch isolation, source/wire provenance, watchdog progress and clock drift.");return 0;

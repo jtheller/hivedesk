@@ -1,4 +1,4 @@
-#define AppVersion "0.8.5"
+#define AppVersion "0.9.0"
 #define RepoRoot SourcePath + ".."
 [Setup]
 AppId={{DFA5DE34-4EA9-4ECC-B99A-8F79EE9357C8}
@@ -6,7 +6,7 @@ AppName=HiveDesk
 AppVersion={#AppVersion}
 AppPublisher=HiveDesk
 AppComments=Personal LAN desktop switching
-VersionInfoVersion=0.8.5.0
+VersionInfoVersion=0.9.0.0
 VersionInfoDescription=HiveDesk Setup
 VersionInfoProductName=HiveDesk
 SetupIconFile={#RepoRoot}\resources\HiveDesk.ico
@@ -27,6 +27,13 @@ RestartApplications=no
 UninstallDisplayIcon={app}\HiveDesk.exe
 
 [Files]
+Source: "{#RepoRoot}\build\ffmpeg\avcodec-63.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\build\ffmpeg\avutil-61.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\build\ffmpeg\COPYING.LGPLv2.1"; DestDir: "{app}\licenses\ffmpeg"; Flags: ignoreversion
+Source: "{#RepoRoot}\build\ffmpeg\ffmpeg-n9.0.2.tar.gz"; DestDir: "{app}\licenses\ffmpeg"; Flags: ignoreversion
+Source: "{#RepoRoot}\third_party\ffmpeg\SOURCE.md"; DestDir: "{app}\licenses\ffmpeg"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\build-codec.ps1"; DestDir: "{app}\licenses\ffmpeg"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\build-codec.sh"; DestDir: "{app}\licenses\ffmpeg"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDesk.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskService.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\build\HiveDeskUpdater.exe"; DestDir: "{app}"; Flags: ignoreversion

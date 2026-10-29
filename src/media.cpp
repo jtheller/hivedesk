@@ -14,6 +14,7 @@
 #include "viewer_queue.h"
 #include "latest_picture.h"
 #include "viewer_composition.h"
+#include "software_decoder.h"
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -716,7 +717,7 @@ public:
         CUVIDDECODECAPS caps{}; caps.eCodecType = cudaVideoCodec_HEVC; caps.eChromaFormat = cudaVideoChromaFormat_444;
         cu(caps_(&caps), "NVDEC HEVC444 capabilities");
         if (!caps.bIsSupported || !(caps.nOutputFormatMask & (1u << cudaVideoSurfaceFormat_YUV444)))
-            throw std::runtime_error("HEVC444 hardware decoding unsupported; software/420 fallback is disabled.");
+            throw std::runtime_error("NVDEC does not support HEVC 4:4:4 on this adapter");
         CUVIDPARSERPARAMS parser{}; parser.CodecType = cudaVideoCodec_HEVC;
         parser.ulMaxNumDecodeSurfaces = 1; parser.ulMaxDisplayDelay = 0; parser.ulClockRate = 1000000;
         parser.pUserData = this; parser.pfnSequenceCallback = &Decoder::sequence;
@@ -773,6 +774,47 @@ public:
         auto result = parse_(parser_, &packet);
         if (!callback_error_.empty()) throw std::runtime_error(callback_error_);
         cu(result, "Parse HEVC444 frame");
+    }
+};
+
+// Backend choice is per viewer lifetime, before accepting the first access
+// unit. Runtime reference failures must never switch decoders mid-GOP.
+class ViewerDecoder {
+    std::unique_ptr<Decoder> hardware_;
+    std::unique_ptr<SoftwareDecoder> software_;
+    std::function<bool()> cancelled_;
+    std::string reason_;
+public:
+    struct Output : Decoder::AsyncOutput {
+        std::function<void(const SoftwarePicture&)> software_prepare;
+    };
+    ViewerDecoder(IDXGIAdapter* adapter,std::function<bool()> cancelled,
+                  std::shared_ptr<std::recursive_mutex> graphics,bool force_software):cancelled_(std::move(cancelled)){
+        DXGI_ADAPTER_DESC description{};hr(adapter->GetDesc(&description),"Read decode adapter");
+        if(!force_software&&description.VendorId==0x10de){
+            try{hardware_=std::make_unique<Decoder>(Decoder::Output{},adapter,true,cancelled_,std::move(graphics));}
+            catch(const std::exception& error){reason_=error.what();}
+        }else reason_=force_software?"Explicit software diagnostic":"No HEVC444 hardware backend for this adapter";
+        if(!hardware_)software_=std::make_unique<SoftwareDecoder>();
+    }
+    bool software()const{return bool(software_);}
+    const std::string& reason()const{return reason_;}
+    void request_stop(){if(hardware_)hardware_->request_stop();}
+    void stop_async(){if(hardware_)hardware_->stop_async();}
+    void check_async(){if(hardware_)hardware_->check_async();}
+    bool feed_async(const EncodedFrame& frame,Output output){
+        if(hardware_)return hardware_->feed_async(frame,std::move(output));
+        if(cancelled_())return false;
+        if(output.admit&&!output.admit())return true;
+        const auto began=now_us();
+        const auto decode_us=software_->decode(frame,[&](const SoftwarePicture& picture){
+            if(!cancelled_())output.software_prepare(picture);
+        });
+        // This backend is synchronous: CPU decode + upload is actual service
+        // capacity. NVDEC's asynchronous mapping latency remains excluded.
+        const auto service_us=uint32_t(std::min<uint64_t>(1000000,now_us()-began));
+        if(!cancelled_())output.complete(decode_us,service_us);
+        return !cancelled_();
     }
 };
 
@@ -858,6 +900,9 @@ public:
     struct Picture {
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<ID3D11ShaderResourceView> resource;
+        ComPtr<ID3D11RenderTargetView> software_target;
+        std::array<ComPtr<ID3D11Texture2D>,3> planes;
+        std::array<ComPtr<ID3D11ShaderResourceView>,3> plane_resources;
         uint32_t width=0,height=0,convert_us=0;
         CursorPresentation cursor;
     };
@@ -874,6 +919,7 @@ private:
     Picture synchronous_picture_;
     ComPtr<ID3D11VertexShader> vertex_;
     ComPtr<ID3D11PixelShader> pixel_;
+    ComPtr<ID3D11PixelShader> software_pixel_;
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<IDXGIAdapter> adapter_;
     uint32_t window_width_ = 0, window_height_ = 0;
@@ -1031,6 +1077,53 @@ public:
         if(!hive_gpu_decode_texture(gpu,yuv,pitch,width,height,picture.texture.Get()))throw std::runtime_error(hive_gpu_error(gpu));
         picture.convert_us=uint32_t(std::min<uint64_t>(10000000,now_us()-begin));
     }
+    void convert_software(Picture& picture,const SoftwarePicture& input){
+        const std::lock_guard graphics(*graphics_gate_);
+        const auto began=now_us();
+        if(!software_pixel_){
+            // Same full-range BT.709 matrix as color_kernels.h. Each plane is
+            // full resolution: never pass through an NV12/4:2:0 surface.
+            constexpr char shader[]=
+                "Texture2D<float> yy:register(t0);Texture2D<float> uu:register(t1);Texture2D<float> vv:register(t2);"
+                "float4 ps(float4 p:SV_POSITION):SV_TARGET{int3 q=int3(p.xy,0);"
+                "float y=yy.Load(q);float u=uu.Load(q)-128.0/255.0;float v=vv.Load(q)-128.0/255.0;"
+                "return float4(saturate(float3(y+1.5748*v,y-0.187324*u-0.468124*v,y+1.8556*u)),1);}";
+            ComPtr<ID3DBlob> bytecode,errors;
+            hr(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&bytecode,&errors),"Compile software-decoded color shader");
+            hr(device_->CreatePixelShader(bytecode->GetBufferPointer(),bytecode->GetBufferSize(),nullptr,&software_pixel_),"Create software-decoded color shader");
+        }
+        if(picture.width!=input.width||picture.height!=input.height||!picture.software_target){
+            Picture replacement;replacement.width=input.width;replacement.height=input.height;
+            D3D11_TEXTURE2D_DESC desc{};desc.Width=input.width;desc.Height=input.height;desc.MipLevels=desc.ArraySize=1;
+            desc.SampleDesc.Count=1;desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.Usage=D3D11_USAGE_DEFAULT;
+            desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
+            hr(device_->CreateTexture2D(&desc,nullptr,&replacement.texture),"Create software-decoded RGB texture");
+            hr(device_->CreateShaderResourceView(replacement.texture.Get(),nullptr,&replacement.resource),"Create software RGB SRV");
+            hr(device_->CreateRenderTargetView(replacement.texture.Get(),nullptr,&replacement.software_target),"Create software RGB target");
+            desc.Format=DXGI_FORMAT_R8_UNORM;desc.Usage=D3D11_USAGE_DYNAMIC;desc.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
+            desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+            for(size_t i=0;i<3;++i){
+                hr(device_->CreateTexture2D(&desc,nullptr,&replacement.planes[i]),"Create full-resolution YUV plane");
+                hr(device_->CreateShaderResourceView(replacement.planes[i].Get(),nullptr,&replacement.plane_resources[i]),"Create YUV plane SRV");
+            }
+            picture=std::move(replacement);
+        }
+        for(size_t i=0;i<3;++i){
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            hr(context_->Map(picture.planes[i].Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped),"Upload full-resolution YUV plane");
+            for(uint32_t row=0;row<input.height;++row)
+                std::memcpy(static_cast<uint8_t*>(mapped.pData)+size_t(row)*mapped.RowPitch,input.planes[i]+size_t(row)*input.strides[i],input.width);
+            context_->Unmap(picture.planes[i].Get(),0);
+        }
+        auto* target=picture.software_target.Get();context_->OMSetRenderTargets(1,&target,nullptr);
+        D3D11_VIEWPORT viewport{};viewport.Width=float(input.width);viewport.Height=float(input.height);viewport.MaxDepth=1;
+        context_->RSSetViewports(1,&viewport);context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vertex_.Get(),nullptr,0);context_->PSSetShader(software_pixel_.Get(),nullptr,0);
+        ID3D11ShaderResourceView* planes[]={picture.plane_resources[0].Get(),picture.plane_resources[1].Get(),picture.plane_resources[2].Get()};
+        context_->PSSetShaderResources(0,3,planes);context_->Draw(3,0);
+        ID3D11ShaderResourceView* empty[3]{};context_->PSSetShaderResources(0,3,empty);context_->OMSetRenderTargets(0,nullptr,nullptr);
+        picture.convert_us=uint32_t(std::min<uint64_t>(10000000,now_us()-began));
+    }
     void draw_prepared(const Picture& picture,Image* proof=nullptr,uint32_t* render_cost=nullptr,uint32_t* present_cost=nullptr,bool* presented=nullptr,
         std::function<bool()> eligible={},bool defer_present=false){
         std::unique_lock graphics(*graphics_gate_);
@@ -1140,7 +1233,7 @@ bool media_prewarm_capacity() {
     return false;
 }
 MediaViewer::~MediaViewer() { close(); }
-bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented,bool warm,std::function<HRESULT()> present_for_test) {
+bool MediaViewer::open(HWND window, std::string& error,std::function<void(const CursorPresentation&)> presented,bool warm,std::function<HRESULT()> present_for_test,bool software_for_test) {
     close();
     // DXGI creation may synchronously send window messages. The caller must
     // keep the HWND owner's message pump running while this preparation runs.
@@ -1165,7 +1258,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
         impl_->live_window={};impl_->live_totals={};impl_->live_window.sample(now_us(),{});
         impl_->feedback={};impl_->last_arrival=0;impl_->service_samples.clear();impl_->present_samples.clear();impl_->diagnostics={};impl_->sample_since=now_us();impl_->receive_sample_at=0;impl_->received_count=impl_->decoded_count=impl_->presented_count=impl_->received_bytes=0;}
     std::promise<std::string> initialized; auto ready = initialized.get_future();
-    impl_->worker = std::thread([this, renderer = std::move(renderer), initialized = std::move(initialized)]() mutable {
+    impl_->worker = std::thread([this, renderer = std::move(renderer), initialized = std::move(initialized),software_for_test]() mutable {
         SetThreadDescription(GetCurrentThread(),L"HiveDesk viewer decode / lifetime");
         bool announced=false;
         try{
@@ -1180,10 +1273,12 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                 const bool fresh=!impl_->stopping&&impl_->frames.output_fresh(*pending,now_us());
                 impl_->sync_queue();return fresh&&!impl_->stopping;
             };
-            Decoder decoder({},renderer->adapter(),true,cancelled,renderer->graphics_gate());
+            ViewerDecoder decoder(renderer->adapter(),cancelled,renderer->graphics_gate(),software_for_test);
+            {std::lock_guard guard(impl_->mutex);impl_->diagnostics.software_decode=decoder.software();}
+            if(decoder.software())log("Viewer using software HEVC 4:4:4: "+decoder.reason());
             std::thread presenter;
             struct Workers {
-                std::atomic<bool>& stop;LatestPicture& pictures;Decoder& decoder;std::thread& presenter;
+                std::atomic<bool>& stop;LatestPicture& pictures;ViewerDecoder& decoder;std::thread& presenter;
                 std::mutex& state_mutex;std::condition_variable& changed;
                 ~Workers(){
                     {std::lock_guard lock(state_mutex);stop=true;}changed.notify_all();
@@ -1261,7 +1356,7 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                 if(!pending)continue;
                 auto context=std::make_shared<ViewerQueue::Pending>(std::move(*pending));
                 auto slot=std::make_shared<std::optional<size_t>>();
-                Decoder::AsyncOutput output;
+                ViewerDecoder::Output output;
                 output.admit=[this,context]{
                     std::lock_guard guard(impl_->mutex);
                     const bool fresh=!impl_->stopping&&impl_->frames.admit(*context,now_us());
@@ -1280,12 +1375,24 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                         *slot=reserved;
                     }catch(...){pictures.release(*reserved);throw;}
                 };
+                output.software_prepare=[&,context,slot](const SoftwarePicture& input){
+                    context->serial_decode_us=input.decode_us;
+                    if(!eligible(context)){std::lock_guard guard(impl_->mutex);++impl_->diagnostics.skipped;return;}
+                    const auto reserved=pictures.reserve();
+                    if(!reserved){if(cancelled())return;throw std::runtime_error("Software picture ownership exhausted");}
+                    try{
+                        auto& picture=ready_pictures[*reserved];picture.pending=context;
+                        renderer->convert_software(picture.pixels,input);
+                        picture.pixels.cursor={context->frame.session,context->frame.sequence,context->frame.cursor_composition,true};
+                        *slot=reserved;
+                    }catch(...){pictures.release(*reserved);throw;}
+                };
                 output.complete=[&,context,slot](uint32_t map_us,uint32_t service_us){
                     if(!*slot){
                         std::lock_guard guard(impl_->mutex);
                         if(!impl_->stopping){
                             ++impl_->decoded_count;++impl_->live_totals[1];
-                            impl_->diagnostics.decode_us=map_us;impl_->diagnostics.nvdec_map_us=map_us;
+                            impl_->diagnostics.decode_us=map_us;impl_->diagnostics.nvdec_map_us=decoder.software()?0:map_us;
                             if(!context->frame.keyframe)impl_->service_samples.add(now_us(),service_us);
                         }
                         return;
@@ -1296,12 +1403,12 @@ bool MediaViewer::open(HWND window, std::string& error,std::function<void(const 
                         std::lock_guard guard(impl_->mutex);
                         if(!impl_->stopping&&!pipeline_stop){
                             ++impl_->decoded_count;++impl_->live_totals[1];
-                            impl_->diagnostics.decode_us=map_us;impl_->diagnostics.nvdec_map_us=map_us;
+                            impl_->diagnostics.decode_us=map_us;impl_->diagnostics.nvdec_map_us=decoder.software()?0:map_us;
                             impl_->diagnostics.convert_us=image.convert_us;
                             if(!context->frame.keyframe)impl_->service_samples.add(now_us(),service_us);
                             prepared=impl_->frames.mark_output_ready(*context,now_us());impl_->sync_queue();
                             if(prepared&&!impl_->stopping){
-                                impl_->status=std::to_string(image.width)+'x'+std::to_string(image.height)+" HEVC 4:4:4 | NVDEC async | latest ready + display pacing";
+                                impl_->status=std::to_string(image.width)+'x'+std::to_string(image.height)+" HEVC 4:4:4 | "+(decoder.software()?"Software CPU":"NVDEC async")+" | latest ready + display pacing";
                                 // Reveal the hidden viewer on prepared pixels;
                                 // actual presentation is counted only at S_OK.
                                 impl_->displayed=true;
@@ -1380,7 +1487,8 @@ StreamFeedback MediaViewer::feedback() const {
     if(impl_->last_arrival)report.arrival_age_us=uint32_t(std::min<uint64_t>(UINT32_MAX,now-impl_->last_arrival));
     report.queue_us=uint32_t(std::min<uint64_t>(UINT32_MAX,impl_->frames.feedback_queue_age(now)));
     // Mapping latency is not pipelined capacity. Actual compressed backlog drives throttling.
-    report.service_us=0;report.service_sample_age_us=impl_->service_samples.sample_age(now);
+    report.service_us=impl_->diagnostics.software_decode?std::min(1000000u,impl_->service_samples.p90(now,1)):0;
+    report.service_sample_age_us=impl_->service_samples.sample_age(now);
     report.rate_details=true;report.received_kbps=impl_->diagnostics.receive_kbps;report.received_millihz=impl_->diagnostics.received_millihz;
     report.receive_sample_age_us=impl_->receive_sample_at?uint32_t(std::min<uint64_t>(UINT32_MAX,now-impl_->receive_sample_at)):UINT32_MAX;
     report.transit_extra_us=impl_->frames.transit_extra_us();
@@ -1393,7 +1501,7 @@ ViewerDiagnostics MediaViewer::diagnostics() const {
     const auto rates=impl_->live_window.sample(now,impl_->live_totals);
     result.received_millihz=rates.rate(0,1000000000,4000000);result.decoded_millihz=rates.rate(1,1000000000,4000000);
     result.presented_millihz=rates.rate(2,1000000000,4000000);result.receive_kbps=rates.rate(3,8000);
-    result.service_p90_us=impl_->service_samples.p90(now);result.service_sample_age_us=impl_->service_samples.sample_age(now);
+    result.service_p90_us=impl_->service_samples.p90(now,result.software_decode?1:8);result.service_sample_age_us=impl_->service_samples.sample_age(now);
     result.queue_us=uint32_t(std::min<uint64_t>(UINT32_MAX,impl_->frames.queue_age(now)));result.queue_depth=uint32_t(impl_->frames.size());result.recovering=impl_->frames.recovering();
     result.present_gap_p95_us=impl_->present_samples.p95(now);result.present_gap_max_us=impl_->present_samples.maximum(now);
     result.receive_sample_age_us=impl_->last_arrival?uint32_t(std::min<uint64_t>(UINT32_MAX,now-impl_->last_arrival)):UINT32_MAX;
@@ -1416,6 +1524,21 @@ std::vector<EncodedFrame> media_generated_motion_frames() {
     for(uint32_t i=0;i<8;++i){
         for(uint32_t y=0;y<height;++y)for(uint32_t x=0;x<width;++x){auto* p=source.bgra.data()+(size_t(y)*width+x)*4;p[0]=uint8_t(x*255/width);p[1]=uint8_t(y*255/height);p[2]=uint8_t(80+i*20);p[3]=255;}
         frames.push_back(encoder.encode(source,i,true));
+    }
+    return frames;
+}
+std::vector<EncodedFrame> media_generated_software_fixture(){
+    std::vector<EncodedFrame> frames;
+    for(uint32_t size:{256u,384u}){
+        Image source{size,size,std::vector<uint8_t>(size_t(size)*size*4)};
+        Encoder encoder(size,size,StreamSettings{60,100});
+        for(uint32_t i=0;i<12;++i){
+            for(uint32_t y=0;y<size;++y)for(uint32_t x=0;x<size;++x){
+                auto* p=source.bgra.data()+(size_t(y)*size+x)*4;
+                p[0]=(x&1)?220:20;p[1]=uint8_t(40+i*8);p[2]=(x&1)?20:220;p[3]=255;
+            }
+            frames.push_back(encoder.encode(source,frames.size(),i==0||i==8));
+        }
     }
     return frames;
 }

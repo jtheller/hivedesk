@@ -36,6 +36,9 @@ int main(){try{
     require(rows[1][0].text.find(state.viewer_version)!=std::wstring::npos&&rows[2][0].text.find(state.host_version)!=std::wstring::npos&&rows[2][0].tone==T::Warning,"Endpoint versions or mismatch warning missing");
     state.host_version=state.viewer_version;rows=hive::build_debug_rows(state,pulses);require(rows[2][0].tone==T::Normal,"Matching endpoint versions flagged");
     state.host_version=std::wstring(32,L'9');rows=hive::build_debug_rows(state,pulses);
+    require(rows[0][0].text.find(L"NVDEC")!=std::wstring::npos,"Hardware decode label missing");
+    state.viewer.software_decode=true;rows=hive::build_debug_rows(state,pulses);
+    require(rows[0][0].text.find(L"CPU")!=std::wstring::npos&&rows[0][0].text.find(L"NVDEC")==std::wstring::npos,"Software decode mislabeled as NVDEC");
     require(rows.size()*18+24<=474,"HUD rows exceed height");
     HDC measuring=CreateCompatibleDC(nullptr);auto previous=SelectObject(measuring,font);
     for(const auto& row:rows){int width=0;for(const auto& span:row){SIZE extent{};GetTextExtentPoint32W(measuring,span.text.c_str(),int(span.text.size()),&extent);width+=extent.cx;}require(width<=436,"HUD text clipped at 96dpi");}

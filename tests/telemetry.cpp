@@ -27,6 +27,7 @@ int main(){
             stats.age_expired=3;stats.sequence_gaps=2;stats.queue_overflows=4;stats.transit_extra_us=3300;
             stats.nvdec_map_us=1500;stats.convert_us=700;stats.draw_us=90;stats.present_gap_p95_us=12000;stats.present_gap_max_us=35000;
             stats.presented_frames=81;
+            stats.software_decode=true;
             monitor.viewer("peer",stats,2560,1440);
             monitor.select(hive::Telemetry::Side::Host,"outbound",90,"Receiver");
             hive::VideoSendDiagnostics send;send.available=true;send.connection=4;send.submitted_packets=11;send.completed_packets=10;send.completed_bytes=1000000;
@@ -59,6 +60,7 @@ int main(){
             require(value.find("\"service_sample_age_ms\":null,\"receive_sample_age_ms\":null,\"transit_excess_ms\":3.300")!=std::string::npos,"Unavailable samples appeared fresh");
             require(value.find("\"nvdec_map_ms\":1.500,\"convert_ms\":0.700,\"draw_ms\":0.090,\"present_gap_p95_ms\":12.000,\"present_gap_max_ms\":35.000")!=std::string::npos,"Missing viewer stalls/cadence metrics");
             require(value.find("\"presented_frames\":81")!=std::string::npos&&value.find("repeated_presentations")==std::string::npos,"Presentation totals or retired experiment telemetry failed");
+            require(value.find("\"decoder\":\"software-hevc444\"")!=std::string::npos,"Software backend identity missing");
             require(value.find("\"completed_packets\":10,\"completed_bytes\":1000000,\"failed_packets\":1,\"queue_expired\":2")!=std::string::npos&&value.find("\"completed_packets\":999")==std::string::npos,"Video send counters or session isolation failed");
             require(value.find("\"inflight\":2,\"send_p95_ms\":1.900,\"send_max_ms\":25.000")!=std::string::npos&&value.find("\"ready_gap_p95_ms\":0.080")!=std::string::npos,"Missing bounded in-flight writes, wire completion and ready dispatch costs");
             require(value.find("\"write_limit\":32,\"owned_bytes\":800000,\"write_budget_bytes\":1250000")!=std::string::npos,"Missing adaptive byte ownership");

@@ -29,7 +29,7 @@ inline DebugRows build_debug_rows(const DebugOverlayState& state,std::array<Diag
         auto count=[&](const wchar_t* label,uint64_t n,size_t index){return DebugSpan{std::wstring(label)+std::to_wstring(n),debug_pulses[index].update(now,n)?T::Warning:T::Normal};};
         auto input_ms=[&](const wchar_t* label,uint32_t n,uint32_t warning,uint32_t critical){return DebugSpan{std::wstring(label)+(input_fresh?num(n/1000.0):L"--"),diagnostic_threshold(n,warning,critical,input_fresh)};};
         DebugRows rows{
-            {{L"HiveDesk debug  "+std::to_wstring(remote_width)+L" x "+std::to_wstring(remote_height)+L"  HEVC 4:4:4"}},
+            {{L"HiveDesk debug  "+std::to_wstring(remote_width)+L" x "+std::to_wstring(remote_height)+L"  HEVC 4:4:4"+(v.software_decode?L"  CPU":L"  NVDEC")}},
             {{L"Viewer (this PC): "+(state.viewer_version.empty()?std::wstring(L"Unknown"):state.viewer_version),state.viewer_version.empty()?T::Muted:T::Normal}},
             {{L"Host (remote): "+(state.host_version.empty()?std::wstring(L"Unknown"):state.host_version),state.host_version.empty()?T::Muted:state.host_version!=state.viewer_version?T::Warning:T::Normal}},
             {metric(L"Target ",stream_health.target_millihz/1000.0),metric(L"   Cap ",stream_health.rate_millihz/1000.0,health_time&&now-health_time<2000?(stream_health.pressure?T::Warning:T::Normal):T::Muted),{L" fps"}},
