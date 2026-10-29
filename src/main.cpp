@@ -47,6 +47,8 @@ public:
     bool test_ready(const std::string& peer)const{const auto active=active_.load();return active&&*active==peer&&view_ready_&&viewer_.load()->has_presented_frame();}
     HWND test_surface()const{return shell_.viewer_window();}
     void test_stop_viewer(){viewer_.load()->request_stop();}
+    void test_return_previous(){shell_.return_previous();}
+    bool test_return_pending(){const std::lock_guard lock(view_intent_mutex_);return return_barrier_.has_value();}
     void test_delay_retirement(DWORD duration){retire_lane_.post([duration]{Sleep(duration);});}
     void test_report()const{const auto v=viewer_.load();const auto active=active_.load();const auto d=v->diagnostics();std::fprintf(stderr,"viewer test: active=%s ready=%d frame=%d presented=%d received=%llu state=%s input=%d decode_mhz=%u present_mhz=%u map_us=%u convert_us=%u depth=%u expired=%llu overflow=%llu skipped=%llu\n",active?active->c_str():"none",int(view_ready_.load()),v->has_frame(),v->has_presented_frame(),(unsigned long long)received_frames_.load(),v->stats().c_str(),active&&transport_.input_ready(*active,active_session_),d.decoded_millihz,d.presented_millihz,d.nvdec_map_us,d.convert_us,d.queue_depth,(unsigned long long)d.age_expired,(unsigned long long)d.queue_overflows,(unsigned long long)d.skipped);std::fflush(stderr);}
     std::future<bool> test_recovery_guards(){
@@ -83,6 +85,24 @@ public:
             view_ready_=false;
             const auto previous=active_.exchange(nullptr);
             enqueue([this,previous]{go_local(previous,false);});
+        };
+        callbacks.return_request=[this](const std::string& peer,const hive::ReturnRequest& request){
+            const std::lock_guard lock(view_intent_mutex_);const auto target=view_control_;
+            if(closing_||!view_ready_||!active_dedicated_input_||!target||target->peer!=peer||target->session!=request.session||target->generation!=generation_)return false;
+            // The request travels on a separate control lane. Wait for a real
+            // broker ACK of ReleaseAll first, so old clicks/held keys cannot
+            // cross the return boundary and operate the newly exposed desktop.
+            hive::InputPacket packet;packet.session=request.session;packet.sequence=++input_sequence_;
+            packet.capture_time_us=hive::input_now_us();packet.event={hive::InputKind::ReleaseAll};
+            return_barrier_=ReturnBarrier{target,request,packet.sequence,false};
+            input_after_return_us_=packet.capture_time_us;
+            if(transport_.send_input(peer,packet))return true;
+            return_barrier_.reset();return false;
+        };
+        callbacks.return_reply=[this](const std::string& peer,const hive::ReturnReply& reply){return !closing_&&transport_.send_return_reply(peer,reply);};
+        callbacks.return_finished=[this](const std::string& peer,uint64_t session){
+            const std::lock_guard lock(view_intent_mutex_);
+            if(return_barrier_&&return_barrier_->view->peer==peer&&return_barrier_->view->session==session){return_barrier_.reset();input_after_return_us_=hive::input_now_us();}
         };
         callbacks.kick_controller=[this] {
             const auto target=hosting_.load();
@@ -143,6 +163,8 @@ public:
             const auto target=view_control_;
             if(!target||target->peer!=peer||target->session!=session||
                 target->generation!=generation_||!view_ready_||closing_)return;
+            if(input.kind!=hive::InputKind::ReleaseAll&&(captured_us<=input_after_return_us_||
+               (return_barrier_&&return_barrier_->view==target)))return;
             if(active_dedicated_input_){
                 hive::InputPacket packet;packet.session=session;packet.sequence=++input_sequence_;
                 packet.capture_time_us=captured_us;packet.event=input;
@@ -495,6 +517,32 @@ private:
         callbacks.feedback=[this](const std::string& peer,const hive::StreamFeedback& report) {
             const auto target=hosting_.load();if(!closing_&&target&&!target->revoked&&target->peer==peer&&target->session==report.session)host_.feedback(report);
         };
+        callbacks.input_ack=[this](const std::string& peer,const hive::InputAck& ack){
+            std::optional<hive::ReturnRequest> failed;
+            {
+                const std::lock_guard lock(view_intent_mutex_);
+                // Input ACKs are cumulative within one ordered broker lease.
+                // A later acknowledged release also proves this barrier ran.
+                if(!return_barrier_||return_barrier_->sent||!ack.injected||ack.sequence<return_barrier_->sequence||ack.session!=return_barrier_->request.session||peer!=return_barrier_->view->peer)return;
+                const auto target=return_barrier_->view;
+                return_barrier_->sent=true;
+                if(closing_||view_control_!=target||target->generation!=generation_||!transport_.send_return_request(peer,return_barrier_->request))failed=return_barrier_->request;
+            }
+            if(failed&&!closing_)shell_.returned(peer,{failed->session,failed->id,hive::ReturnResult::Stale});
+        };
+        callbacks.return_request=[this](const std::string& peer,const hive::ReturnRequest& request){
+            const auto control=hosting_.load();
+            const auto authorized=[this,control,peer,session=request.session]{return !closing_&&control&&hosting_.load()==control&&!control->revoked&&!control->warming&&control->input_enabled&&control->peer==peer&&control->session==session&&control->connection==transport_.connection_token(peer);};
+            if(!authorized()){transport_.send_return_reply(peer,{request.session,request.id,hive::ReturnResult::Stale});return;}
+            // The secure desktop hides this user's outbound viewer. The
+            // controller is looking at this machine's lock/login screen,
+            // not at a nested viewer left open behind it.
+            if(hive::input_desktop_name()!=L"Default"){
+                transport_.send_return_reply(peer,{request.session,request.id,hive::ReturnResult::Leaf});return;
+            }
+            shell_.return_one(peer,request,authorized);
+        };
+        callbacks.return_reply=[this](const std::string& peer,const hive::ReturnReply& reply){if(!closing_)shell_.returned(peer,reply);};
         callbacks.host_ended=[this](const std::string& peer,uint64_t session) {
             {const std::lock_guard lock(warm_mutex_);const auto found=warm_views_.find(peer);
                 if(found!=warm_views_.end()&&found->second->settings.session==session){found->second->failed=true;return;}}
@@ -859,7 +907,7 @@ private:
                 // replay overtaken by a newer presentation callback.
                 const auto cursor=viewer_.load()->cursor_presentation();
                 if(cursor.valid)shell_.update_cursor_composition(peer,cursor.session,cursor.sequence,cursor.composition);
-                status("Viewing "+hive::narrow(label)+" | HEVC 4:4:4 | Ctrl+Alt+` returns here");
+                status("Viewing "+hive::narrow(label)+" | HEVC 4:4:4 | Ctrl+Alt+` returns one level; Ctrl+Alt+Backspace returns here");
                 return;
             }
         }
@@ -956,6 +1004,8 @@ private:
     std::atomic<std::shared_ptr<const std::string>> active_,last_controlled_;
     std::atomic<std::shared_ptr<hive::HostControl>> hosting_;
     std::shared_ptr<const hive::ViewControl> view_control_; // Protected by view_intent_mutex_.
+    struct ReturnBarrier {std::shared_ptr<const hive::ViewControl> view;hive::ReturnRequest request;uint64_t sequence=0;bool sent=false;};
+    std::optional<ReturnBarrier> return_barrier_;uint64_t input_after_return_us_=0; // view_intent_mutex_
     std::map<std::string,uint64_t> legacy_kicked_; // Protected by host_mutex_.
     std::shared_ptr<hive::HostControl> kick_pending_; // Protected by kick_mutex_.
     std::atomic<bool> closing_=false,view_ready_=false,updating_=false;

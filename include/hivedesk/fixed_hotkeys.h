@@ -4,26 +4,28 @@
 #include <cstdint>
 
 namespace hive {
-enum class FixedHotkey { None, ReturnLocal, KickController };
+enum class FixedHotkey { None, ReturnLocal, KickController, ReturnOne };
 struct FixedHotkeyResult { bool consume=false; FixedHotkey action=FixedHotkey::None; };
 
 // Physical key state only. Windows virtual-key values identify modifiers;
-// scan 0x29 identifies the physical US backtick key independently of layout.
+// Scans 0x29/0x0e identify backtick/Backspace independently of keyboard layout.
 class FixedHotkeys {
 public:
     FixedHotkeyResult observe(uint32_t key,uint32_t scan,bool extended,bool up,bool injected) {
         if(injected)return {};
         if(key<down_.size())down_[key]=!up;
-        if(scan!=0x29||extended)return {};
-        if(backtick_consumed_) {
-            if(up)backtick_consumed_=false;
+        if((scan!=0x29&&scan!=0x0e)||extended)return {};
+        auto& consumed=scan==0x29?backtick_consumed_:backspace_consumed_;
+        if(consumed) {
+            if(up)consumed=false;
             return {true,FixedHotkey::None};
         }
         if(up)return {};
         const auto mods=modifiers();
-        const auto action=mods==7?FixedHotkey::KickController:mods==3?FixedHotkey::ReturnLocal:FixedHotkey::None;
+        const auto action=scan==0x0e?(mods==3?FixedHotkey::ReturnLocal:FixedHotkey::None):
+            mods==7?FixedHotkey::KickController:mods==3?FixedHotkey::ReturnOne:FixedHotkey::None;
         if(action==FixedHotkey::None)return {};
-        backtick_consumed_=true;
+        consumed=true;
         return {true,action};
     }
     uint32_t modifiers() const {
@@ -50,6 +52,6 @@ private:
     static constexpr std::array<ModifierKey,6> ModifierKeys{{{0x1d,false},{0x1d,true},{0x38,false},{0x38,true},{0x2a,false},{0x36,false}}};
     std::array<bool,256> down_{};
     std::array<bool,ModifierKeys.size()> forwarded_{};
-    bool backtick_consumed_=false;
+    bool backtick_consumed_=false,backspace_consumed_=false;
 };
 }

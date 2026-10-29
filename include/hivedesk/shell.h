@@ -2,6 +2,7 @@
 #include "types.h"
 #include "input_diagnostics.h"
 #include "clipboard.h"
+#include "nested_return.h"
 #include <windows.h>
 #include <functional>
 #include <future>
@@ -44,6 +45,9 @@ struct ShellCallbacks {
     std::function<bool()> restart_video;
     std::function<bool()> restart;
     std::function<bool(const std::vector<std::string>&)> save_order;
+    std::function<bool(const std::string&,const ReturnRequest&)> return_request;
+    std::function<bool(const std::string&,const ReturnReply&)> return_reply;
+    std::function<void(const std::string&,uint64_t)> return_finished;
 };
 class Shell {
 public:
@@ -79,6 +83,11 @@ public:
     void update_snapshot(const std::string& peer, Snapshot);
     void observe_cursor(const std::string& controller,uint64_t session=0);
     void cursor_input_applied(uint64_t session,uint64_t capture_us);
+    // The guard rechecks the authenticated inbound controller lease on the UI
+    // thread and again before applying a delayed downstream reply.
+    void return_one(const std::string& peer,ReturnRequest,std::function<bool()> authorized);
+    void return_previous();
+    void returned(const std::string& peer,ReturnReply);
     void update_cursor(const std::string& peer, CursorState);
     void update_cursor_composition(const std::string& peer,uint64_t session,uint64_t sequence,CursorComposition);
     void update_health(const std::string& peer,const StreamHealth&);
@@ -93,6 +102,7 @@ public:
     void taskbar_interaction_self_test();
     void quick_swap_interaction_self_test();
     void cursor_sync_self_test();
+    void nested_return_self_test();
 #endif
 private: struct Impl; Impl* impl_ = nullptr;
 };

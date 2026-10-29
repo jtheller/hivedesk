@@ -4,6 +4,7 @@
 #include "input_channel.h"
 #include "input_diagnostics.h"
 #include "clipboard.h"
+#include "nested_return.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -56,6 +57,8 @@ struct TransportCallbacks {
     std::function<bool(const std::string&, uint64_t)> input_begin;
     std::function<void(const std::string&, const InputPacket&)> input_packet;
     std::function<void(const std::string&, const InputAck&)> input_ack;
+    std::function<void(const std::string&, const ReturnRequest&)> return_request;
+    std::function<void(const std::string&, const ReturnReply&)> return_reply;
 };
 // Explicit developer diagnostic: generated data only, bounded duration/rate.
 struct PathProbeResult {
@@ -94,6 +97,8 @@ public:
     // Drop unsent old work, cancel its ACK deadline and queue one ordered release.
     bool end_input(const std::string& peer, uint64_t session);
     bool send_input_ack(const std::string& peer, const InputAck&);
+    bool send_return_request(const std::string& peer,const ReturnRequest&);
+    bool send_return_reply(const std::string& peer,const ReturnReply&);
     InputDiagnostics input_diagnostics(const std::string& peer) const;
     bool send_clipboard(const std::string& peer, const std::wstring&);
     bool send_clipboard_offer(const std::string&,const ClipboardOffer&);

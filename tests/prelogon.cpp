@@ -39,6 +39,8 @@ int main(){try{
         const bootstrap::Identity identity{L"0123456789abcdef0123456789abcdef",L"Isolated prelogon test",true};
         require(endpoint.start(identity,error,port,false),error.c_str());
         Transport viewer;std::atomic<int> acks=0,ended=0;TransportCallbacks cb;
+        std::atomic<unsigned> leaves=0,stale_returns=0;
+        cb.return_reply=[&](const std::string&,const ReturnReply& r){if(r.result==ReturnResult::Leaf)++leaves;else if(r.result==ReturnResult::Stale)++stale_returns;};
         cb.input_ack=[&](const std::string&,const InputAck& a){if(a.injected)++acks;};
         cb.host_ended=[&](const std::string&,uint64_t){++ended;};
         require(viewer.start({"prelogon-viewer","Generated viewer","",0,false,true},std::move(cb),error),error.c_str());
@@ -46,6 +48,7 @@ int main(){try{
         StreamSettings request;request.session=51;request.receiver_millihz=60000;request.warm=true;
         require(viewer.request_stream(peer,request),"Warm request");await([]{return FakeHost::starts==1;},"Warm did not start broker");
         require(viewer.begin_input(peer,51),"Warm input request");Sleep(80);require(!viewer.input_ready(peer,51)&&FakeHost::inputs==0,"Warm granted input authority");
+        require(viewer.send_return_request(peer,{51,1,15}),"Warm return request");await([&]{return stale_returns==1;},"Warm lease granted nested-return authority");
         require(viewer.preview(peer,51,true),"Peek request");await([]{return FakeHost::previews==1;},"Peek not forwarded");
         require(viewer.request_stream(peer,request),"Warm renewal");Sleep(50);require(FakeHost::starts==1,"Renewal restarted capture");
         request.warm=false;require(viewer.request_stream(peer,request),"Promotion request");await([]{return FakeHost::promotions==1;},"Warm promotion failed");
@@ -54,6 +57,8 @@ int main(){try{
         require(viewer.send_input(peer,packet),"Synthetic input enqueue");await([&]{return acks==1;},"Independent ACK not returned");
         // FakeHost consumes this event; no SendInput or desktop changes occur.
         require(FakeHost::inputs==1,"Unexpected injected-event count");
+        require(viewer.send_return_request(peer,{51,2,15}),"Prelogon return request");await([&]{return leaves==1;},"Prelogon did not report leaf");
+        require(viewer.send_return_request(peer,{52,3,15}),"Wrong-session return request");await([&]{return stale_returns==2;},"Wrong session received return authority");
         const auto before=FakeHost::stops.load();viewer.cancel_warm(peer,51);Sleep(50);require(FakeHost::stops==before,"Late warm cancellation stopped promoted control");
         viewer.stop_stream(peer);await([&]{return FakeHost::stops>before;},"Stop did not release broker");
         require(viewer.connection_token(peer)!=0,"Stopping host unnecessarily broke network pair");

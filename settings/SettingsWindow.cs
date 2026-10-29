@@ -89,7 +89,7 @@ internal sealed class SettingsWindow : Window
         relativeMouse.IsEnabled = bridge.RelativeMouseAvailable();
         content.Children.Add(Card(Stack(8, tools, Stack(0, gpuPerformance, gpuPolicyHint))));
         var footer = new Grid { ColumnSpacing = 16 }; footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var escape = Hint("Ctrl + Alt + `  returns here"); escape.VerticalAlignment = VerticalAlignment.Center; footer.Children.Add(escape); Grid.SetColumn(saveStatus, 1); footer.Children.Add(saveStatus);
+        var escape = Hint("Ctrl + Alt + `  back one level"); ToolTipService.SetToolTip(escape, "Ctrl + Alt + Backspace returns directly to this computer.\nCtrl + Shift + Alt + ` disconnects its controller."); escape.VerticalAlignment = VerticalAlignment.Center; footer.Children.Add(escape); Grid.SetColumn(saveStatus, 1); footer.Children.Add(saveStatus);
         content.Children.Add(footer); content.Children.Add(feedback);
         saveTimer.Tick += async (_, _) => { saveTimer.Stop(); await Save(); };
         retrySave.Click += async (_, _) => await Save();

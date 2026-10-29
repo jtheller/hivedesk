@@ -55,6 +55,13 @@ public:
         cb.cancel_warm=[this](const std::string& peer,uint64_t session){std::lock_guard lock(lifecycle_);auto c=current_.load();if(c&&c->warming&&c->peer==peer&&c->session==session)stop_host();};
         cb.preview=[this](const std::string& peer,uint64_t session,bool enabled){std::lock_guard lock(lifecycle_);auto c=current_.load();if(current(c)&&c->warming&&c->peer==peer&&c->session==session){c->previewing=enabled;c->warm_until=GetTickCount64()+10000;if(!host_.preview(enabled))stop_host();}};
         cb.input_begin=[this](const std::string& peer,uint64_t session){std::lock_guard lock(lifecycle_);auto c=current_.load();if(!current(c)||c->warming||c->peer!=peer||c->session!=session)return false;c->input_enabled=true;return true;};
+        cb.return_request=[this](const std::string& peer,const ReturnRequest& request){
+            const auto c=current_.load();
+            const bool authorized=current(c)&&!c->warming&&c->input_enabled&&c->peer==peer&&c->session==request.session&&c->connection==transport_.connection_token(peer);
+            // There is no outbound viewer before logon, but advertise/answer
+            // the same protocol so escape never waits for a nonexistent Shell.
+            transport_.send_return_reply(peer,{request.session,request.id,authorized?ReturnResult::Leaf:ReturnResult::Stale});
+        };
         cb.input_packet=[this](const std::string& peer,const InputPacket& packet){
             auto c=current_.load();if(!current(c)||c->warming||!c->input_enabled||c->peer!=peer||c->session!=packet.session){transport_.end_stream(peer,packet.session);return;}
             if(!host_.input(packet)){InputAck ack;ack.session=packet.session;ack.sequence=packet.sequence;ack.capture_time_us=packet.capture_time_us;transport_.send_input_ack(peer,ack);}

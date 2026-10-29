@@ -107,6 +107,10 @@ struct InputCapture::Impl {
                 if(route.enabled)s->fixed.release_forwarded_modifiers([&](uint32_t scan,bool extended){s->emit(route,{InputKind::Key,int32_t(scan),1,extended?1:0},now);});
                 s->post(CaptureAction::KickController,route.state->generation);
             }else if(fixed.action==FixedHotkey::ReturnLocal)s->escape(route,now);
+            else if(fixed.action==FixedHotkey::ReturnOne){
+                if(route.enabled)s->emit(route,{InputKind::ReleaseAll},now);
+                s->post(CaptureAction::ReturnOne,route.state->generation);
+            }
             return 1;
         }
         if(s->summon_key_up==k.vkCode){if(up)s->summon_key_up=0;return 1;}
@@ -279,7 +283,10 @@ bool InputCapture::routing_self_test(std::string& result){
         key(VK_CONTROL,0x1d);key(VK_MENU,0x38);key(VK_SHIFT,0x2a);
         require(key(VK_OEM_3,0x29)==1,"Kick chord was not intercepted");action(CaptureAction::KickController);
         key(VK_OEM_3,0x29,true);key(VK_SHIFT,0x2a,true);
-        require(key(VK_OEM_3,0x29)==1,"Escape chord was not intercepted");action(CaptureAction::ReturnLocal);
+        require(key(VK_OEM_3,0x29)==1,"Nested escape chord was not intercepted");action(CaptureAction::ReturnOne);
+        require(s.snapshot().enabled,"Nested escape prematurely revoked outer control");
+        key(VK_OEM_3,0x29,true);
+        require(key(VK_BACK,0x0e)==1,"Emergency escape chord was not intercepted");action(CaptureAction::ReturnLocal);
         require(!s.snapshot().enabled&&s.queue.size()==1&&s.queue.pop()->event.kind==InputKind::ReleaseAll,"Escape failed to revoke and release remote input immediately");
         require(!capture.cursor_position_allowed(state.session,UINT64_MAX),"Escape retained cursor correction authority");
         key(VK_OEM_3,0x29,true);key(VK_MENU,0x38,true);key(VK_CONTROL,0x1d,true);quiet();

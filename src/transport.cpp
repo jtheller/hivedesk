@@ -52,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -214,7 +214,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -987,6 +987,17 @@ struct Transport::Impl {
         }
         case Start: { StreamSettings settings; settings.fps = r.dword(); settings.bitrate_mbps = r.dword(); if (!r.end() || !settings.bitrate_mbps || settings.bitrate_mbps > 10000) return false; if (callbacks.start_stream) callbacks.start_stream(c.peer.id,settings); return true; }
         case Stop: if (!r.end()) return false; if (callbacks.stop_stream) callbacks.stop_stream(c.peer.id); return true;
+        case ReturnStep: case ReturnDone: {
+            const auto session=r.qword(),id=r.qword();const auto value=r.byte();
+            if(!(c.peer.features&FeatureNestedReturn)||!session||!id||!r.end())return false;
+            if(type==ReturnStep){
+                if(value>16)return false;
+                if(callbacks.return_request)callbacks.return_request(c.peer.id,{session,id,value});
+            }else {
+                if(value>uint8_t(ReturnResult::Timeout))return false;
+                if(callbacks.return_reply)callbacks.return_reply(c.peer.id,{session,id,ReturnResult(value)});
+            }return true;
+        }
         case HostEnded: {
             const auto session=r.qword();if(!(c.peer.features&FeatureHostKick)||!session||!r.end())return false;
             if(auto input=find_input(c.peer.id))input->revoke_input(session);
@@ -1237,6 +1248,14 @@ bool Transport::end_stream(const std::string& peer,uint64_t session) {
     if(video&&video->datagram)video->datagram->cancel(session);
     if(!control||!(control->peer.features&FeatureHostKick))return input_notified;
     Bytes b{HostEnded};u64(b,session);const bool control_notified=control->enqueue(std::move(b));return input_notified||control_notified;
+}
+bool Transport::send_return_request(const std::string& peer,const ReturnRequest& request) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureNestedReturn)||!request.session||!request.id||request.hops>16)return false;
+    Bytes b{ReturnStep};u64(b,request.session);u64(b,request.id);b.push_back(request.hops);return c->enqueue(std::move(b));
+}
+bool Transport::send_return_reply(const std::string& peer,const ReturnReply& reply) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureNestedReturn)||!reply.session||!reply.id||uint8_t(reply.result)>uint8_t(ReturnResult::Timeout))return false;
+    Bytes b{ReturnDone};u64(b,reply.session);u64(b,reply.id);b.push_back(uint8_t(reply.result));return c->enqueue(std::move(b));
 }
 bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
     auto c = impl_->find(peer,true); if (!c || frame.data.empty() || frame.data.size() > kMaxFrame || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384) return false;
@@ -1501,6 +1520,26 @@ bool Transport::discovery_self_test(std::string& result){
     result="PASS: automatic broadcast discovery established all three encrypted channels, rediscovered listener and initiator restarts independently, and replaced a broken video/control/input set without connect() or an IP argument.";return true;
 }
 bool Transport::self_test(std::string& result) {
+    {
+        Transport sender;auto& owner=*sender.impl_;
+        auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);control->ready=true;
+        control->peer.id="return-peer";control->peer.features=FeatureNestedReturn;
+        owner.connected[control->peer.id]={control,{}};ReturnRequest request;ReturnReply reply;
+        owner.callbacks.return_request=[&](const std::string&,const ReturnRequest& r){request=r;};
+        owner.callbacks.return_reply=[&](const std::string&,const ReturnReply& r){reply=r;};
+        if(!sender.send_return_request("return-peer",{91,7,15})||!owner.dispatch(*control,control->control.back())||request.session!=91||request.id!=7||request.hops!=15){result="Nested return request serialization";return false;}
+        const auto packet=control->control.back();auto malformed=packet;malformed.pop_back();
+        if(owner.dispatch(*control,malformed)){result="Truncated nested return accepted";return false;}
+        malformed=packet;malformed.back()=17;
+        if(owner.dispatch(*control,malformed)){result="Unbounded nested return accepted";return false;}
+        malformed=packet;std::fill(malformed.begin()+1,malformed.begin()+9,0);
+        if(owner.dispatch(*control,malformed)||sender.send_return_request("return-peer",{91,0,15})){result="Invalid nested return identity accepted";return false;}
+        if(!sender.send_return_reply("return-peer",{91,7,ReturnResult::Returned})||!owner.dispatch(*control,control->control.back())||reply.session!=91||reply.id!=7||reply.result!=ReturnResult::Returned){result="Nested return reply serialization";return false;}
+        malformed=control->control.back();malformed.back()=6;
+        if(owner.dispatch(*control,malformed)){result="Invalid nested return result accepted";return false;}
+        control->peer.features=0;
+        if(owner.dispatch(*control,packet)||sender.send_return_request("return-peer",{91,7,15})){result="Unnegotiated nested return accepted";return false;}
+    }
     {
         Transport sender;auto& owner=*sender.impl_;
         auto control=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);control->ready=true;
@@ -2378,6 +2417,9 @@ bool Transport::self_test(std::string& result) {
     bcb.stop_stream = [&](const std::string&) { std::lock_guard lock(mutex); got_stop = true; cv.notify_all(); };
     bcb.frame = [&](const std::string&,EncodedFrame f) { std::lock_guard lock(mutex); received_frame = f.width == 1920 && f.height == 1080 && f.sequence == 42 && f.capture_time_us == 123456 && f.source_ready_us == 124500 && f.session == 77 && f.keyframe && f.cursor_composition==CursorComposition::NoSeparate && f.data == Bytes({0,0,0,1,42,99}) && f.receive_started_us>1 && f.receive_completed_us>=f.receive_started_us && f.receive_progress && f.receive_progress->load()>=f.data.size(); cv.notify_all(); };
     TransportCallbacks acb; acb.clipboard = [&](const std::string&,const std::wstring& s) { std::lock_guard lock(mutex); returned_text = s == L"return"; cv.notify_all(); };
+    bool got_return=false;
+    bcb.return_request=[&](const std::string& peer,const ReturnRequest& r){b.send_return_reply(peer,{r.session,r.id,ReturnResult::Leaf});};
+    acb.return_reply=[&](const std::string& peer,const ReturnReply& r){std::lock_guard lock(mutex);got_return=peer=="test-b"&&r.session==91&&r.id==17&&r.result==ReturnResult::Leaf;cv.notify_all();};
     acb.host_ended=[&](const std::string& peer,uint64_t session){std::lock_guard lock(mutex);got_host_ended=peer=="test-b"&&session==91;cv.notify_all();};
     acb.diagnostics=[&](const std::string&,const SourceDiagnostics& d){std::lock_guard lock(mutex);const bool base=d.session==91&&d.encoded_millihz==59940&&d.encode_us==1234&&d.capture_wait_us==5678&&d.send_wait_us_per_second==9000&&d.feedback_age_us==11000&&d.network_extra_us==13000;if(d.encode_details)got_encode_diagnostics=base&&d.color_us==500&&d.nvenc_us==734&&d.encode_age_us==10000;else got_diagnostics=base;cv.notify_all();};
     bcb.snapshot_request=[&](const std::string& peer,uint64_t request,bool native){b.send_snapshot(peer,{request,native?Bytes(1200*1024,42):Bytes({0xff,0xd8,42,0xff,0xd9}),native});};
@@ -2398,12 +2440,12 @@ bool Transport::self_test(std::string& result) {
     if (!wrong.start(wcfg,{},error)) { result = "Wrong-key test setup failed."; return false; }
     if (wrong.connect("127.0.0.1",b.impl_->cfg.port,id,error) || !wrong.peers().empty()) { result = "Wrong Network Key was accepted."; return false; }
     CursorState cursor;cursor.session=91;cursor.input_capture_us=123456;cursor.position_valid=true;cursor.x=12345;cursor.y=54321;cursor.position_revision=77;cursor.width=2;cursor.height=1;cursor.hotspot_x=1;cursor.mask=Bytes(8,0xff);
-    bool ok=a.request_snapshot("test-b",901)&&b.send_cursor("test-a",cursor)&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000});
+    bool ok=a.send_return_request("test-b",{91,17,15})&&a.request_snapshot("test-b",901)&&b.send_cursor("test-a",cursor)&&b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000});
     // Check both wire formats after delivery. Unsent diagnostic states now
     // intentionally coalesce; the separate queue test verifies that behavior.
     {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_diagnostics;})&&ok;}
     ok=b.send_diagnostics("test-a",{91,59940,1234,5678,9000,11000,13000,500,734,10000,true})&&ok;
-    {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_snapshot&&got_cursor&&got_diagnostics&&got_encode_diagnostics;})&&ok;
+    {std::unique_lock lock(mutex);ok=cv.wait_for(lock,std::chrono::seconds(5),[&]{return got_return&&got_snapshot&&got_cursor&&got_diagnostics&&got_encode_diagnostics;})&&ok;
         ok=ok&&state==0&&snapshot_count==1;}
     if(!ok){result="Auxiliary loopback failed: snapshot="+std::to_string(got_snapshot)+" cursor="+std::to_string(got_cursor)+" diagnostics="+std::to_string(got_diagnostics)+" encode="+std::to_string(got_encode_diagnostics);return false;}
     cursor.width=cursor.height=cursor.hotspot_x=0;cursor.mask.clear();cursor.visible=false;

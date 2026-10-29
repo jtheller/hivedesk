@@ -1,0 +1,44 @@
+void Shell::nested_return_self_test(){
+    auto& s=*impl_;
+    const auto require=[](bool ok,const char* why){if(!ok)throw std::runtime_error(why);};
+    USEROBJECTFLAGS flags{};DWORD bytes=0;
+    require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Nested regression requires isolated station");
+    auto saved=s.callbacks;const auto peers=s.peers;
+    struct Cleanup{Impl& s;ShellCallbacks callbacks;std::vector<Peer> peers;~Cleanup(){s.local(false);s.callbacks=std::move(callbacks);s.peers=std::move(peers);}} cleanup{s,saved,peers};
+    unsigned closes=0,sends=0;ReturnRequest sent;ReturnReply reply;
+    s.callbacks.return_local=[&]{++closes;};
+    s.callbacks.return_request=[&](const std::string&,const ReturnRequest& r){++sends;sent=r;return true;};
+    s.callbacks.return_reply=[&](const std::string&,const ReturnReply& r){reply=r;return true;};
+    const auto viewing=[&](uint64_t session){
+        s.local(false);s.end_peek(false);s.taskbar_focus_guard=false;
+        s.peers={{"nested-child","Child","",47980,true,FeatureNestedReturn}};
+        ++s.generation;s.selection_armed=true;s.remote=true;s.active_id=s.pending_id="nested-child";s.input_session=session;s.publish_input();
+    };
+    viewing(11);s.return_begin();require(s.nested_return.busy()&&s.input_state().local_shell,"pending return did not yield input authority");
+    const auto first=sent;s.return_begin();require(sends==1,"rapid repeat queued another unwind");
+    returned("nested-child",{11,first.id,ReturnResult::Returned});
+    require(closes==0&&s.remote&&!s.nested_return.busy()&&!s.input_state().local_shell,"successful child unwind also closed parent or stranded input");
+    s.return_begin();returned("nested-child",{11,sent.id,ReturnResult::Leaf});
+    require(closes==1&&!s.remote&&s.input_session==0,"leaf return did not release local viewer");
+    viewing(12);bool authorized=true;
+    return_one("parent",{77,1,15},[&]{return authorized;});const auto old=sent;
+    authorized=false;returned("nested-child",{12,old.id,ReturnResult::Leaf});
+    require(closes==1&&s.remote&&reply.result==ReturnResult::Stale,"revoked inbound controller closed a viewer");
+    authorized=true;return_one("parent",{77,2,15},[&]{return authorized;});
+    const auto old2=sent;++s.generation;
+    returned("nested-child",{12,old2.id,ReturnResult::Leaf});
+    require(closes==1&&reply.result==ReturnResult::Stale,"queued reply closed a new generation");
+    const auto count=sends;return_one("parent",{77,2,15},[]{return true;});
+    require(sends==count&&reply.result==ReturnResult::Stale,"duplicate command restarted an unwind");
+    return_one("parent",{77,3,0},[]{return true;});require(reply.result==ReturnResult::Limit&&s.remote,"hop limit closed a view");
+    return_one("parent",{77,4,15},[]{return true;});
+    return_one("cycle",{88,1,14},[]{return true;});require(reply.result==ReturnResult::Busy,"cycle was not bounded by busy admission");
+    const auto pending=sent;s.local(true);
+    returned("nested-child",{12,pending.id,ReturnResult::Leaf});require(closes==2&&!s.remote,"late reply repeated emergency return");
+    return_one("parent",{77,5,15},[]{return true;});require(reply.result==ReturnResult::Leaf&&closes==2,"leaf node unwound inbound stream");
+    viewing(13);s.peers[0].features=0;s.return_begin();require(closes==3&&!s.remote,"legacy boundary lost old local escape");
+    viewing(0);s.return_begin();require(closes==4&&!s.remote,"connecting selection could not be cancelled");
+    viewing(14);s.return_begin();
+    s.return_complete(s.nested_return.tick(GetTickCount64()+10001,s.return_view(),true));
+    require(s.remote&&!s.nested_return.busy()&&!s.input_state().local_shell&&closes==4,"timeout closed or stranded outer desktop");
+}

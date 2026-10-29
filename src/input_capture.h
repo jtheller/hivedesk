@@ -8,7 +8,7 @@
 
 namespace hive {
 // Posted to the owner; never executes UI, clipboard, or network work in a hook.
-enum class CaptureAction : WPARAM { ReturnLocal=1, KickController, HidePanel, HidePanelAnimated, Summon, Failed };
+enum class CaptureAction : WPARAM { ReturnLocal=1, KickController, HidePanel, HidePanelAnimated, Summon, Failed, ReturnOne };
 struct InputCaptureState {
     uint64_t generation=0,session=0;
     std::string peer;

@@ -57,6 +57,7 @@ int probe(){
     };
     shell.taskbar_interaction_self_test();
     shell.quick_swap_interaction_self_test();
+    shell.nested_return_self_test();
     std::puts("PASS exact-corner quick swap: click-only corner, card-only Peek through timer/mouse, local/remote/previous peer, cancellation, edge expansion and 100/150/200% scaling");
     // This station owns its own clipboard; the user's clipboard is untouched.
     for(const std::wstring value:{L"First desktop\n\u4e2d\u6587 \U0001f642",L"",L"Second desktop\r\nUS keyboard"}){

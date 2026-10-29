@@ -280,6 +280,9 @@ struct Shell::Impl {
     POINT physical_pointer{};
     ULONGLONG last_local_motion=0;
     InputCapture input_capture;uint64_t input_session=0,last_capture_pointer_revision=0;
+    NestedReturn nested_return;
+    std::function<bool()> return_authorized;
+    std::string return_parent_peer;uint64_t return_parent_session=0,return_parent_id=0;
     std::wstring status=L"Ready on your local network";
     bool remote=false,shutting_down=false,selection_armed=false,reconnecting=false;
     bool relative_mode=false,raw_mouse_available=false;
@@ -306,7 +309,7 @@ struct Shell::Impl {
     InputCaptureState input_state(bool keep_taskbar_guard=false) {
         InputCaptureState state;state.generation=generation.load();state.session=input_session;state.peer=active_id;
         if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
-        state.local_shell=taskbar_peek.active()||taskbar_focus_guard||!peek_id.empty()||!fading_peeks.empty();
+        state.local_shell=nested_return.busy()||taskbar_peek.active()||taskbar_focus_guard||!peek_id.empty()||!fading_peeks.empty();
         state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel=panel;state.panel_visible=panel&&(GetWindowLongPtrW(panel,GWL_STYLE)&WS_VISIBLE);state.panel_summoned=panel_summoned;
@@ -532,7 +535,55 @@ struct Shell::Impl {
             cursor_sent=true;sent_cursor=info.hCursor;sent_cursor_visible=visible;sent_pointer_revision=pointer_revision;
         }
     }
+    NestedReturn::View return_view()const {
+        return {selection_armed?(pending_id.empty()?active_id:pending_id):active_id,input_session,generation.load()};
+    }
+    bool return_parent_valid()const{return !return_authorized||return_authorized();}
+    void return_complete(std::optional<NestedReturn::Completion> done) {
+        if(!done)return;
+        return_authorized={};
+        if(callbacks.return_finished)callbacks.return_finished(done->view.peer,done->view.session);
+        if(done->close)local(true);
+        else {publish_input();confine_mouse();}
+        log("Nested return: peer="+done->view.peer+" session="+std::to_string(done->view.session)+" result="+std::to_string(int(done->result))+" closed="+std::to_string(done->close));
+        if(!done->parent.peer.empty()) {
+            if(callbacks.return_reply)callbacks.return_reply(done->parent.peer,{done->parent.request.session,done->parent.request.id,done->result});
+        }else if(done->result!=ReturnResult::Returned){
+            status=L"Could not return one level. Ctrl+Alt+Backspace returns directly to this computer.";
+        }
+    }
+    void return_begin(NestedReturn::Parent parent={},std::function<bool()> authorized={}) {
+        const auto respond=[&](ReturnResult result){if(!parent.peer.empty()&&callbacks.return_reply)callbacks.return_reply(parent.peer,{parent.request.session,parent.request.id,result});};
+        if(shutting_down||(authorized&&!authorized())){respond(ReturnResult::Stale);return;}
+        if(!parent.peer.empty()){
+            if(return_parent_peer!=parent.peer||return_parent_session!=parent.request.session){
+                return_parent_peer=parent.peer;return_parent_session=parent.request.session;return_parent_id=0;
+            }
+            if(parent.request.id<=return_parent_id){respond(ReturnResult::Stale);return;}
+            return_parent_id=parent.request.id;
+        }
+        if(nested_return.busy()){respond(ReturnResult::Busy);return;}
+        const auto view=return_view();
+        if(view.peer.empty()){
+            if(parent.peer.empty())local(true);else respond(ReturnResult::Leaf);
+            return;
+        }
+        const auto hops=parent.peer.empty()?16:parent.request.hops;
+        if(!hops){respond(ReturnResult::Limit);return;}
+        const auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==view.peer;});
+        // Connecting has no active input lease yet. An old peer cannot report
+        // a nested view; retain the pre-upgrade one-hop escape for that boundary.
+        if(!view.session||peer==peers.end()||!(peer->features&FeatureNestedReturn)){
+            local(true);respond(ReturnResult::Returned);return;
+        }
+        return_authorized=std::move(authorized);
+        const auto request=nested_return.begin(view,std::move(parent),uint8_t(hops-1),GetTickCount64());
+        publish_input();ClipCursor(nullptr);
+        if(!callbacks.return_request||!callbacks.return_request(view.peer,request))
+            return_complete(nested_return.reply(view.peer,{request.session,request.id,ReturnResult::Stale},return_view(),return_parent_valid()));
+    }
     void local(bool notify) {
+        return_complete(nested_return.cancel());
         cancel_connection_hint();
         ++generation;remote=false;reconnecting=false;input_session=0;publish_input();
         // Remove video before its cover, including Escape during a fade.
@@ -578,7 +629,7 @@ struct Shell::Impl {
         publish_input();
     }
     void confine_mouse() {
-        if(!remote||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
+        if(!remote||nested_return.busy()||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
         RECT r=viewer_client();
         if(relative_mode){int x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;r={x,y,x+1,y+1};SetCursorPos(x,y);}
         ClipCursor(&r);
@@ -587,7 +638,7 @@ struct Shell::Impl {
         relative_mode=enabled&&raw_mouse_available;confine_mouse();
         apply_remote_cursor();
         publish_input();
-        status=relative_mode?L"Relative mouse on. Ctrl+Alt+` returns locally.":L"Absolute desktop mouse";
+        status=relative_mode?L"Relative mouse on. Ctrl+Alt+` returns one level; Ctrl+Alt+Backspace returns locally.":L"Absolute desktop mouse";
         InvalidateRect(panel,nullptr,FALSE);
     }
     bool own_surface(POINT p) const {
@@ -599,7 +650,7 @@ struct Shell::Impl {
         remove=remove||!config.desktop.tray_icon;
         if(!remove&&tray_present)return;
         NOTIFYICONDATAW n{};n.cbSize=sizeof(n);n.hWnd=owner;n.uID=1;n.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;n.uCallbackMessage=TrayMessage;
-        n.hIcon=app_small_icon;wcscpy_s(n.szTip,L"HiveDesk - Ctrl+Alt+` returns to this computer");
+        n.hIcon=app_small_icon;wcscpy_s(n.szTip,L"HiveDesk - Ctrl+Alt+` back one level; Ctrl+Alt+Backspace local");
         if(remove){Shell_NotifyIconW(NIM_DELETE,&n);tray_present=false;RemovePropW(owner,L"HiveDesk.TrayVisible");}
         else if(Shell_NotifyIconW(NIM_ADD,&n)){tray_present=true;SetPropW(owner,L"HiveDesk.TrayVisible",reinterpret_cast<HANDLE>(1));n.uVersion=NOTIFYICON_VERSION_4;Shell_NotifyIconW(NIM_SETVERSION,&n);}
     }
@@ -689,6 +740,7 @@ struct Shell::Impl {
         if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
     }
     void timer() {
+        return_complete(nested_return.tick(GetTickCount64(),return_view(),return_parent_valid()));
         tick_peek();publish_visible();collect_viewers();
         // Latest-state mailbox: no per-report UI messages or stale report FIFO.
         std::optional<PendingSource> incoming;
@@ -928,6 +980,7 @@ struct Shell::Impl {
                 if(s->shutting_down||uint64_t(l)!=s->generation.load())return 0;
                 switch(action){
                 case CaptureAction::ReturnLocal:s->local(true);break;
+                case CaptureAction::ReturnOne:s->return_begin();break;
                 case CaptureAction::Failed:s->local(true);s->status=L"Input channel stalled. Returned to this computer.";break;
                 case CaptureAction::HidePanel:s->hide_panel();break;
                 case CaptureAction::HidePanelAnimated:s->hide_panel(true,s->taskbar_peek.active());break;
@@ -1153,6 +1206,7 @@ void Shell::close(){if(impl_){delete impl_;impl_=nullptr;log("Shell shutdown: co
 #include "../tests/shell_taskbar_regression.inc"
 #include "../tests/shell_corner_regression.inc"
 #include "../tests/shell_cursor_regression.inc"
+#include "../tests/shell_nested_regression.inc"
 #endif
 bool Shell::create(HINSTANCE instance,const ShellConfig& config,ShellCallbacks callbacks,std::string& error){return impl_->create(instance,config,std::move(callbacks),error);}
 int Shell::run(){MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){if(impl_->settings&&!impl_->settings_process&&IsDialogMessageW(impl_->settings,&m))continue;TranslateMessage(&m);DispatchMessageW(&m);}return static_cast<int>(m.wParam);}
@@ -1265,6 +1319,13 @@ void Shell::observe_cursor(const std::string& controller,uint64_t session) {
     });
 }
 void Shell::cursor_input_applied(uint64_t session,uint64_t capture_us){impl_->input_capture.cursor_input_applied(session,capture_us);}
+void Shell::return_one(const std::string& peer,ReturnRequest request,std::function<bool()> authorized){
+    impl_->dispatch([s=impl_,peer,request,authorized=std::move(authorized)]{s->return_begin({peer,request},authorized);});
+}
+void Shell::return_previous(){impl_->dispatch([s=impl_]{s->return_begin();});}
+void Shell::returned(const std::string& peer,ReturnReply reply){
+    impl_->dispatch([s=impl_,peer,reply]{s->return_complete(s->nested_return.reply(peer,reply,s->return_view(),s->return_parent_valid()));});
+}
 void Shell::update_health(const std::string& peer,const StreamHealth& health) {
     const auto generation=impl_->generation.load();
     impl_->dispatch([s=impl_,peer,health,generation] {

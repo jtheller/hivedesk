@@ -29,8 +29,17 @@ int main(){try {
         const auto up=keys.observe(0xc0,0x29,false,true,false);
         require(up.consume&&up.action==FixedHotkey::None,"kick key-up escaped to the peer");
         const auto escape=keys.observe(0xc0,0x29,false,false,false);
-        require(escape.consume&&escape.action==FixedHotkey::ReturnLocal,"Ctrl Alt backtick did not remain a separate escape");
+        require(escape.consume&&escape.action==FixedHotkey::ReturnOne,"Ctrl Alt backtick did not remain a separate escape");
         require(keys.observe(0xc0,0x29,false,true,false).consume,"escape key-up not consumed");
+    }
+    {
+        FixedHotkeys keys;modifiers(keys,false,false);
+        require(keys.observe(8,0x0e,false,false,false).action==FixedHotkey::ReturnLocal,"emergency local escape missing");
+        require(keys.observe(8,0x0e,false,false,false).action==FixedHotkey::None,"emergency escape repeated");
+        require(keys.observe(8,0x0e,false,true,false).consume,"emergency key-up leaked");
+        require(!keys.observe(8,0x0e,false,false,true).consume,"injected emergency escape accepted");
+        keys.observe(0xa0,0x2a,false,false,false);
+        require(!keys.observe(8,0x0e,false,false,false).consume,"extra shift accepted for emergency escape");
     }
     {
         FixedHotkeys keys;modifiers(keys,false,true,true);

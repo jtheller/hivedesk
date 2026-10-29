@@ -154,7 +154,9 @@ impersonator. No universal shared password is embedded in the application.
   They use real WinUI 3 controls, system light/dark theme and accent, with
   Mica on Windows 11 and a themed background on Windows 10. Open from the tray,
   Start menu or by opening HiveDesk.exe, even when the agent is already running. The Win8-inspired switcher remains native.
-- Ctrl+Alt+physical backtick key returns directly to the local desktop.
+- Ctrl+Alt+physical backtick returns one remote level: A -> B -> C first returns to B, then to A.
+- Ctrl+Alt+Backspace returns directly to the computer at your keyboard, without waiting for the network.
+- Nested return requires 0.10.0 or later along the chain. At an older-version boundary, it retains the previous local-return behavior.
 - Ctrl+Shift+Alt+physical backtick disconnects the controller of this computer.
   This fixed shortcut accepts physical keyboard input on the normal desktop,
   releases injected keys/buttons, and leaves your own outbound viewer alone.
@@ -296,7 +298,7 @@ Hover at the primary screen's top-left corner for the previous-computer card,
 then move down along the left edge to expand the computer list. Click a computer
 to enter its desktop. Right-click the sidebar or tray for Settings. For games,
 enable Relative mouse in the tray menu; escape back locally before
-using the corner in that mode. Ctrl+Alt+physical backtick always returns locally.
+using the corner in that mode. Ctrl+Alt+physical backtick returns one level; Ctrl+Alt+Backspace always returns locally.
 
 The active desktop's copied text updates your local cache. Switching sends that cache to
 the next computer when switching. During a lock screen or a temporarily busy

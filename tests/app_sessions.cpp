@@ -10,7 +10,7 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic events on interactive station");
     const auto profile=std::filesystem::temp_directory_path()/(L"HiveDesk-AppSessions-"+std::to_wstring(GetCurrentProcessId()));std::filesystem::create_directories(profile);SetEnvironmentVariableW(L"LOCALAPPDATA",profile.c_str());
     auto encoded=hive::media_generated_test_frame();
-    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;};
+    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0;};
     std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0,previews=0,preview_stops=0,visible_previews=0;std::atomic<bool> bad_handoff=false;
     for(unsigned i=0;i<3;++i){auto& p=peers[i];hive::TransportCallbacks cb;
         cb.clipboard=[&p](const std::string&,const std::wstring&){std::lock_guard lock(p.mutex);p.handoff=true;};
@@ -20,7 +20,11 @@ int probe(){
         cb.cancel_warm=[&p](const std::string&,uint64_t s){if(p.session==s&&p.warm)p.remaining=0;};
         cb.feedback=[&p](const std::string&,const hive::StreamFeedback& f){std::lock_guard lock(p.mutex);if(f.session==p.session&&f.recover&&!p.remaining)p.remaining=1;};
         cb.input_begin=[&p,&bad_handoff](const std::string&,uint64_t){if(p.warm){bad_handoff=true;return false;}return true;};
-        cb.input_packet=[&p](const std::string& id,const hive::InputPacket& in){p.net.send_input_ack(id,{in.session,in.sequence,in.capture_time_us,0,0,true});};
+        cb.input_packet=[&p](const std::string& id,const hive::InputPacket& in){
+            {std::lock_guard lock(p.mutex);if(p.hold_release&&in.event.kind==hive::InputKind::ReleaseAll){p.held_release=in;return;}}
+            p.net.send_input_ack(id,{in.session,in.sequence,in.capture_time_us,0,0,true});
+        };
+        cb.return_request=[&p](const std::string& id,const hive::ReturnRequest& r){const auto count=++p.returns;p.net.send_return_reply(id,{r.session,r.id,count==1?hive::ReturnResult::Returned:hive::ReturnResult::Leaf});};
         std::string error;require(p.net.start({"peer-"+std::to_string(i),"Generated peer "+std::to_string(i),"stress-key",uint16_t(48190+i),false,true},cb,error),error.c_str());
     }
     hive::AppConfig config;config.device_id="isolated-viewer";config.name=L"Isolated viewer";config.group_key="stress-key";config.port=48194;config.first_run=false;config.desktop.tray_icon=false;
@@ -100,6 +104,22 @@ int probe(){
         auto recovery=app.test_recovery_guards();
         require(recovery.wait_for(std::chrono::seconds(3))==std::future_status::ready&&recovery.get(),"Graphics watchdog interrupted a healthy session or failed to request idle recovery");
         std::puts("PASS aged-retirement watchdog: healthy viewer/controller/preview protected; idle recovery requested (process helper tested separately)");
+        {
+            auto& p=peers[0];{std::lock_guard lock(p.mutex);p.hold_release=true;p.held_release={};}
+            app.test_return_previous();
+            hive::InputPacket release;
+            for(unsigned n=0;n<200&&!release.sequence;++n){{std::lock_guard lock(p.mutex);release=p.held_release;}Sleep(5);}
+            require(release.sequence!=0,"Nested return did not send a release barrier");
+            Sleep(100);require(!p.returns&&app.test_ready("peer-0")&&app.test_return_pending(),"Unwind ran before broker release ACK");
+            {std::lock_guard lock(p.mutex);p.hold_release=false;}
+            require(p.net.send_input_ack(p.client,{release.session,release.sequence,release.capture_time_us,0,0,true}),"Could not ACK nested release barrier");
+            for(unsigned n=0;n<200&&(p.returns!=1||app.test_return_pending());++n)Sleep(5);
+            require(p.returns==1&&!app.test_return_pending()&&app.test_ready("peer-0"),"Child unwind closed outer App or stranded input");
+            app.test_return_previous();
+            for(unsigned n=0;n<200&&app.test_ready("peer-0");++n)Sleep(5);
+            require(p.returns==2&&!app.test_ready("peer-0")&&!app.test_return_pending(),"Leaf unwind did not return actual App locally");
+            std::puts("PASS actual App nested return: encrypted release ACK barrier, child-return preserves view, leaf-return closes view");
+        }
         Sleep(300);PostMessageW(owner,WM_CLOSE,0,0);
     }catch(...){driver_failure=std::current_exception();if(const auto owner=FindWindowW(L"HiveDesk.Owner",nullptr))PostMessageW(owner,WM_CLOSE,0,0);}
     });
