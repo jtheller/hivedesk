@@ -31,11 +31,31 @@ int main(){try{
     ledger.remote("wrong",{42,9,200,4,5,true});require(ledger.drain().empty(),"wrong peer ACK accepted");
     ledger.remote("c",{41,9,200,4,5,true});require(ledger.drain().empty(),"wrong session ACK accepted");
     ledger.remote("c",{42,9,200,4,5,true});const auto done=ledger.drain();
-    require(done.size()==2&&done[0].sequence==1&&done[1].sequence==2&&done[0].capture_time_us==100&&done[0].host_queue_us==4,"relay ACK order/clock/telemetry broken");
+    require(done.size()==1&&done[0].sequence==2&&done[0].capture_time_us==110&&done[0].host_queue_us==4,"cumulative child ACK expanded into stale per-event ACKs");
     require(ledger.push(a,true,c,10)&&ledger.push(b,true),"ledger mixed admission");
     ledger.local({11,2,110,7,9,true});require(ledger.drain().empty(),"local ACK overtook pending child input");
-    ledger.cancel_remote();require(ledger.drain().size()==2,"return/handoff stranded upstream ACK");
+    ledger.cancel_remote();require(ledger.drain().size()==1,"return/handoff stranded upstream ACK");
     ledger.push(a,false,c,11);ledger.remote("c",{42,11,200,0,0,false});require(!ledger.drain()[0].injected,"child failure hidden");
+    {
+        // A delayed cumulative completion must free the original credit window
+        // once, without fabricating an RTT sample for every old motion event.
+        InputSendWindow origin;origin.reset(11);
+        for(uint64_t i=1;i<=8;++i){
+            InputPacket motion{11,i,1000+i,{InputKind::Absolute,int(i),20}};
+            require(origin.enqueue(motion,1000+i),"origin admission");origin.take(1100+i);
+            require(ledger.push(motion,false,c,100+i),"burst relay admission");
+        }
+        ledger.remote("c",{42,108,2000,2,3,true});const auto batch=ledger.drain();
+        require(batch.size()==1&&batch[0].sequence==8&&batch[0].capture_time_us==1008,"cumulative completion amplified across relay");
+        require(origin.acknowledge(batch[0],201108),"cumulative origin ACK rejected");
+        const auto stats=origin.snapshot(201108);
+        require(stats.acknowledged==8&&!stats.inflight&&stats.samples==1&&stats.ack_roundtrip_p50_us==200000,"ACK compression corrupted credits or RTT clock");
+        ledger.push({11,9,1009,{InputKind::Key,30,0}},false,c,109);
+        ledger.push({11,10,1010,{InputKind::ReleaseAll}},false,c,110);
+        ledger.remote("c",{42,109,2001,0,0,false});ledger.remote("c",{42,110,2002,0,0,true});
+        const auto failed=ledger.drain();
+        require(failed.size()==2&&!failed[0].injected&&failed[0].sequence==9&&failed[1].injected,"successful release hid prior rejected input");
+    }
     for(unsigned i=0;i<512;++i)require(ledger.push(a,true),"early ledger overflow");require(!ledger.push(a,true),"unbounded relay ledger");ledger.reset();
     require(input_append(a,input_node("A"))&&input_append(a,input_node("B"))&&!input_append(a,input_node("A")),"A-B-A loop accepted");
     for(unsigned i=0;i<14;++i)require(input_append(a,input_node("hop"+std::to_string(i))),"early hop limit");require(!input_append(a,999),"hop limit ignored");

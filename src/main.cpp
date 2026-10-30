@@ -56,6 +56,7 @@ public:
     void test_stop_viewer(){viewer_.load()->request_stop();}
     void test_return_previous(){shell_.return_previous();}
     bool test_return_pending(){const std::lock_guard lock(view_intent_mutex_);return return_barrier_.has_value();}
+    std::unique_lock<std::mutex> test_lock_input(bool relay){return std::unique_lock(relay?relay_mutex_:view_intent_mutex_);}
     void test_relay_controller(const std::string& peer,uint64_t session,std::function<void(const hive::InputPacket&)> sink){
         USEROBJECTFLAGS flags{};DWORD size=0;
         if(!GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&size)||(flags.dwFlags&WSF_VISIBLE))throw std::runtime_error("Relay fixture requires invisible station");
@@ -150,7 +151,7 @@ public:
             return !closing_&&target&&!target->revoked&&!target->warming&&target->peer==peer&&target->session==cursor.session&&transport_.send_cursor(peer,cursor);
         };
         callbacks.stream_tick=[this] {
-            relay_tick();
+            relay_tick(true);
             if(!closing_&&clipboard_pending_&&GetTickCount64()-last_clipboard_retry_>=1000) {
                 last_clipboard_retry_=GetTickCount64();enqueue([this]{
                     const std::lock_guard lock(host_mutex_);const auto target=hosting_.load();
@@ -270,11 +271,18 @@ private:
         {const std::lock_guard lock(relay_mutex_);control=relay_control_;relay_ledger_.remote(peer,ack);ready=relay_ledger_.drain();}
         relay_deliver(control,ready);
     }
-    void relay_tick(){
+    void relay_tick(bool opportunistic=false){
         std::vector<hive::InputAck> ready;std::shared_ptr<hive::HostControl> control;
         {
-            const std::lock_guard view_lock(view_intent_mutex_);
-            const std::lock_guard lock(relay_mutex_);control=relay_control_;
+            // The UI timer also sends video feedback. Periodic cleanup must
+            // never wait behind a selection or the input relay's ACK ledger.
+            // Input/stop callbacks still perform ordered, blocking cleanup;
+            // a skipped timer attempt is retried on the next stream tick.
+            std::unique_lock view_lock(view_intent_mutex_,std::defer_lock);
+            if(opportunistic){if(!view_lock.try_lock())return;}else view_lock.lock();
+            std::unique_lock lock(relay_mutex_,std::defer_lock);
+            if(opportunistic){if(!lock.try_lock())return;}else lock.lock();
+            control=relay_control_;
             const bool host_lost=control&&(control->revoked||hosting_.load()!=control);
             const bool view_lost=relay_child_&&(view_control_!=relay_child_||relay_child_->generation!=generation_);
             if(host_lost&&relay_child_&&view_control_==relay_child_&&view_ready_&&active_dedicated_input_){

@@ -56,7 +56,14 @@ public:
         while(!entries_.empty()&&!entries_.front().local&&!entries_.front().remote){
             const auto e=entries_.front();entries_.pop_front();
             // Relay latency includes another network leg, not broker CPU time.
-            result.push_back({e.input.session,e.input.sequence,e.input.capture_time_us,e.queue_us,e.inject_us,e.ok});
+            const InputAck ack{e.input.session,e.input.sequence,e.input.capture_time_us,e.queue_us,e.inject_us,e.ok};
+            // Input ACKs are cumulative. Preserve the newest event's clock and
+            // timing instead of turning one child completion into a burst of
+            // upstream writes/RTT samples. Never hide a failed injection behind
+            // a subsequent successful release.
+            if(ack.injected&&!result.empty()&&result.back().injected&&result.back().session==ack.session)
+                result.back()=ack;
+            else result.push_back(ack);
         }return result;
     }
     void reset(){entries_.clear();}

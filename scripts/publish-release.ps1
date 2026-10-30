@@ -13,7 +13,7 @@ if($built -ne $commit){throw 'Package was not built from the current commit'}
 & .\scripts\sign-release.ps1 -ReleaseDirectory $ReleaseDirectory
 if($LASTEXITCODE){throw 'Signing failed'}
 $env:GIT_TERMINAL_PROMPT='0';$env:GCM_INTERACTIVE='Never'
-$lines=@('protocol=https','host=github.com','') | git credential fill
+$lines=@('protocol=https','host=github.com','username=jtheller','') | git credential fill
 if($LASTEXITCODE){throw 'GitHub authentication unavailable'}
 $credentials=@{};foreach($line in $lines){$parts=$line -split '=',2;if($parts.Length -eq 2){$credentials[$parts[0]]=$parts[1]}}
 $headers=@{Authorization=('Bearer '+$credentials.password);Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28';'User-Agent'='HiveDesk-release'}
@@ -30,9 +30,9 @@ try {
     if($release -and $release.target_commitish -ne $commit){throw 'Draft release belongs to another commit'}
     $existingTag=git rev-parse -q --verify ('refs/tags/'+$tag) 2>$null
     if($existingTag){if($existingTag.Trim() -ne $commit){throw 'Release tag points to another commit'}}else{git tag $tag $commit;if($LASTEXITCODE){throw 'Cannot create release tag'}}
-    git push --quiet origin HEAD:main
+    git -c credential.https://github.com.username=jtheller push --quiet origin HEAD:main
     if($LASTEXITCODE){throw 'Cannot push release source'}
-    git push --quiet origin ('refs/tags/'+$tag)
+    git -c credential.https://github.com.username=jtheller push --quiet origin ('refs/tags/'+$tag)
     if($LASTEXITCODE){throw 'Cannot push release tag'}
     if(-not $release){
         $noteFile=Join-Path $projectRoot ('docs\releases\'+$version+'.md')

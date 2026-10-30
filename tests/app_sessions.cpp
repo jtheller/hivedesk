@@ -11,7 +11,7 @@ int probe(){
     require(GetUserObjectInformationW(GetProcessWindowStation(),UOI_FLAGS,&flags,sizeof(flags),&bytes)&&!(flags.dwFlags&WSF_VISIBLE),"Refuse synthetic events on interactive station");
     const auto profile=std::filesystem::temp_directory_path()/(L"HiveDesk-AppSessions-"+std::to_wstring(GetCurrentProcessId()));std::filesystem::create_directories(profile);SetEnvironmentVariableW(L"LOCALAPPDATA",profile.c_str());
     auto encoded=hive::media_generated_test_frame();
-    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0,summons=0;std::atomic<uint64_t> relay_acked=0;std::vector<hive::InputPacket> relayed;bool hold_relay=false;std::atomic<unsigned> releases=0;};
+    struct Peer {hive::Transport net;std::atomic<uint64_t> session=0,sequence=0;std::atomic<bool> warm=false,peek=false;std::atomic<unsigned> remaining=0,feedbacks=0;std::string client;std::mutex mutex;bool handoff=false;bool hold_release=false;hive::InputPacket held_release;std::atomic<unsigned> returns=0,summons=0;std::atomic<uint64_t> relay_acked=0;std::vector<hive::InputPacket> relayed;bool hold_relay=false;std::atomic<unsigned> releases=0;};
     std::array<Peer,3> peers;std::atomic<unsigned> starts=0,promotions=0,warms=0,previews=0,preview_stops=0,visible_previews=0;std::atomic<bool> bad_handoff=false;
     for(unsigned i=0;i<3;++i){auto& p=peers[i];hive::TransportCallbacks cb;
         cb.clipboard=[&p](const std::string&,const std::wstring&){std::lock_guard lock(p.mutex);p.handoff=true;};
@@ -19,7 +19,7 @@ int probe(){
         cb.preview=[&p,&previews,&preview_stops,&bad_handoff](const std::string&,uint64_t session,bool enabled){std::lock_guard lock(p.mutex);if(p.warm&&p.session==session){if(enabled){++previews;if(p.handoff)bad_handoff=true;}else ++preview_stops;p.peek=enabled;p.remaining=enabled?10000:0;}};
         cb.stop_stream=[&p](const std::string&){p.remaining=0;};
         cb.cancel_warm=[&p](const std::string&,uint64_t s){if(p.session==s&&p.warm)p.remaining=0;};
-        cb.feedback=[&p](const std::string&,const hive::StreamFeedback& f){std::lock_guard lock(p.mutex);if(f.session==p.session&&f.recover&&!p.remaining)p.remaining=1;};
+        cb.feedback=[&p](const std::string&,const hive::StreamFeedback& f){std::lock_guard lock(p.mutex);if(f.session==p.session){++p.feedbacks;if(f.recover&&!p.remaining)p.remaining=1;}};
         cb.input_begin=[&p,&bad_handoff](const std::string&,uint64_t){if(p.warm){bad_handoff=true;return false;}return true;};
         cb.input_packet=[&p](const std::string& id,const hive::InputPacket& in){
             if(in.event.kind==hive::InputKind::ReleaseAll)++p.releases;
@@ -112,6 +112,19 @@ int probe(){
         }
         require(recorded&&!hive::experience_enabled(),"Overlay-off App failed to record lightweight diagnostics or enabled per-frame tracing");
         std::puts("PASS actual App diagnostics with overlay off: active viewer/input counters, independent lightweight logging, no per-frame tracing");
+        for(const bool relay:{false,true}){
+            // A controller/selection can own this lock while the UI must still
+            // send video feedback. Never inject anything into the real desktop.
+            Sleep(120);
+            auto intent=app.test_lock_input(relay);const auto before=peers[0].feedbacks.load();
+            auto tick=std::async(std::launch::async,[&]{SendMessageW(owner,WM_TIMER,1,0);});
+            const bool independent=tick.wait_for(std::chrono::milliseconds(250))==std::future_status::ready;
+            for(unsigned n=0;independent&&peers[0].feedbacks==before&&n<100;++n)Sleep(5);
+            const bool delivered=peers[0].feedbacks>before;
+            intent.unlock();tick.get();
+            require(independent&&delivered,"Video feedback/UI timer blocked behind input relay/selection mutex");
+            std::printf("PASS actual App feedback timer: encrypted feedback arrives while %s mutex is held\n",relay?"relay ACK":"input/selection");
+        }
         for(unsigned n=0;n<3;++n){
             const auto old=app.test_surface();
             app.test_delay_retirement(2000);app.test_stop_viewer();
@@ -170,6 +183,7 @@ int probe(){
             require(leaf.net.send_input_ack(leaf.client,{last.session,last.sequence,last.capture_time_us,0,0,true}),"Leaf release ACK");
             for(unsigned n=0;n<300&&origin.relay_acked!=8;++n)Sleep(5);
             require(origin.relay_acked==8,"Leaf cumulative ACK did not reach origin in order");
+            require(origin.net.input_diagnostics("isolated-viewer").samples==1,"Actual App amplified a cumulative leaf ACK into multiple RTT samples");
             hive::InputPacket cycle{701,9,hive::input_now_us(),{hive::InputKind::Key,31,0}};
             hive::input_append(cycle,hive::input_node("peer-1"));hive::input_append(cycle,hive::input_node("isolated-viewer"));
             require(origin.net.send_input("isolated-viewer",cycle),"Cycle fixture send");
