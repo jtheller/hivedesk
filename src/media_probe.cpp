@@ -101,6 +101,7 @@ void amd(ID3D11Device* device){
 int main(int argc,char** argv){
     const bool roundtrip=argc==2&&std::strcmp(argv[1],"--intel-roundtrip")==0;
     if(argc>1&&!roundtrip){std::puts("Usage: HiveDeskMediaProbe [--intel-roundtrip]");return 1;}
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     setvbuf(stdout,nullptr,_IONBF,0);
     unsigned tested=0,failed=0;
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32|LOAD_LIBRARY_SEARCH_APPLICATION_DIR);

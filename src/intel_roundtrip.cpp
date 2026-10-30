@@ -1,4 +1,5 @@
 #include "intel_roundtrip.h"
+#include "intel_system_surfaces.h"
 #include "hevc_format.h"
 #include <vpl/mfxmemory.h>
 #include <windows.h>
@@ -9,6 +10,8 @@
 #include <sstream>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
+#include <cstdio>
 
 namespace {
 using Clock=std::chrono::steady_clock;
@@ -21,9 +24,10 @@ void sync(mfxSession session,mfxSyncPoint point){
         if(s!=MFX_WRN_IN_EXECUTION||Clock::now()>=deadline)throw std::runtime_error("Intel sync status="+std::to_string(s));}
 }
 struct Surface {
-    mfxFrameSurface1* value=nullptr;bool mapped=false;
+    mfxFrameSurface1* value=nullptr;bool mapped=false,system_memory=false;
     ~Surface(){if(value&&value->FrameInterface){if(mapped)value->FrameInterface->Unmap(value);value->FrameInterface->Release(value);}}
     void map(mfxU32 mode){
+        if(system_memory){require(value&&value->Data.Y&&value->Data.U&&value->Data.V&&value->Data.A,"Intel system-memory surface has no AYUV storage");return;}
         require(value&&value->FrameInterface,"Intel managed surface interface missing");
         mfxHDL native=nullptr;mfxResourceType type{};
         exact(value->FrameInterface->GetNativeHandle(value,&native,&type),"GetNativeHandle");
@@ -35,7 +39,7 @@ struct Surface {
         const auto pitch=(uint32_t(value->Data.PitchHigh)<<16)|value->Data.PitchLow;
         require(value->Data.Y&&value->Data.U&&value->Data.V&&pitch>=uint32_t(value->Info.Width)*4,"Intel mapped AYUV planes invalid");
     }
-    void unmap(){exact(value->FrameInterface->Unmap(value),"Unmap generated surface");mapped=false;}
+    void unmap(){if(system_memory)return;exact(value->FrameInterface->Unmap(value),"Unmap generated surface");mapped=false;}
 };
 std::array<uint8_t,3> pixel(unsigned x,unsigned y,unsigned frame){
     return {uint8_t(16+(x*3+y*5+frame*7)%220),uint8_t(x&1?48:208),uint8_t(y&1?64:192)};
@@ -47,8 +51,9 @@ bool format(const mfxVideoParam& p){
 }
 }
 std::string intel_roundtrip(mfxSession session){
-    mfxVersion api{};exact(MFXQueryVersion(session,&api),"QueryVersion");require(api.Major>=2,"Intel managed-surface test requires VPL 2.x");
-    mfxVideoParam p{};p.AsyncDepth=1;p.IOPattern=MFX_IOPATTERN_IN_VIDEO_MEMORY;
+    mfxVersion api{};exact(MFXQueryVersion(session,&api),"QueryVersion");const bool managed=api.Major>=2;
+    std::printf("  intel.runtime_api=%u.%u surface_path=%s\n",api.Major,api.Minor,managed?"VPL2-managed-D3D11":"MediaSDK1-system-memory");
+    mfxVideoParam p{};p.AsyncDepth=1;p.IOPattern=mfxU16(managed?MFX_IOPATTERN_IN_VIDEO_MEMORY:MFX_IOPATTERN_IN_SYSTEM_MEMORY);
     p.mfx.CodecId=MFX_CODEC_HEVC;p.mfx.CodecProfile=MFX_PROFILE_HEVC_REXT;
     p.mfx.TargetUsage=MFX_TARGETUSAGE_BEST_SPEED;p.mfx.GopRefDist=1;p.mfx.GopPicSize=120;p.mfx.NumRefFrame=1;
     p.mfx.RateControlMethod=MFX_RATECONTROL_CBR;p.mfx.BRCParamMultiplier=2;p.mfx.TargetKbps=50000;
@@ -60,10 +65,12 @@ std::string intel_roundtrip(mfxSession session){
     // timeout: outstanding asynchronous driver work may still own this memory.
     std::vector<uint8_t> storage(4*1024*1024),encoded;
     mfxBitstream bits{};bits.Data=storage.data();bits.MaxLength=mfxU32(storage.size());unsigned outputs=0;
+    IntelSystemSurfaces encode_surfaces;
     struct Encoder {mfxSession s;bool open=false;~Encoder(){if(open)MFXVideoENCODE_Close(s);}} encoder{session};
     const auto initialized=MFXVideoENCODE_Init(session,&p);encoder.open=initialized>=0;exact(initialized,"HEVC444 encode Init");
     mfxVideoParam actual{};exact(MFXVideoENCODE_GetVideoParam(session,&actual),"Encode GetVideoParam");
     require(format(actual)&&actual.mfx.GopRefDist==1,"Intel initialized encoder changed format or frame ordering");
+    if(!managed){mfxFrameAllocRequest allocation{};exact(MFXVideoENCODE_QueryIOSurf(session,&actual,&allocation),"Encode QueryIOSurf");encode_surfaces.allocate(actual.mfx.FrameInfo,std::max<unsigned>(2,allocation.NumFrameSuggested));}
     const auto encode=[&](mfxFrameSurface1* surface){
         bits.DataOffset=bits.DataLength=0;mfxSyncPoint point=nullptr;
         const auto deadline=Clock::now()+std::chrono::seconds(3);mfxStatus status;
@@ -77,7 +84,9 @@ std::string intel_roundtrip(mfxSession session){
         encoded.insert(encoded.end(),bits.Data+bits.DataOffset,bits.Data+bits.DataOffset+bits.DataLength);++outputs;return true;
     };
     for(unsigned i=0;i<Frames;++i){
-        Surface surface;exact(MFXMemory_GetSurfaceForEncode(session,&surface.value),"GetSurfaceForEncode");surface.map(MFX_MAP_WRITE);
+        Surface surface;surface.system_memory=!managed;
+        if(managed)exact(MFXMemory_GetSurfaceForEncode(session,&surface.value),"GetSurfaceForEncode");else surface.value=encode_surfaces.available();
+        surface.map(MFX_MAP_WRITE);
         auto& data=surface.value->Data;const auto pitch=(uint32_t(data.PitchHigh)<<16)|data.PitchLow;
         for(unsigned y=0;y<surface.value->Info.Height;++y)for(unsigned x=0;x<surface.value->Info.Width;++x){
             const auto c=pixel(x,y,i);const auto at=size_t(y)*pitch+x*4;data.Y[at]=c[0];data.U[at]=c[1];data.V[at]=c[2];if(data.A)data.A[at]=255;
@@ -94,16 +103,18 @@ std::string intel_roundtrip(mfxSession session){
     mfxVideoParam decode{};decode.mfx.CodecId=MFX_CODEC_HEVC;
     exact(MFXVideoDECODE_DecodeHeader(session,&input,&decode),"DecodeHeader");
     require(format(decode),"Intel decoder header changed output format");
-    decode.AsyncDepth=1;decode.IOPattern=MFX_IOPATTERN_OUT_VIDEO_MEMORY;
+    decode.AsyncDepth=1;decode.IOPattern=mfxU16(managed?MFX_IOPATTERN_OUT_VIDEO_MEMORY:MFX_IOPATTERN_OUT_SYSTEM_MEMORY);
+    IntelSystemSurfaces decode_surfaces;
     struct Decoder {mfxSession s;bool open=false;~Decoder(){if(open)MFXVideoDECODE_Close(s);}} decoder{session};
+    if(!managed){mfxFrameAllocRequest allocation{};exact(MFXVideoDECODE_QueryIOSurf(session,&decode,&allocation),"Decode QueryIOSurf");decode_surfaces.allocate(allocation.Info,std::max<unsigned>(2,allocation.NumFrameSuggested));}
     const auto decoder_status=MFXVideoDECODE_Init(session,&decode);decoder.open=decoder_status>=0;exact(decoder_status,"HEVC444 decode Init");
     input.DataOffset=0;input.DataLength=mfxU32(encoded.size());
     unsigned decoded=0;bool draining=false;std::array<uint64_t,3> errors{};std::array<unsigned,3> maximum{};
     const auto deadline=Clock::now()+std::chrono::seconds(10);
     for(;;){
-        require(Clock::now()<deadline,"Intel decode drain timeout");Surface output;mfxSyncPoint point=nullptr;
+        require(Clock::now()<deadline,"Intel decode drain timeout");Surface output;output.system_memory=!managed;mfxSyncPoint point=nullptr;
         if(!input.DataLength)draining=true;
-        const auto status=MFXVideoDECODE_DecodeFrameAsync(session,draining?nullptr:&input,nullptr,&output.value,&point);
+        const auto status=MFXVideoDECODE_DecodeFrameAsync(session,draining?nullptr:&input,managed?nullptr:decode_surfaces.available(),&output.value,&point);
         if(status==MFX_ERR_MORE_DATA){if(draining)break;draining=true;continue;}
         if(status==MFX_WRN_DEVICE_BUSY&&!point){Sleep(1);continue;}
         exact(status,"DecodeFrameAsync");require(output.value&&point,"Intel decode returned no output/completion");sync(session,point);
@@ -124,5 +135,5 @@ std::string intel_roundtrip(mfxSession session){
     std::ostringstream report;report<<"generated_frames="<<decoded<<" actual_sps=HEVC444/8bit bytes="<<encoded.size();
     report<<" mean_abs_YUV="<<errors[0]/samples<<","<<errors[1]/samples<<","<<errors[2]/samples;
     report<<" max_abs_YUV="<<maximum[0]<<","<<maximum[1]<<","<<maximum[2];
-    report<<" (D3D11 managed surfaces, async completion, CPU-mapped diagnostic pattern; not desktop streaming or latency validation)";return report.str();
+    report<<" runtime_api="<<api.Major<<"."<<api.Minor<<" ("<<(managed?"D3D11 managed surfaces":"Media SDK system-memory surfaces with hardware upload/readback")<<", async completion, generated pattern; not desktop streaming or latency validation)";return report.str();
 }
