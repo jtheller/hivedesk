@@ -41,7 +41,7 @@ inline DebugRows build_debug_rows(const DebugOverlayState& state,std::array<Diag
             {metric(L"RX ",v.receive_kbps/1000.0),{L" Mbps"},count(L"  Drop ",v.discarded,0),count(L"  Skip ",v.skipped,1),{v.recovering?L"  IDR WAIT":L"  IDR ok",v.recovering?T::Critical:T::Normal}},
             {count(L"Recovery: gap ",v.sequence_gaps,2),count(L"   age ",v.age_expired,3),count(L"   overflow ",v.queue_overflows,4)},
             {metric(L"Source ",d.encoded_millihz/1000.0,source_fresh?T::Normal:T::Muted),{L" fps"},ms(L"   Encode ",d.encode_us,encode_fresh),{L" ms"}},
-            {ms(L"Color/sync ",d.color_us,encode_fresh),ms(L"   NVENC latency ",d.nvenc_us,encode_fresh),{L" ms"}},
+            {ms(L"Color/sync ",d.color_us,encode_fresh),ms(L"   Codec latency ",d.nvenc_us,encode_fresh),{L" ms"}},
             {metric(L"Capture wait ",d.capture_wait_us/1000.0,source_fresh?T::Normal:T::Muted),{L" ms"},metric(L"   Send wait ",d.send_wait_us_per_second/1000.0,diagnostic_threshold(d.send_wait_us_per_second,100000,400000,source_fresh)),{L" ms/s"}},
             {ms(L"Transit excess ",d.network_extra_us,source_fresh),{L" ms"},{L"   Feedback "+(d.feedback_age_us==UINT32_MAX?std::wstring(L"--"):num(d.feedback_age_us/1000.0))+L" ms",diagnostic_threshold(d.feedback_age_us,300000,1000000,source_fresh)}},
             {metric(d.automatic_cbr?L"Auto CBR ":L"CQP baseline ",d.target_bitrate_bps/1000000.0,source_fresh?T::Normal:T::Muted),metric(L" / actual ",d.actual_bitrate_bps/1000000.0,source_fresh?T::Normal:T::Muted),{L" Mbps"}},

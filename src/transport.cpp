@@ -214,7 +214,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -1004,7 +1004,7 @@ struct Transport::Impl {
         }
         case MediaProbeRequest: {
             const auto request=r.qword();const auto mode=r.dword();
-            if(!(c.peer.features&FeatureMediaProbe)||!request||mode<1||mode>3||!r.end())return false;
+            if(!(c.peer.features&FeatureMediaProbe)||!request||mode<1||mode>4||(mode==4&&!(c.peer.features&FeatureHostProbe))||!r.end())return false;
             if(callbacks.media_probe_request)callbacks.media_probe_request(c.peer,request,mode);
             else {Bytes reply{MediaProbeReply};u64(reply,request);u32(reply,ERROR_NOT_SUPPORTED);const std::string message="Media diagnostic unavailable in this process";reply.insert(reply.end(),message.begin(),message.end());c.enqueue(std::move(reply));}
             return true;
@@ -1529,7 +1529,7 @@ bool Transport::send_clipboard_packet(const std::string& peer,const std::vector<
 }
 bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{ClipboardText}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
 bool Transport::request_media_probe(const std::string& peer,uint64_t request,uint32_t mode) {
-    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureMediaProbe)||!request||mode<1||mode>3)return false;
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureMediaProbe)||!request||mode<1||mode>4||(mode==4&&!(c->peer.features&FeatureHostProbe)))return false;
     Bytes b{MediaProbeRequest};u64(b,request);u32(b,mode);return c->enqueue(std::move(b));
 }
 bool Transport::send_media_probe_report(const std::string& peer,const MediaProbeReport& report) {
@@ -1890,6 +1890,11 @@ bool Transport::self_test(std::string& result) {
         bool called=false;owner.callbacks.media_probe_request=[&](const Peer&,uint64_t id,uint32_t mode){called=id==9&&mode==2;};
         Bytes request{MediaProbeRequest};u64(request,9);u32(request,2);
         if(!owner.dispatch(control,request)||!called){result="Media probe dispatch failed";return false;}
+        Bytes host_request{MediaProbeRequest};u64(host_request,9);u32(host_request,4);
+        if(owner.dispatch(control,host_request)){result="Unnegotiated host probe accepted";return false;}
+        control.peer.features|=FeatureHostProbe;called=false;
+        owner.callbacks.media_probe_request=[&](const Peer&,uint64_t id,uint32_t mode){called=id==9&&mode==4;};
+        if(!owner.dispatch(control,host_request)||!called){result="Negotiated host probe dispatch failed";return false;}
         control.peer.features=0;if(owner.dispatch(control,request)){result="Unnegotiated media probe accepted";return false;}
         control.peer.features=FeatureMediaProbe;request.back()=255;
         if(owner.dispatch(control,request)){result="Invalid media probe mode accepted";return false;}

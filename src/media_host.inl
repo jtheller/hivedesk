@@ -28,7 +28,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
             const bool automatic=settings.session!=0;
             AdaptivePacer pacer(automatic?primary_refresh_millihz():120000,automatic?settings.receiver_millihz:120000);
             auto encoder_settings=settings;if(automatic)encoder_settings.receiver_millihz=pacer.target();
-            Encoder encoder(capture.width,capture.height,encoder_settings,capture.adapter());
+            HostEncoder encoder(capture.width,capture.height,encoder_settings,capture.adapter(),capture.texture(),[this]{return impl_->stop.load();});
             AutoRateController rate_control(capture.width,capture.height,pacer.target());
             // Protected by wait_mutex. Completing GPU work never waits for the
             // pipe/socket: delivery is a third, independently bounded stage.
@@ -49,7 +49,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
             std::thread drain,deliver;
             try{
                 drain=std::thread([&]{try{
-                    Encoder::Completion result;
+                    HostEncoder::Completion result;
                     while(encoder.receive(result)){
                         {
                             std::lock_guard lock(impl_->wait_mutex);
@@ -98,7 +98,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         }
                     }
                 }catch(...){fail(std::current_exception());}});
-                log(std::string("Video pipeline: ")+(encoder.asynchronous()?"NVENC async events":"NVENC synchronous output worker")+", 4 IO slots / 2 in flight, bounded fresh-frame delivery.");
+                log(std::string("Video pipeline: ")+encoder.description()+", bounded fresh-frame delivery.");
                 initialized.set_value({});announced=true;
                 bool have_picture=false;
                 auto deadline=Clock::now(),last_keyframe=deadline;

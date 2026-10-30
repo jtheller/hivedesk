@@ -15,6 +15,7 @@
 #include "latest_picture.h"
 #include "viewer_composition.h"
 #include "software_decoder.h"
+#include "intel_encoder.h"
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -535,6 +536,38 @@ private:
     }
 };
 
+// Keep the existing NVIDIA implementation and its ownership unchanged. Only
+// production hosting selects a backend; NVIDIA-specific generated tests retain
+// their explicit Encoder. Intel never creates CUDA/NVENC resources.
+class HostEncoder {
+    std::unique_ptr<Encoder> nvidia_;
+    std::unique_ptr<IntelEncoder> intel_;
+public:
+    using Completion=Encoder::Completion;
+    HostEncoder(uint32_t width,uint32_t height,const StreamSettings& settings,IDXGIAdapter* adapter,ID3D11Texture2D* texture,std::function<bool()> cancelled){
+        DXGI_ADAPTER_DESC desc{};hr(adapter->GetDesc(&desc),"Read host adapter");
+        if(desc.VendorId==0x8086)intel_=std::make_unique<IntelEncoder>(width,height,settings,adapter,texture,std::move(cancelled));
+        else nvidia_=std::make_unique<Encoder>(width,height,settings,adapter);
+    }
+    bool ready()const{return intel_?intel_->ready():nvidia_->ready();}
+    uint32_t in_flight()const{return intel_?intel_->in_flight():nvidia_->in_flight();}
+    bool automatic_rate()const{return intel_?intel_->automatic_rate():nvidia_->automatic_rate();}
+    bool dynamic_rate()const{return intel_?intel_->dynamic_rate():nvidia_->dynamic_rate();}
+    uint32_t bitrate_bps()const{return intel_?intel_->bitrate_bps():nvidia_->bitrate_bps();}
+    uint32_t nominal_millihz()const{return intel_?intel_->nominal_millihz():nvidia_->nominal_millihz();}
+    const char* description()const{return intel_?"Intel asynchronous HEVC444, 2 in flight":nvidia_->asynchronous()?"NVENC async events, 4 IO slots / 2 in flight":"NVENC synchronous output worker, 4 IO slots / 2 in flight";}
+    bool reconfigure(uint32_t bitrate,uint32_t millihz){return intel_?intel_->reconfigure(bitrate,millihz):nvidia_->reconfigure(bitrate,millihz);}
+    bool submit_texture(ID3D11Texture2D* texture,uint64_t sequence,bool force,uint64_t captured,bool* queued,CursorComposition cursor){
+        return intel_?intel_->submit_texture(texture,sequence,force,captured,queued,cursor):nvidia_->submit_texture(texture,sequence,force,captured,queued,cursor);
+    }
+    bool receive(Completion& result){
+        if(!intel_)return nvidia_->receive(result);IntelEncoder::Completion value;if(!intel_->receive(value))return false;
+        result.frame=std::move(value.frame);result.color_us=value.color_us;result.nvenc_us=value.codec_us;result.total_us=value.total_us;
+        result.average_qp=value.average_qp;result.submitted_us=value.submitted_us;result.completed_us=value.completed_us;return true;
+    }
+    void finish(){if(intel_)intel_->finish();else nvidia_->finish();}
+};
+
 class Decoder {
 public:
     using Output=std::function<void(uint64_t,size_t,uint32_t,uint32_t,HiveGpu*)>;
@@ -856,7 +889,9 @@ public:
         }
         if (description_.Rotation != DXGI_MODE_ROTATION_IDENTITY && description_.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED)
             throw std::runtime_error("Rotated primary monitors are not supported in this first version.");
-        hr(D3D11CreateDevice(adapter_.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        DXGI_ADAPTER_DESC1 capture_adapter{};hr(adapter_->GetDesc1(&capture_adapter),"Read capture adapter");
+        const UINT capture_flags=D3D11_CREATE_DEVICE_BGRA_SUPPORT|(capture_adapter.VendorId==0x8086?D3D11_CREATE_DEVICE_VIDEO_SUPPORT:0);
+        hr(D3D11CreateDevice(adapter_.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, capture_flags,
              nullptr, 0, D3D11_SDK_VERSION, &device_, nullptr, &context_), "Create primary capture device");
         hr(output->DuplicateOutput(device_.Get(), &duplication_), "Desktop Duplication");
         width = static_cast<uint32_t>(description_.DesktopCoordinates.right - description_.DesktopCoordinates.left);

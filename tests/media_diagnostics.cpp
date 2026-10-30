@@ -20,11 +20,11 @@ int main(int argc,char** argv){
         const auto started=GetTickCount64();r=hive::bounded_probe_process(executable,L"--child-hang",5000,[&]{return GetTickCount64()-started>100;});
         require(r.result==ERROR_CANCELLED&&GetTickCount64()-started<2000,"active-session cancellation");
         r=hive::run_media_probe(3,"127.0.0.1 & command",[]{return false;});require(r.result==ERROR_INVALID_PARAMETER,"non-address accepted");
-        r=hive::run_media_probe(4,"127.0.0.1",[]{return false;});require(r.result==ERROR_INVALID_PARAMETER,"arbitrary diagnostic accepted");
+        r=hive::run_media_probe(5,"127.0.0.1",[]{return false;});require(r.result==ERROR_INVALID_PARAMETER,"arbitrary diagnostic accepted");
         hive::MediaDiagnostics runner;bool deferred=false;
         runner.request(7,1,"127.0.0.1",[]{return false;},[&](hive::MediaProbeReport report){deferred=report.request==7&&report.result==ERROR_BUSY;});require(deferred,"active desktop admitted probe");
         std::mutex admission_mutex;std::condition_variable admission_changed;bool finished=false;
-        runner.request(8,4,"127.0.0.1",[]{return true;},[&](hive::MediaProbeReport report){std::lock_guard lock(admission_mutex);finished=report.result==ERROR_INVALID_PARAMETER;admission_changed.notify_all();});
+        runner.request(8,5,"127.0.0.1",[]{return true;},[&](hive::MediaProbeReport report){std::lock_guard lock(admission_mutex);finished=report.result==ERROR_INVALID_PARAMETER;admission_changed.notify_all();});
         {std::unique_lock lock(admission_mutex);require(admission_changed.wait_for(lock,std::chrono::seconds(2),[&]{return finished;}),"bounded worker completion");}
         deferred=false;runner.request(9,1,"127.0.0.1",[]{return true;},[&](hive::MediaProbeReport report){deferred=report.result==ERROR_BUSY;});require(deferred,"cooldown bypass");runner.stop();
         deferred=false;runner.request(10,1,"127.0.0.1",[]{return true;},[&](hive::MediaProbeReport report){deferred=report.result==ERROR_BUSY;});require(deferred,"shutdown admitted probe");
@@ -35,7 +35,7 @@ int main(int argc,char** argv){
         require(server.start({"diagnostic-server","Diagnostic server","Test1234",49235,false,true},cb,error),"server start");
         hive::TransportCallbacks reply;reply.media_probe_report=[&](const std::string&,hive::MediaProbeReport report){std::lock_guard lock(mutex);received=report.request==71&&report.result==2&&report.text=="generated remote result";changed.notify_all();};
         require(client.start({"diagnostic-client","Diagnostic client","Test1234",0,false,true},reply,error)&&client.connect("127.0.0.1",49235,peer,error),"encrypted connection");
-        require(!client.request_media_probe(peer,0,1)&&!client.request_media_probe(peer,1,4),"request bounds");
+        require(!client.request_media_probe(peer,0,1)&&!client.request_media_probe(peer,1,5),"request bounds");
         require(!server.send_media_probe_report("diagnostic-client",{71,0,std::string(hive::MaxMediaProbeReport+1,'x')}),"report bounds");
         require(client.request_media_probe(peer,71,2),"request send");
         {std::unique_lock lock(mutex);require(changed.wait_for(lock,std::chrono::seconds(3),[&]{return received;}),"encrypted report roundtrip");}

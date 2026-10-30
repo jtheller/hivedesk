@@ -1,4 +1,4 @@
-# Pinned upstream dispatcher, used ONLY by HiveDeskMediaProbe.
+# Pinned upstream dispatcher. Loaded only when an Intel backend/probe is used.
 set(vpl_windows main mfx_critical_section mfx_dispatcher mfx_dispatcher_log
     mfx_driver_store_loader mfx_dxva2_device mfx_function_table
     mfx_library_iterator mfx_load_dll mfx_win_reg_key)

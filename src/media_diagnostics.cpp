@@ -71,6 +71,7 @@ MediaProbeReport run_media_probe(uint32_t mode,const std::string& source,const s
     const auto root=std::filesystem::path(module).parent_path();
     if(mode==1||mode==2)return bounded_probe_process((root/L"HiveDeskMediaProbe.exe").wstring(),mode==2?L"--intel-roundtrip":L"",45000,cancelled);
     if(mode==3&&ipv4(source))return bounded_probe_process((root/L"HiveDeskRemoteVideoCheck.exe").wstring(),std::wstring(source.begin(),source.end())+L" 15000",30000,cancelled);
+    if(mode==4)return bounded_probe_process((root/L"HiveDeskProductionHostCheck.exe").wstring(),L"",30000,cancelled);
     return {0,ERROR_INVALID_PARAMETER,"Invalid fixed diagnostic mode or source address"};
 }
 void MediaDiagnostics::stop(){

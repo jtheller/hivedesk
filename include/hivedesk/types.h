@@ -52,6 +52,7 @@ constexpr uint32_t FeatureInputRelay = 8388608;
 constexpr uint32_t FeatureViewRoute = 16777216;
 constexpr uint32_t FeatureRemoteHive = 33554432;
 constexpr uint32_t FeatureMediaProbe = 67108864;
+constexpr uint32_t FeatureHostProbe = 134217728;
 constexpr size_t MaxMediaProbeReport = 48 * 1024;
 struct MediaProbeReport { uint64_t request=0; uint32_t result=0; std::string text; };
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
