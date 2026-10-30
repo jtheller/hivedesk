@@ -680,7 +680,7 @@ struct Shell::Impl {
     std::pair<std::wstring,std::wstring> card_label(int index) const {
         if(index==0)return {config.device_name.empty()?L"This computer":config.device_name,L"This computer"};
         if(index<1||index>static_cast<int>(peers.size()))return {L"No other computers",L"Open HiveDesk on another computer"};
-        const Peer& p=peers[index-1];return {wide(p.name.empty()?p.address:p.name),wide(p.address)+(p.authenticated?L"":L" / Discovered")};
+        const Peer& p=peers[index-1];return {wide(p.name.empty()?p.address:p.name),wide(p.address)+(p.authenticated?L"":L" / Offline - click to wake")};
     }
     int preview_index() const {
         if(!previous_id.empty())for(size_t i=0;i<peers.size();++i)if(peers[i].id==previous_id)return static_cast<int>(i)+1;

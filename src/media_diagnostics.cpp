@@ -2,6 +2,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <vector>
+#include <powrprof.h>
+#include <sstream>
 
 namespace hive {
 namespace {
@@ -72,6 +74,19 @@ MediaProbeReport run_media_probe(uint32_t mode,const std::string& source,const s
     if(mode==1||mode==2)return bounded_probe_process((root/L"HiveDeskMediaProbe.exe").wstring(),mode==2?L"--intel-roundtrip":L"",45000,cancelled);
     if(mode==3&&ipv4(source))return bounded_probe_process((root/L"HiveDeskRemoteVideoCheck.exe").wstring(),std::wstring(source.begin(),source.end())+L" 15000",30000,cancelled);
     if(mode==4)return bounded_probe_process((root/L"HiveDeskProductionHostCheck.exe").wstring(),L"",30000,cancelled);
+    if(mode==5){
+        MediaProbeReport report;std::ostringstream text;SYSTEM_POWER_CAPABILITIES capabilities{};SYSTEM_POWER_STATUS supply{};
+        if(GetPwrCapabilities(&capabilities))text<<"ModernStandby="<<unsigned(capabilities.AoAc)<<" S3="<<unsigned(capabilities.SystemS3)<<" Hibernate="<<unsigned(capabilities.SystemS4)<<'\n';
+        if(GetSystemPowerStatus(&supply))text<<"AC="<<unsigned(supply.ACLineStatus)<<" BatteryPercent="<<unsigned(supply.BatteryLifePercent)<<'\n';
+        wchar_t system[MAX_PATH]{};if(!GetSystemDirectoryW(system,MAX_PATH))return {0,GetLastError(),"System directory unavailable"};
+        const auto executable=(std::filesystem::path(system)/L"powercfg.exe").wstring();
+        for(const auto* command:{L"/a",L"/devicequery wake_armed",L"/devicequery wake_programmable"}){
+            auto part=bounded_probe_process(executable,command,5000,cancelled);
+            text<<"\npowercfg ";for(auto p=command;*p;++p)text<<char(*p);text<<" (exit="<<part.result<<")\n"<<part.text;
+            if(part.result==ERROR_CANCELLED||part.result==WAIT_TIMEOUT){report.result=part.result;break;}
+        }
+        report.text=text.str();if(report.text.size()>MaxMediaProbeReport)report.text.resize(MaxMediaProbeReport);return report;
+    }
     return {0,ERROR_INVALID_PARAMETER,"Invalid fixed diagnostic mode or source address"};
 }
 void MediaDiagnostics::stop(){

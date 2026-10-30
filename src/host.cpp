@@ -6,6 +6,7 @@
 #include "hivedesk/config.h"
 #include "hivedesk/shell.h"
 #include "hivedesk/desktop_session.h"
+#include "session_power.h"
 #include "hivedesk/gpu_policy_restart.h"
 #include <sddl.h>
 #include <wtsapi32.h>
@@ -35,6 +36,7 @@ bool trusted_client(HANDLE pipe,DWORD session){
     return ok&&CompareStringOrdinal(path,-1,(broker::module_directory()/L"HiveDesk.exe").c_str(),-1,TRUE)==CSTR_EQUAL;
 }
 struct Session {
+    SessionPower<> power;
     HANDLE pipe;MediaHost media;std::mutex write_mutex,media_mutex;
     std::atomic<bool> stopping{false},credit{true};bool active=false;StreamSettings settings{};std::wstring captured_desktop;
     HANDLE input_pipe=INVALID_HANDLE_VALUE;std::thread input_reader;
@@ -151,11 +153,13 @@ struct Session {
                 // Publish input authority before capture initialization. Later
                 // desktop restarts and feedback cannot obstruct this owner.
                 input_session=settings.session?settings.session:UINT64_MAX;
+                if(!settings.warm&&!power.activate())notice("Active-session power request partially unavailable; Windows power policy still applies.");
                 std::string error;active=start_media(error);
                 if(!active){send(broker::Failure,broker::Bytes(error.begin(),error.end()));break;}
                 if(!send(broker::Started))break;
             }else if(kind==broker::Activate){
                 std::lock_guard lock(media_mutex);if(!b.empty()||!active)break;
+                if(!power.activate())notice("Active-session power request partially unavailable; Windows power policy still applies.");
                 settings.warm=false;settings.preview=false;warming=false;media.activate();if(!send(broker::Activated))break;
             }else if(kind==broker::Preview){
                 const auto enabled=r.u32();std::lock_guard lock(media_mutex);
@@ -170,7 +174,7 @@ struct Session {
             }else valid=false;
             if(!valid)break;
         }
-        stop_status();stop_input();monitor.join();media.stop();
+        stop_status();stop_input();monitor.join();media.stop();power.release();
     }
 };
 }

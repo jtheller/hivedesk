@@ -5,8 +5,8 @@
 #include <condition_variable>
 #include <chrono>
 int main(int argc,char** argv){
-    if(argc!=3){std::puts("Usage: HiveDeskRemoteMediaProbe <IPv4> capabilities|intel-roundtrip|receive|host\nReceive previews THIS computer on the target for 15 seconds; no input or clipboard.");return 2;}
-    const std::string mode_name=argv[2];const uint32_t mode=mode_name=="capabilities"?1:mode_name=="intel-roundtrip"?2:mode_name=="receive"?3:mode_name=="host"?4:0;if(!mode)return 2;
+    if(argc!=3){std::puts("Usage: HiveDeskRemoteMediaProbe <IPv4> capabilities|intel-roundtrip|receive|host|power\nReceive previews THIS computer on the target for 15 seconds; power is read-only.");return 2;}
+    const std::string mode_name=argv[2];const uint32_t mode=mode_name=="capabilities"?1:mode_name=="intel-roundtrip"?2:mode_name=="receive"?3:mode_name=="host"?4:mode_name=="power"?5:0;if(!mode)return 2;
     setvbuf(stdout,nullptr,_IONBF,0);const auto config=hive::load_config();hive::Transport client;
     const auto request=GetTickCount64();std::mutex mutex;std::condition_variable changed;bool done=false;hive::MediaProbeReport report;
     hive::TransportCallbacks callbacks;callbacks.peer=[](const hive::Peer& p){if(!p.version.empty())std::printf("peer=%s version=%s\n",p.name.c_str(),p.version.c_str());};

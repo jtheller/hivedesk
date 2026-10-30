@@ -79,6 +79,9 @@ public:
     bool connect(const std::string& address, uint16_t port, std::string& peer_id, std::string& error);
     std::vector<Peer> peers() const;
     std::vector<Peer> visible_peers() const;
+    // Explicit selection only. Sends bounded on-link magic packets and queues
+    // discovery repair; never grants input authority or claims wake success.
+    unsigned wake_peer(const std::string& peer);
     bool view_allowed(const std::string&) const;
     void set_view_parent(const std::string&,uint64_t session);
     ViewRoute view_route() const;

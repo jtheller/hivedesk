@@ -878,6 +878,10 @@ private:
     }
     void retry_tick() {
         if(updating_||closing_||!reconnect_.current(generation_))return;
+        if(reconnect_.wake_due(generation_,GetTickCount64())){
+            const auto sent=transport_.wake_peer(reconnect_.peer);
+            if(sent&&reconnect_.wake_attempts==1)hive::log("Wake request sent for selected device: "+reconnect_.peer+"; awaiting authenticated connection and desktop.");
+        }
         const auto current=active_.load();
         if(current&&view_ready_) {
             const auto state=viewer_.load()->stats();

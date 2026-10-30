@@ -22,6 +22,7 @@
 #include "input_send_window.h"
 #include "datagram_video.h"
 #include "network_watch.h"
+#include "wake_lan.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -52,7 +53,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41, HiveSummon=42, HiveSummoned=43, MediaProbeRequest=44, MediaProbeReply=45 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41, HiveSummon=42, HiveSummoned=43, MediaProbeRequest=44, MediaProbeReply=45, WakeIdentity=46 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -214,7 +215,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe|FeatureWake;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -624,6 +625,7 @@ struct Transport::Impl {
     std::atomic<bool> refresh_network{false};
     mutable std::mutex mutex; std::mutex thread_mutex, connect_mutex,clipboard_connect_mutex,config_mutex; std::vector<std::shared_ptr<Conn>> connections;
     std::map<std::string,Pair> connected;
+    wake::Book wake_book;
     std::map<std::string,std::chrono::steady_clock::time_point> next_attempt;
     std::mutex sleep_mutex; std::condition_variable sleep_cv;
 
@@ -651,7 +653,7 @@ struct Transport::Impl {
                 if(it->second.clipboard)it->second.clipboard->close();
                 if(it->second.video)it->second.video->close();
                 if(it->second.input)it->second.input->close();
-                ended_peer=c.peer;connected.erase(it);notify=true;
+                ended_peer=it->second.control?it->second.control->peer:c.peer;wake_book.refresh(ended_peer,GetTickCount64());connected.erase(it);notify=true;
                 {std::lock_guard route_lock(route_mutex);routes.peers.erase(c.peer.id);if(routes.parent==c.peer.id){routes.parent.clear();routes.session=0;}routes.rebuild();}
             }
         }
@@ -735,6 +737,7 @@ struct Transport::Impl {
         DWORD timeout = 0; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout)); return running;
     }
     bool activate(const std::shared_ptr<Conn>& c) {
+        const auto mac=c->channel==0?wake::neighbor_mac(c->peer.address):wake::Mac{};
         {
             std::lock_guard lock(mutex); if (!running) return false;
             auto& pair = connected[c->peer.id]; auto& slot = c->channel == 0 ? pair.control : c->channel==1?pair.video:c->channel==2?pair.input:pair.clipboard;
@@ -748,6 +751,7 @@ struct Transport::Impl {
             if(c->bound_control_token&&c->bound_control_token!=pair.control->token)return false;
             if(c->channel==0){if(pair.clipboard){pair.clipboard->close();pair.clipboard.reset();}if(pair.video){pair.video->close();pair.video.reset();}if(pair.input){pair.input->close();pair.input.reset();}}
             slot = c; c->ready = true;
+            if(!c->channel){wake_book.forget(c->peer.id);wake_book.remember(c->peer,mac,GetTickCount64());}
             if(!c->channel){std::lock_guard route_lock(route_mutex);routes.peers.erase(c->peer.id);
                 // A new control connection never inherits an old viewing lease,
                 // even if its registration races the old reader's ended().
@@ -755,6 +759,12 @@ struct Transport::Impl {
         }
         if(!c->channel)publish_route();
         if (!c->channel && callbacks.peer) { try { callbacks.peer(c->peer); } catch (...) {} }
+        if(!c->channel&&(c->peer.features&FeatureWake)){
+            sockaddr_in local{};int size=sizeof(local);char address[INET_ADDRSTRLEN]{};
+            if(getsockname(c->socket,reinterpret_cast<sockaddr*>(&local),&size)==0&&inet_ntop(AF_INET,&local.sin_addr,address,sizeof(address))){
+                const auto identity=wake::local_mac(address);Bytes b{WakeIdentity};b.insert(b.end(),identity.begin(),identity.end());if(!c->enqueue(std::move(b)))return false;
+            }
+        }
         // Keep the authenticated hello layout and its random challenge intact.
         // Older peers never receive the optional encrypted version announcement.
         if(!c->channel&&(c->peer.features&FeatureBuildVersion)){
@@ -955,14 +965,21 @@ struct Transport::Impl {
         }
         case Rename:{
             auto name=r.string(256);if(!cfg.automatic_lan||!text_ok(name,256)||!r.end())return false;
-            Peer updated;{std::lock_guard lock(mutex);c.peer.name=std::move(name);updated=c.peer;}
+            Peer updated;{std::lock_guard lock(mutex);c.peer.name=std::move(name);updated=c.peer;wake_book.refresh(updated,GetTickCount64());}
             if(callbacks.peer)callbacks.peer(updated);return true;
+        }
+        case WakeIdentity:{
+            if(!(c.peer.features&FeatureWake)||b.size()!=7)return false;
+            wake::Mac mac{};std::copy_n(b.begin()+1,6,mac.begin());
+            if(mac!=wake::Mac{}&&!wake::valid(mac))return false;
+            std::lock_guard lock(mutex);const auto it=connected.find(c.peer.id);
+            if(it!=connected.end()&&it->second.control.get()==&c){wake_book.forget(c.peer.id);wake_book.remember(c.peer,mac,GetTickCount64());}return true;
         }
         case BuildVersion:{
             auto version=r.string(32);
             if(!(c.peer.features&FeatureBuildVersion)||!r.end()||version.empty()||
                 !std::all_of(version.begin(),version.end(),[](unsigned char ch){return (ch>='0'&&ch<='9')||(ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||ch=='.'||ch=='-'||ch=='+';}))return false;
-            Peer updated;{std::lock_guard lock(mutex);c.peer.version=std::move(version);updated=c.peer;}
+            Peer updated;{std::lock_guard lock(mutex);c.peer.version=std::move(version);updated=c.peer;wake_book.refresh(updated,GetTickCount64());}
             if(callbacks.peer)callbacks.peer(updated);return true;
         }
         case WarmCancel: {
@@ -1004,7 +1021,7 @@ struct Transport::Impl {
         }
         case MediaProbeRequest: {
             const auto request=r.qword();const auto mode=r.dword();
-            if(!(c.peer.features&FeatureMediaProbe)||!request||mode<1||mode>4||(mode==4&&!(c.peer.features&FeatureHostProbe))||!r.end())return false;
+            if(!(c.peer.features&FeatureMediaProbe)||!request||mode<1||mode>5||(mode==4&&!(c.peer.features&FeatureHostProbe))||(mode==5&&!(c.peer.features&FeatureWake))||!r.end())return false;
             if(callbacks.media_probe_request)callbacks.media_probe_request(c.peer,request,mode);
             else {Bytes reply{MediaProbeReply};u64(reply,request);u32(reply,ERROR_NOT_SUPPORTED);const std::string message="Media diagnostic unavailable in this process";reply.insert(reply.end(),message.begin(),message.end());c.enqueue(std::move(reply));}
             return true;
@@ -1249,7 +1266,7 @@ void Transport::stop() {
     { std::lock_guard lock(p.thread_mutex); }
     std::vector<std::shared_ptr<Impl::Conn>> connections; { std::lock_guard lock(p.mutex); connections = p.connections; }
     for (auto& c : connections) { c->close(); if (c->reader.joinable()) c->reader.join(); if (c->writer.joinable()) c->writer.join(); }
-    { std::lock_guard lock(p.mutex); p.connected.clear(); p.connections.clear(); p.next_attempt.clear();p.discovery_pending.clear(); }
+    { std::lock_guard lock(p.mutex); p.connected.clear();p.wake_book={}; p.connections.clear(); p.next_attempt.clear();p.discovery_pending.clear(); }
     SecureZeroMemory(p.group.data(),p.group.size()); SecureZeroMemory(p.cfg.group_key.data(),p.cfg.group_key.size()); p.cfg.group_key.clear(); if (p.winsock) { WSACleanup(); p.winsock = false; }
 }
 bool Transport::connect(const std::string& address, uint16_t port, std::string& peer_id, std::string& error) { return impl_->connect(address,port,peer_id,error); }
@@ -1264,8 +1281,26 @@ std::vector<Peer> Transport::peers() const {
     std::vector<Peer> result; std::lock_guard lock(impl_->mutex); for (const auto& [id,pair] : impl_->connected) if (pair.control && pair.control->ready && !pair.control->closed) result.push_back(pair.control->peer); return result;
 }
 std::vector<Peer> Transport::visible_peers()const {
-    auto list=peers();std::lock_guard lock(impl_->route_mutex);
+    auto list=peers();std::vector<wake::Record> remembered;
+    {std::lock_guard lock(impl_->mutex);remembered=impl_->wake_book.records(GetTickCount64());}
+    for(const auto& record:remembered)if(std::none_of(list.begin(),list.end(),[&](const Peer& p){return p.id==record.peer.id;})&&on_link(record.peer.address)){
+        auto peer=record.peer;peer.authenticated=false;list.push_back(std::move(peer));
+    }
+    std::lock_guard lock(impl_->route_mutex);
     std::erase_if(list,[&](const Peer& p){return !impl_->routes.allowed(p.id);});return list;
+}
+unsigned Transport::wake_peer(const std::string& peer){
+    if(!impl_->running||!view_allowed(peer))return 0;wake::Record target;bool found=false;
+    {std::lock_guard lock(impl_->mutex);for(const auto& record:impl_->wake_book.records(GetTickCount64()))if(record.peer.id==peer){target=record;found=true;break;}}
+    if(!found||!on_link(target.peer.address))return 0;
+    const auto sent=wake::send(target.peer.address,target.mac);
+    if(!connection_token(peer)){
+        std::lock_guard lock(impl_->mutex);
+        if(impl_->cfg.discovery&&impl_->discovery_pending.size()<64&&std::none_of(impl_->discovery_pending.begin(),impl_->discovery_pending.end(),[&](const Peer& p){return p.id==peer;})){
+            impl_->discovery_pending.push_back(target.peer);impl_->discovery_cv.notify_one();
+        }
+    }
+    return sent;
 }
 bool Transport::view_allowed(const std::string& peer)const {std::lock_guard lock(impl_->route_mutex);return impl_->routes.allowed(peer);}
 ViewRoute Transport::view_route()const {std::lock_guard lock(impl_->route_mutex);return impl_->routes.local;}
@@ -1529,7 +1564,7 @@ bool Transport::send_clipboard_packet(const std::string& peer,const std::vector<
 }
 bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{ClipboardText}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
 bool Transport::request_media_probe(const std::string& peer,uint64_t request,uint32_t mode) {
-    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureMediaProbe)||!request||mode<1||mode>4||(mode==4&&!(c->peer.features&FeatureHostProbe)))return false;
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureMediaProbe)||!request||mode<1||mode>5||(mode==4&&!(c->peer.features&FeatureHostProbe))||(mode==5&&!(c->peer.features&FeatureWake)))return false;
     Bytes b{MediaProbeRequest};u64(b,request);u32(b,mode);return c->enqueue(std::move(b));
 }
 bool Transport::send_media_probe_report(const std::string& peer,const MediaProbeReport& report) {
@@ -1886,10 +1921,29 @@ bool Transport::self_test(std::string& result) {
         }
     }
     {
+        Transport endpoint;auto& owner=*endpoint.impl_;auto c=std::make_shared<Impl::Conn>(&owner,INVALID_SOCKET);
+        c->channel=0;c->peer={"wake-peer","Wake peer","192.0.2.50",47980,true,FeatureWake};owner.connected[c->peer.id].control=c;
+        Bytes packet{WakeIdentity,0x40,0x74,0xe0,0x75,0x70,0x2e};
+        if(!owner.dispatch(*c,packet)||owner.wake_book.records(GetTickCount64()).size()!=1){result="Authenticated wake identity rejected";return false;}
+        auto bad=packet;bad[1]=1;if(owner.dispatch(*c,bad)){result="Multicast wake identity accepted";return false;}
+        bad.pop_back();if(owner.dispatch(*c,bad)){result="Short wake identity accepted";return false;}
+        c->channel=1;if(owner.dispatch(*c,packet)){result="Wake identity accepted on video lane";return false;}c->channel=0;
+        c->peer.features=0;if(owner.dispatch(*c,packet)){result="Unnegotiated wake identity accepted";return false;}c->peer.features=FeatureWake;
+        Impl::Conn stale(&owner,INVALID_SOCKET);stale.channel=0;stale.peer=c->peer;
+        Bytes unavailable{WakeIdentity,0,0,0,0,0,0};
+        if(!owner.dispatch(stale,unavailable)||owner.wake_book.records(GetTickCount64()).empty()){result="Stale connection replaced wake identity";return false;}
+        if(!owner.dispatch(*c,unavailable)||!owner.wake_book.records(GetTickCount64()).empty()){result="Missing hardware did not revoke wake identity";return false;}
+    }
+    {
         Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);control.channel=0;control.peer.features=FeatureMediaProbe;
         bool called=false;owner.callbacks.media_probe_request=[&](const Peer&,uint64_t id,uint32_t mode){called=id==9&&mode==2;};
         Bytes request{MediaProbeRequest};u64(request,9);u32(request,2);
         if(!owner.dispatch(control,request)||!called){result="Media probe dispatch failed";return false;}
+        Bytes power_request{MediaProbeRequest};u64(power_request,9);u32(power_request,5);
+        if(owner.dispatch(control,power_request)){result="Unnegotiated power report accepted";return false;}
+        control.peer.features|=FeatureWake;called=false;
+        owner.callbacks.media_probe_request=[&](const Peer&,uint64_t id,uint32_t mode){called=id==9&&mode==5;};
+        if(!owner.dispatch(control,power_request)||!called){result="Negotiated power report rejected";return false;}
         Bytes host_request{MediaProbeRequest};u64(host_request,9);u32(host_request,4);
         if(owner.dispatch(control,host_request)){result="Unnegotiated host probe accepted";return false;}
         control.peer.features|=FeatureHostProbe;called=false;
