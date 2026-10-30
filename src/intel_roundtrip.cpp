@@ -1,5 +1,6 @@
 #include "intel_roundtrip.h"
 #include "intel_system_surfaces.h"
+#include "intel_probe_limits.h"
 #include "hevc_format.h"
 #include <vpl/mfxmemory.h>
 #include <windows.h>
@@ -70,6 +71,10 @@ std::string intel_roundtrip(mfxSession session){
     const auto initialized=MFXVideoENCODE_Init(session,&p);encoder.open=initialized>=0;exact(initialized,"HEVC444 encode Init");
     mfxVideoParam actual{};exact(MFXVideoENCODE_GetVideoParam(session,&actual),"Encode GetVideoParam");
     require(format(actual)&&actual.mfx.GopRefDist==1,"Intel initialized encoder changed format or frame ordering");
+    storage.resize(intel_probe_bitstream_capacity(actual.mfx));bits.Data=storage.data();bits.MaxLength=mfxU32(storage.size());
+    std::printf("  intel.encode.buffer_kb=%u brc_multiplier=%u capacity_bytes=%u target_kbps=%u\n",
+        actual.mfx.BufferSizeInKB,actual.mfx.BRCParamMultiplier,bits.MaxLength,
+        unsigned(actual.mfx.TargetKbps)*std::max<unsigned>(1,actual.mfx.BRCParamMultiplier));
     if(!managed){mfxFrameAllocRequest allocation{};exact(MFXVideoENCODE_QueryIOSurf(session,&actual,&allocation),"Encode QueryIOSurf");encode_surfaces.allocate(actual.mfx.FrameInfo,std::max<unsigned>(2,allocation.NumFrameSuggested));}
     const auto encode=[&](mfxFrameSurface1* surface){
         bits.DataOffset=bits.DataLength=0;mfxSyncPoint point=nullptr;
@@ -97,6 +102,7 @@ std::string intel_roundtrip(mfxSession session){
     require(outputs==Frames,"Intel encoded frame count changed");
     const auto sps=hive::hevc_annexb_format(encoded);
     require(sps&&sps->full_chroma8()&&sps->width==Width&&sps->height==Height,"Actual Intel bitstream is not 640x360 8-bit HEVC 4:4:4");
+    std::printf("  intel.encode=PASS frames=%u actual_sps=640x360/HEVC444/8bit bytes=%zu\n",outputs,encoded.size());
     exact(MFXVideoENCODE_Close(session),"Encode Close");encoder.open=false;
 
     mfxBitstream input{};input.Data=encoded.data();input.MaxLength=input.DataLength=mfxU32(encoded.size());

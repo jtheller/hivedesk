@@ -1,7 +1,16 @@
 #include "../src/intel_system_surfaces.h"
+#include "../src/intel_probe_limits.h"
 #include <cstdio>
 int main(){
     try{
+        mfxInfoMFX bitstream{};
+        if(intel_probe_bitstream_capacity(bitstream)!=4*1024*1024)return 1;
+        bitstream.BufferSizeInKB=6250;bitstream.BRCParamMultiplier=2;
+        if(intel_probe_bitstream_capacity(bitstream)!=12500000)return 1;
+        bitstream.BRCParamMultiplier=0;
+        if(intel_probe_bitstream_capacity(bitstream)!=6250000)return 1;
+        bitstream.BufferSizeInKB=65535;bitstream.BRCParamMultiplier=65535;
+        bool oversized=false;try{intel_probe_bitstream_capacity(bitstream);}catch(const std::runtime_error&){oversized=true;}if(!oversized)return 1;
         mfxFrameInfo info{};info.FourCC=MFX_FOURCC_AYUV;info.ChromaFormat=MFX_CHROMAFORMAT_YUV444;
         info.BitDepthLuma=info.BitDepthChroma=8;info.Width=640;info.Height=368;info.CropW=640;info.CropH=360;
         IntelSystemSurfaces pool;pool.allocate(info,2);auto* first=pool.available();
@@ -13,6 +22,6 @@ int main(){
         bool rejected=false;try{IntelSystemSurfaces invalid;invalid.allocate(info,33);}catch(const std::runtime_error&){rejected=true;}if(!rejected)return 1;
         rejected=false;info.CropW=641;try{IntelSystemSurface invalid(info);}catch(const std::runtime_error&){rejected=true;}if(!rejected)return 1;
         rejected=false;info.CropW=640;info.FourCC=MFX_FOURCC_NV12;try{IntelSystemSurface invalid(info);}catch(const std::runtime_error&){rejected=true;}if(!rejected)return 1;
-        std::puts("PASS legacy AYUV layout, padded allocation, locked-surface ownership/reuse, bounds and no chroma downgrade");return 0;
+        std::puts("PASS Intel bitstream capacity/multiplier/overflow bounds; legacy AYUV layout, padded allocation, locked-surface ownership/reuse and no chroma downgrade");return 0;
     }catch(...){return 1;}
 }
