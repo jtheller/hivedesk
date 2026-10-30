@@ -124,8 +124,36 @@ The corrected 0.13.7 probe passed on both enumerated Intel adapter instances:
 16 encoded and decoded frames, actual HEVC444/8-bit SPS, mean absolute Y/U/V
 errors 0.34264/0.326287/0.278204. Its initialized output allocation was
 25,000,000 bytes (12,500 KB with multiplier 2). This generated qualification
-does not establish desktop-streaming performance; 0.14.0 production-host
-acceptance must be recorded separately.
+does not establish desktop-streaming performance.
+
+JT was observed running 0.14.2 after idle OTA on 2026-10-30 at 13:50 UTC.
+The production generated test passed all 48 frames in 719 ms, including the
+requested recovery IDR, no unexpected IDRs, color checks and final draining.
+Its live-rate request was declined and disabled; the original bitrate and
+subsequent pictures remained valid. This device therefore retains initialized
+CBR plus adaptive capture pacing, rather than claiming working live CBR reset.
+The real 2736x1824 primary-capture test then decoded initial and recovery IDRs.
+
+Actual network verification on 0.14.2, using read-only preview leases:
+
+- JT to DEVG: original 2736x1824 HEVC444 presented through NVIDIA NVDEC;
+  a 15-second static-desktop run received 16 frames and presented 14 distinct
+  pictures. Three fresh 5-second starts all presented pictures without decline.
+- DEVG to JT: a 15-second 2560x1440 receiving run received 787 frames and
+  presented 706 distinct pictures through the CPU decoder, without decline.
+  Sampled CPU decode median was 7.40 ms; conversion median was 2.50 ms.
+- A separate 10-second JT-to-DEVG timing run received/presented 12 pictures.
+  Nine distinct source telemetry samples had median color cost 5.81 ms and
+  median codec submission/completion cost 247.69 ms (126.50-355.77 ms).
+  This is a remaining source-latency concern, not a smoothness pass. Sparse
+  static-desktop updates do not measure maximum sustained frame throughput.
+
+The 0.14.2 release passed 52 native tests, managed settings bridge checks and
+real WinUI light/dark checks. During 0.14.1 validation, one app-session graphics
+recovery test failed; its unchanged binary then passed an isolated rerun,
+three repeats, the full suite and six further repeats. That intermittent
+failure was not reproduced or declared fixed. NVIDIA codec implementations
+were not changed by the Intel integration.
 
 SDK sources and licenses are pinned under `third_party/onevpl` and
 `third_party/amf`. No additional vendor runtime is bundled or required by the
