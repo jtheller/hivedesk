@@ -51,7 +51,15 @@ void intel_pipeline_check(){
     try{
         std::vector<uint8_t> pixels(640*360*4);
         for(unsigned frame=0;frame<48;++frame){
-            if(frame==16||frame==32){wait([&]{return encoder.in_flight()==0;});if(encoder.dynamic_rate()&&encoder.reconfigure(frame==16?12000000:8000000,frame==16?50000:60000))++changes;}
+            if(frame==16||frame==32){
+                wait([&]{return encoder.in_flight()==0;});
+                if(encoder.dynamic_rate()){
+                    const auto prior_bitrate=encoder.bitrate_bps();const bool changed=encoder.reconfigure(frame==16?12000000:8000000,frame==16?50000:60000);
+                    if(changed)++changes;
+                    else if(encoder.dynamic_rate()||encoder.bitrate_bps()!=prior_bitrate)throw std::runtime_error("Intel rejected reset did not retain bitrate and disable unsupported changes");
+                    std::printf("Intel rate request at frame=%u applied=%d dynamic=%d bitrate=%u; subsequent pictures must retain sequence/color/IDR\n",frame,changed,encoder.dynamic_rate(),encoder.bitrate_bps());
+                }
+            }
             wait([&]{return encoder.ready();});
             for(unsigned y=0;y<360;++y)for(unsigned x=0;x<640;++x){const auto color=rgb(x,y,frame);auto* p=&pixels[(y*640+x)*4];p[0]=color[2];p[1]=color[1];p[2]=color[0];p[3]=255;}
             context->UpdateSubresource(texture.Get(),0,nullptr,pixels.data(),640*4,0);bool queued=false;

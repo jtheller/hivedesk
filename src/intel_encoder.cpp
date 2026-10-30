@@ -41,13 +41,12 @@ struct Parameters {
     Parameters& operator=(const Parameters& other){video=other.video;coding=other.coding;quality=other.quality;signal=other.signal;reset=other.reset;bind(other.video.NumExtParam==4);return *this;}
     void bind(bool resetting){extensions={&coding.Header,&quality.Header,&signal.Header,&reset.Header};video.ExtParam=extensions.data();video.NumExtParam=resetting?4:3;}
 };
-void set_rate(Parameters& p,uint32_t bitrate,uint32_t millihz){
-    require(bitrate>=1000000&&bitrate<=1000000000&&millihz>=1000&&millihz<=4000000,"Intel bitrate/refresh out of bounds");
+void set_bitrate(Parameters& p,uint32_t bitrate){
+    require(bitrate>=1000000&&bitrate<=1000000000,"Intel bitrate out of bounds");
     // Fixed multiplier permits live changes up to 1 Gbit/s without changing
     // the initial bitstream allocation. Quantization is at most 16 kbit/s.
     p.video.mfx.BRCParamMultiplier=16;
     p.video.mfx.TargetKbps=p.video.mfx.MaxKbps=mfxU16((uint64_t(bitrate)+15999)/16000);
-    p.video.mfx.FrameInfo.FrameRateExtN=millihz;p.video.mfx.FrameInfo.FrameRateExtD=1000;
 }
 bool format(const Parameters& p,uint32_t width,uint32_t height){
     const auto& v=p.video;const auto& f=v.mfx.FrameInfo;
@@ -114,7 +113,7 @@ struct IntelEncoder::Impl {
         v.mfx.TargetUsage=MFX_TARGETUSAGE_BEST_SPEED;v.mfx.GopRefDist=1;v.mfx.GopPicSize=65535;v.mfx.NumRefFrame=1;v.mfx.RateControlMethod=MFX_RATECONTROL_CBR;
         f.FourCC=MFX_FOURCC_AYUV;f.ChromaFormat=MFX_CHROMAFORMAT_YUV444;f.BitDepthLuma=f.BitDepthChroma=8;
         f.Width=mfxU16((w+15)&~15u);f.Height=mfxU16((h+15)&~15u);f.CropW=mfxU16(w);f.CropH=mfxU16(h);f.PicStruct=MFX_PICSTRUCT_PROGRESSIVE;
-        set_rate(p,bitrate,millihz);
+        set_bitrate(p,bitrate);f.FrameRateExtN=millihz;f.FrameRateExtD=1000;
         v.mfx.BufferSizeInKB=mfxU16(std::max<uint64_t>(1,(uint64_t(w)*h*3+15999)/16000));v.mfx.InitialDelayInKB=v.mfx.BufferSizeInKB;
         p.coding.NalHrdConformance=MFX_CODINGOPTION_OFF;p.coding.VuiNalHrdParameters=MFX_CODINGOPTION_OFF;
         p.quality.RepeatPPS=MFX_CODINGOPTION_ON;
@@ -147,17 +146,42 @@ uint32_t IntelEncoder::bitrate_bps()const{return impl_->bitrate;}
 uint32_t IntelEncoder::nominal_millihz()const{return impl_->millihz;}
 bool IntelEncoder::reconfigure(uint32_t bitrate,uint32_t millihz){
     auto& d=*impl_;{std::lock_guard lock(d.mutex);if(d.failure)std::rethrow_exception(d.failure);if(!d.dynamic||d.finishing||d.count)return false;}
-    if(bitrate==d.bitrate&&millihz==d.millihz)return true;
-    Parameters change=d.parameters;set_rate(change,bitrate,millihz);change.reset.StartNewSequence=MFX_CODINGOPTION_OFF;change.bind(true);
+    require(millihz>=1000&&millihz<=4000000,"Intel pacing refresh out of bounds");
+    // Pacing may change without rewriting HEVC sequence timing. Intel only
+    // documents bitrate/QP/slice changes as reference-preserving resets;
+    // changing FrameRateExtN/D caused JT's Reset to reject a successful Query.
+    // millihz acknowledges the scheduler's target, not a changed codec clock.
+    if(bitrate==d.bitrate){d.millihz=millihz;return true;}
+    Parameters change=d.parameters;set_bitrate(change,bitrate);change.reset.StartNewSequence=MFX_CODINGOPTION_OFF;change.bind(true);
     Parameters requested=change;const auto query=MFXVideoENCODE_Query(d.session,&requested.video,&change.video);
-    if(!configuration_status(query)||change.reset.StartNewSequence!=MFX_CODINGOPTION_OFF||!format(change,d.width,d.height)||
+    const auto same_timing=[&](const Parameters& candidate){return
+        candidate.video.mfx.FrameInfo.FrameRateExtN==d.parameters.video.mfx.FrameInfo.FrameRateExtN&&
+        candidate.video.mfx.FrameInfo.FrameRateExtD==d.parameters.video.mfx.FrameInfo.FrameRateExtD;};
+    if(!configuration_status(query)||change.reset.StartNewSequence!=MFX_CODINGOPTION_OFF||!format(change,d.width,d.height)||!same_timing(change)||
        intel_probe_bitstream_capacity(change.video.mfx)>d.slots.front().storage.size()){
         d.dynamic=false;log("Intel live CBR change unavailable; retaining codec state and adaptive frame pacing. Query="+std::to_string(query));return false;
     }
-    const auto status=MFXVideoENCODE_Reset(d.session,&change.video);if(!configuration_status(status))exact(status,"Intel reference-preserving CBR change");
+    const auto status=MFXVideoENCODE_Reset(d.session,&change.video);
+    if(status==MFX_ERR_INVALID_VIDEO_PARAM||status==MFX_ERR_INCOMPATIBLE_VIDEO_PARAM||status==MFX_ERR_UNSUPPORTED){
+        // Some legacy implementations accept Query but reject the live reset.
+        // Keep streaming only if the runtime still reports the original usable
+        // configuration. Device failures and changed state remain hard errors.
+        Parameters retained=d.parameters;retained.bind(false);
+        exact(MFXVideoENCODE_GetVideoParam(d.session,&retained.video),"Intel parameters after rejected CBR change");
+        const auto& old=d.parameters.video.mfx;const auto& now=retained.video.mfx;
+        require(format(retained,d.width,d.height)&&now.BRCParamMultiplier==old.BRCParamMultiplier&&
+            now.TargetKbps==old.TargetKbps&&now.MaxKbps==old.MaxKbps&&now.BufferSizeInKB==old.BufferSizeInKB&&
+            now.InitialDelayInKB==old.InitialDelayInKB&&now.FrameInfo.FrameRateExtN==old.FrameInfo.FrameRateExtN&&
+            now.FrameInfo.FrameRateExtD==old.FrameInfo.FrameRateExtD&&now.GopPicSize==old.GopPicSize&&now.NumRefFrame==old.NumRefFrame,
+            "Intel rejected CBR change did not retain original codec state");
+        d.parameters=retained;d.dynamic=false;
+        log("Intel live CBR reset rejected; original parameters verified, retaining codec and adaptive pacing. Reset="+std::to_string(status));
+        return false;
+    }
+    if(!configuration_status(status))exact(status,"Intel reference-preserving CBR change");
     change.bind(false);
     exact(MFXVideoENCODE_GetVideoParam(d.session,&change.video),"Intel parameters after CBR change");
-    require(format(change,d.width,d.height),"Intel CBR change altered format or quality");
+    require(format(change,d.width,d.height)&&same_timing(change),"Intel CBR change altered format, timing or quality");
     d.parameters=change;d.bitrate=bitrate;d.millihz=millihz;return true;
 }
 bool IntelEncoder::submit_texture(ID3D11Texture2D* texture,uint64_t sequence,bool force,uint64_t captured,bool* queued,CursorComposition cursor){

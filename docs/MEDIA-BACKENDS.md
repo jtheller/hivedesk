@@ -18,6 +18,12 @@ warm/Peek lifecycle and adaptive pacing. Each requested recovery IDR is checked
 against its actual SPS before delivery. Timestamp correspondence is mandatory.
 Supported runtime rate changes request continuation of the coded sequence;
 unsupported reset queries retain the current codec and adaptive pacing.
+Since 0.14.2, capture pacing changes never rewrite the Intel codec's sequence
+frame rate. Only the bitrate is proposed for a reference-preserving reset.
+If Reset rejects a successful Query, the backend reads back the original rate,
+timing, format and quality before disabling live resets for that session;
+device errors or changed parameters still fail. Subsequent generated pictures
+must retain their sequence, colors and forced-IDR behavior in qualification.
 
 This first Intel path has upload/readback overhead; it is not zero-copy.
 Intel hardware receiving remains separate work. AMD hosting is not implemented.
@@ -55,7 +61,7 @@ The test reports encoded bytes and Y/U/V mean/maximum errors. Exit status is
 absent. This test uses CPU-mapped diagnostic patterns, not desktop capture or
 a production zero-copy path, and does not qualify latency or frame throughput.
 
-An exact query or generated roundtrip is NOT a functioning backend. Remaining
+An exact query or generated roundtrip is NOT a functioning backend.
 Remaining Intel hardware work includes hardware decoder integration and
 real-device sustained throughput/latency qualification. The production host
 uses the system-memory path even on newer runtimes; managed surfaces remain
