@@ -1,6 +1,7 @@
 #include "../src/intel_encoder.h"
 #include "../src/software_decoder.h"
 #include <wrl/client.h>
+#include <d3d10.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -33,7 +34,7 @@ void intel_pipeline_check(){
     D3D11_TEXTURE2D_DESC desc{};desc.Width=640;desc.Height=360;desc.MipLevels=desc.ArraySize=1;desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> texture;if(FAILED(device->CreateTexture2D(&desc,nullptr,&texture)))throw std::runtime_error("Pipeline generated texture");
     hive::StreamSettings settings;settings.session=1;settings.receiver_millihz=60000;
-    std::atomic<bool> failed=false;std::exception_ptr failure;std::mutex mutex;
+    std::atomic<bool> failed=false;std::atomic<unsigned> completed=0;std::exception_ptr failure;std::mutex mutex;
     hive::IntelEncoder encoder(640,360,settings,adapter.Get(),texture.Get(),[&]{return failed.load();});
     uint64_t error_sum=0,samples=0;unsigned decoded=0,changes=0;hive::SoftwareDecoder decoder;
     std::thread consumer([&]{try{hive::IntelEncoder::Completion result;while(encoder.receive(result)){
@@ -44,7 +45,7 @@ void intel_pipeline_check(){
                 const std::array<float,3> expected{luma,(color[2]-luma)/1.8556f+128,(color[0]-luma)/1.5748f+128};
                 for(unsigned c=0;c<3;++c){error_sum+=uint64_t(std::abs(int(picture.planes[c][y*picture.strides[c]+x])-int(std::floor(expected[c]+.5f))));++samples;}
             }
-        });++decoded;
+        });++decoded;completed=decoded;
     }}catch(...){std::lock_guard lock(mutex);failure=std::current_exception();failed=true;}});
     const auto began=GetTickCount64();
     const auto wait=[&](auto predicate){while(!predicate()){if(failed||GetTickCount64()-began>15000)throw std::runtime_error("Intel pipeline completion failed or timed out");Sleep(1);}};
@@ -65,6 +66,17 @@ void intel_pipeline_check(){
             context->UpdateSubresource(texture.Get(),0,nullptr,pixels.data(),640*4,0);bool queued=false;
             const auto stamp=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
             if(!encoder.submit_texture(texture.Get(),frame,frame==0||frame==24,stamp,&queued,hive::CursorComposition::Unknown)||!queued)throw std::runtime_error("Intel pipeline lost submission");
+            if(frame==8){
+                // The capture context can be occupied by a blocking DXGI call.
+                // A submitted codec job must finish without needing its lock.
+                ComPtr<ID3D10Multithread> capture_lock;
+                if(FAILED(context.As(&capture_lock)))throw std::runtime_error("Intel pipeline capture lock interface");
+                capture_lock->Enter();const bool was_pending=completed.load()<frame+1;const auto until=GetTickCount64()+1000;
+                while(completed.load()<frame+1&&!failed&&GetTickCount64()<until)Sleep(1);
+                const bool independent=completed.load()>=frame+1;capture_lock->Leave();
+                if(!independent)throw std::runtime_error("Intel codec completion stalled behind the capture context lock");
+                std::puts(was_pending?"PASS Intel completion while capture-context lock is held":"SKIP Intel capture-lock contention check: picture already completed");
+            }
         }
         encoder.finish();consumer.join();if(failure)std::rethrow_exception(failure);
     }catch(...){encoder.finish();if(consumer.joinable())consumer.join();if(failure)std::rethrow_exception(failure);throw;}

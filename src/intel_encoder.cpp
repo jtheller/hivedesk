@@ -91,9 +91,16 @@ struct IntelEncoder::Impl {
     void initialize(uint32_t w,uint32_t h,const StreamSettings& settings,IDXGIAdapter* adapter,ID3D11Texture2D* texture,std::function<bool()> stop){
         require(w&&h&&w<=8192&&h<=8192&&!(w&1)&&!(h&1),"Intel HEVC444 requires even primary dimensions up to 8192");
         width=w;height=h;source=texture;cancelled=std::move(stop);require(texture&&adapter,"Intel primary capture resources missing");
-        texture->GetDevice(&device);device->GetImmediateContext(&context);
-        ComPtr<ID3D10Multithread> multithread;require(SUCCEEDED(context.As(&multithread)),"Intel D3D11 multithread interface");multithread->SetMultithreadProtected(TRUE);
         DXGI_ADAPTER_DESC wanted{};require(SUCCEEDED(adapter->GetDesc(&wanted))&&wanted.VendorId==0x8086,"Intel encoder adapter mismatch");
+        // Input is owned system-memory AYUV, not a shared D3D texture. Give the
+        // runtime its own device on the capture adapter: DXGI's blocking idle
+        // acquisition must not compete with codec workers for the capture
+        // device/context lock. Color conversion stays on the capture device.
+        const auto created=D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT|D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context);
+        if(FAILED(created))throw std::runtime_error("Intel dedicated codec device HRESULT="+std::to_string(uint32_t(created)));
+        ComPtr<ID3D10Multithread> multithread;require(SUCCEEDED(context.As(&multithread)),"Intel D3D11 multithread interface");multithread->SetMultithreadProtected(TRUE);
         ComPtr<IDXGIFactory1> factory;require(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))),"Intel DXGI factory");
         UINT index=0;for(;;++index){ComPtr<IDXGIAdapter1> candidate;require(factory->EnumAdapters1(index,&candidate)!=DXGI_ERROR_NOT_FOUND,"Intel primary adapter not enumerated");DXGI_ADAPTER_DESC1 desc{};
             require(SUCCEEDED(candidate->GetDesc1(&desc)),"Intel adapter identity");if(desc.AdapterLuid.LowPart==wanted.AdapterLuid.LowPart&&desc.AdapterLuid.HighPart==wanted.AdapterLuid.HighPart)break;}
@@ -133,7 +140,7 @@ struct IntelEncoder::Impl {
         for(auto& slot:slots){slot.storage.resize(capacity);slot.bits.Data=slot.storage.data();slot.bits.MaxLength=capacity;
             extension(slot.info,MFX_EXTBUFF_ENCODED_FRAME_INFO);slot.info_pointer=&slot.info.Header;
             if(frame_info){slot.bits.ExtParam=&slot.info_pointer;slot.bits.NumExtParam=1;}}
-        log("Intel HEVC444 hardware encoder: full-range BT.709, GPU color + system-memory upload, 2 IO slots / codec AsyncDepth 1; QP feedback="+std::to_string(frame_info)+", dynamic CBR="+std::to_string(dynamic));
+        log("Intel HEVC444 hardware encoder: dedicated codec D3D11 device, full-range BT.709, GPU color + system-memory upload, 2 IO slots / codec AsyncDepth 1; QP feedback="+std::to_string(frame_info)+", dynamic CBR="+std::to_string(dynamic));
     }
 };
 IntelEncoder::IntelEncoder(uint32_t w,uint32_t h,const StreamSettings& s,IDXGIAdapter* a,ID3D11Texture2D* t,std::function<bool()> cancelled):impl_(std::make_unique<Impl>()){impl_->initialize(w,h,s,a,t,std::move(cancelled));}

@@ -26,6 +26,13 @@ device errors or changed parameters still fail. Subsequent generated pictures
 must retain their sequence, colors and forced-IDR behavior in qualification.
 
 This first Intel path has upload/readback overhead; it is not zero-copy.
+Since 0.14.3 the hardware codec owns a separate D3D11 device on the same
+adapter. The capture/color device is not given to Media SDK: system-memory
+AYUV already separates their resource ownership, so blocking DXGI acquisition
+need not share a device/context lock with codec workers. Real-device latency
+comparison remains necessary; the shared-device contention hypothesis is not
+proven by a source change alone. The generated qualification also checks
+completion while the capture-context multithread lock is held.
 Intel hardware receiving remains separate work. AMD hosting is not implemented.
 
 `HiveDeskMediaProbe.exe` is a separate, explicit diagnostic executable:
