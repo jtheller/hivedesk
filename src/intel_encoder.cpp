@@ -53,7 +53,7 @@ bool format(const Parameters& p,uint32_t width,uint32_t height){
     const auto& v=p.video;const auto& f=v.mfx.FrameInfo;
     return v.mfx.CodecId==MFX_CODEC_HEVC&&v.mfx.CodecProfile==MFX_PROFILE_HEVC_REXT&&
         f.FourCC==MFX_FOURCC_AYUV&&f.ChromaFormat==MFX_CHROMAFORMAT_YUV444&&f.BitDepthLuma==8&&f.BitDepthChroma==8&&
-        f.CropW==width&&f.CropH==height&&v.mfx.GopRefDist==1&&v.AsyncDepth==2&&v.IOPattern==MFX_IOPATTERN_IN_SYSTEM_MEMORY&&
+        f.CropW==width&&f.CropH==height&&v.mfx.GopRefDist==1&&v.AsyncDepth==1&&v.IOPattern==MFX_IOPATTERN_IN_SYSTEM_MEMORY&&
         v.mfx.RateControlMethod==MFX_RATECONTROL_CBR&&p.quality.MaxQPI==AutoRateMaxQp&&p.quality.MaxQPP==AutoRateMaxQp&&
         p.signal.VideoFullRange==1&&p.signal.ColourDescriptionPresent==1&&p.signal.MatrixCoefficients==1;
 }
@@ -106,7 +106,11 @@ struct IntelEncoder::Impl {
         millihz=settings.session?std::clamp(settings.receiver_millihz,1000u,4000000u):(settings.fps?settings.fps:120)*1000;
         bitrate=automatic?initial_auto_bitrate(w,h,millihz):settings.bitrate_mbps*1000000u;
         auto& p=parameters;auto& v=p.video;auto& f=v.mfx.FrameInfo;
-        v.AsyncDepth=2;v.IOPattern=MFX_IOPATTERN_IN_SYSTEM_MEMORY;v.mfx.CodecId=MFX_CODEC_HEVC;v.mfx.CodecProfile=MFX_PROFILE_HEVC_REXT;
+        // AsyncDepth > 1 makes Media SDK 1.35 retain the first HEVC picture
+        // (MORE_DATA), which deadlocks single-picture warm/idle desktops.
+        // Two application slots still overlap preparation with completion;
+        // the codec itself must produce an output from its first input.
+        v.AsyncDepth=1;v.IOPattern=MFX_IOPATTERN_IN_SYSTEM_MEMORY;v.mfx.CodecId=MFX_CODEC_HEVC;v.mfx.CodecProfile=MFX_PROFILE_HEVC_REXT;
         v.mfx.TargetUsage=MFX_TARGETUSAGE_BEST_SPEED;v.mfx.GopRefDist=1;v.mfx.GopPicSize=65535;v.mfx.NumRefFrame=1;v.mfx.RateControlMethod=MFX_RATECONTROL_CBR;
         f.FourCC=MFX_FOURCC_AYUV;f.ChromaFormat=MFX_CHROMAFORMAT_YUV444;f.BitDepthLuma=f.BitDepthChroma=8;
         f.Width=mfxU16((w+15)&~15u);f.Height=mfxU16((h+15)&~15u);f.CropW=mfxU16(w);f.CropH=mfxU16(h);f.PicStruct=MFX_PICSTRUCT_PROGRESSIVE;
@@ -130,7 +134,7 @@ struct IntelEncoder::Impl {
         for(auto& slot:slots){slot.storage.resize(capacity);slot.bits.Data=slot.storage.data();slot.bits.MaxLength=capacity;
             extension(slot.info,MFX_EXTBUFF_ENCODED_FRAME_INFO);slot.info_pointer=&slot.info.Header;
             if(frame_info){slot.bits.ExtParam=&slot.info_pointer;slot.bits.NumExtParam=1;}}
-        log("Intel HEVC444 hardware encoder: full-range BT.709, GPU color + system-memory upload, 2 in flight; QP feedback="+std::to_string(frame_info)+", dynamic CBR="+std::to_string(dynamic));
+        log("Intel HEVC444 hardware encoder: full-range BT.709, GPU color + system-memory upload, 2 IO slots / codec AsyncDepth 1; QP feedback="+std::to_string(frame_info)+", dynamic CBR="+std::to_string(dynamic));
     }
 };
 IntelEncoder::IntelEncoder(uint32_t w,uint32_t h,const StreamSettings& s,IDXGIAdapter* a,ID3D11Texture2D* t,std::function<bool()> cancelled):impl_(std::make_unique<Impl>()){impl_->initialize(w,h,s,a,t,std::move(cancelled));}

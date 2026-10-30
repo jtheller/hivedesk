@@ -4,7 +4,7 @@
 #include <vector>
 #include <stdexcept>
 
-// Diagnostic-only Media SDK 1.x surfaces. The hardware runtime performs its
+// Bounded Media SDK-compatible surfaces. The hardware runtime performs its
 // own upload/readback. Storage must outlive codec Close, including failed Sync.
 struct IntelSystemSurface {
     mfxFrameSurface1 frame{};

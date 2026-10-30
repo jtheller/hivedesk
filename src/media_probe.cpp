@@ -66,7 +66,7 @@ void intel(UINT index,ID3D11Device* device,bool roundtrip){
             encode?"encode":"decode",status,exact?"yes":"no",actual.mfx.CodecProfile,f.ChromaFormat,f.FourCC);
     }
     if(roundtrip)std::printf("  intel.roundtrip=PASS %s\n",intel_roundtrip(vpl.session).c_str());
-    std::puts("  intel.backend_ready=no (desktop capture, async pipeline integration and display qualification pending)");
+    std::puts("  intel.production_host=separate qualification required (run the host diagnostic); hardware viewer not integrated");
 }
 struct Library {HMODULE handle=nullptr;~Library(){if(handle)FreeLibrary(handle);}};
 void amd(ID3D11Device* device){

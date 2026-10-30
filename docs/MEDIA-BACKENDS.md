@@ -9,7 +9,10 @@ keeps its existing encoder implementation; no silent chroma downgrade is negotia
 
 The Intel host converts BGRA to full-range BT.709 AYUV on D3D11, reads back into
 bounded system-memory surfaces, then submits to the hardware encoder. It uses
-two in-flight jobs, no B frames, CBR and the existing QP 16..22 quality policy.
+two application IO slots, no frame reordering, CBR and the existing QP 16..22
+quality policy. Since 0.14.1 codec AsyncDepth is 1: JT's Media SDK 1.35 retained
+the first picture with depth 2, which cannot support a one-picture warm stream.
+Application conversion/completion/delivery remain separate stages.
 It shares the existing latest-capture scheduling, independent output/delivery,
 warm/Peek lifecycle and adaptive pacing. Each requested recovery IDR is checked
 against its actual SPS before delivery. Timestamp correspondence is mandatory.

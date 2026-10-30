@@ -555,7 +555,7 @@ public:
     bool dynamic_rate()const{return intel_?intel_->dynamic_rate():nvidia_->dynamic_rate();}
     uint32_t bitrate_bps()const{return intel_?intel_->bitrate_bps():nvidia_->bitrate_bps();}
     uint32_t nominal_millihz()const{return intel_?intel_->nominal_millihz():nvidia_->nominal_millihz();}
-    const char* description()const{return intel_?"Intel asynchronous HEVC444, 2 in flight":nvidia_->asynchronous()?"NVENC async events, 4 IO slots / 2 in flight":"NVENC synchronous output worker, 4 IO slots / 2 in flight";}
+    const char* description()const{return intel_?"Intel low-delay HEVC444, 2 IO slots / codec AsyncDepth 1":nvidia_->asynchronous()?"NVENC async events, 4 IO slots / 2 in flight":"NVENC synchronous output worker, 4 IO slots / 2 in flight";}
     bool reconfigure(uint32_t bitrate,uint32_t millihz){return intel_?intel_->reconfigure(bitrate,millihz):nvidia_->reconfigure(bitrate,millihz);}
     bool submit_texture(ID3D11Texture2D* texture,uint64_t sequence,bool force,uint64_t captured,bool* queued,CursorComposition cursor){
         return intel_?intel_->submit_texture(texture,sequence,force,captured,queued,cursor):nvidia_->submit_texture(texture,sequence,force,captured,queued,cursor);
