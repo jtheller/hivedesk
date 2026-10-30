@@ -134,8 +134,12 @@ int probe(){
         std::puts("PASS 72 rapid Peek transitions and three same-peer recoveries with blocked retirement; final frames verified");
         {
             auto& p=peers[0];{std::lock_guard lock(p.mutex);p.hold_release=true;p.held_release={};}
-            // Queue behind show_remote's UI handoff. SendMessage can overtake
-            // it after test_ready observes the network worker's ready flag.
+            // test_ready can observe view_ready_ before the command worker
+            // queues show_remote under this mutex. Fence that publication
+            // before posting the hotkey; PostMessage alone can still overtake
+            // a handoff that has not been queued yet. Production timing stays
+            // unchanged: this fixture specifically tests an established lease.
+            {auto handoff=app.test_lock_input(false);}
             PostMessageW(owner,WM_HOTKEY,83,0);
             hive::InputPacket barrier;
             for(unsigned n=0;n<200;++n){{std::lock_guard lock(p.mutex);barrier=p.held_release;}if(barrier.sequence)break;Sleep(5);}
