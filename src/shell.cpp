@@ -1265,7 +1265,10 @@ void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl
     s->peers=peers;s->sort_peers();s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));
     if(s->selection_armed){
         const auto current=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==s->pending_id;});
-        if(current!=peers.end()&&!current->name.empty())s->pending_name=wide(current->name);
+        if(current!=peers.end()&&!current->name.empty()&&s->pending_name!=wide(current->name)){
+            s->pending_name=wide(current->name);
+            if(s->waiting_visible&&!s->waiting_fading){try{s->paint_waiting(false);}catch(const std::exception&){s->local(true);}}
+        }
     }
     s->publish_visible();s->publish_input();InvalidateRect(s->panel,nullptr,FALSE);
 });}

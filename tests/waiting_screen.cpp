@@ -109,7 +109,6 @@ int probe(){
     require(shown(waiting)&&title(waiting).find(L"Reconnecting")!=std::wstring::npos&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Reconnection reused stale video instead of a waiting screen");
     shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Renamed C","",47980,true}});
     shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true}});
-    shell.update_thumbnail("c",image(220));
     require(title(waiting).find(L"Renamed C")!=std::wstring::npos,"Reconnect lost the latest known name after rediscovery/removal");
     shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Computer C","",47980,true}});
     auto failed_surface=shell.viewer_surface();
