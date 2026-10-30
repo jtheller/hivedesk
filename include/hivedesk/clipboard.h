@@ -5,12 +5,23 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace hive {
 constexpr uint32_t ClipboardChunk = 256*1024;
 constexpr uint64_t ClipboardImageLimit = 256ull*1024*1024;
 enum class ClipboardFormat : uint32_t { Dib=1, DibV5=2, Png=3 };
+// Item-scoped failures; never tear down a clipboard or control connection.
+class ClipboardReadError : public std::runtime_error {
+public:
+    HRESULT result;
+    explicit ClipboardReadError(HRESULT code):std::runtime_error("Clipboard source file unavailable"),result(code){}
+};
+inline HRESULT clipboard_read_result(uint32_t code){
+    const auto result=HRESULT(code);
+    return result==STG_E_FILENOTFOUND||result==STG_E_ACCESSDENIED||result==STG_E_REVERTED?result:STG_E_READFAULT;
+}
 struct ClipboardBlob { ClipboardFormat format{}; uint64_t size=0; };
 struct ClipboardFile { std::wstring name; uint64_t size=0,modified=0; bool directory=false; };
 struct ClipboardOffer {

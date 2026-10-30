@@ -51,7 +51,7 @@ public:
     ULONG STDMETHODCALLTYPE AddRef()override{return ++refs;}ULONG STDMETHODCALLTYPE Release()override{auto n=--refs;if(!n)delete this;return n;}
     HRESULT STDMETHODCALLTYPE Read(void* buffer,ULONG count,ULONG* read)override{
         if(read)*read=0;if(count&&!buffer)return STG_E_INVALIDPOINTER;std::lock_guard lock(mutex);ULONG done=0;
-        try{while(done<count&&position<size){const auto length=uint32_t(std::min<uint64_t>({count-done,size-position,ClipboardChunk}));auto b=content->read(item,position,length);if(b.size()!=length)return STG_E_READFAULT;memcpy(static_cast<uint8_t*>(buffer)+done,b.data(),length);position+=length;done+=length;if(read)*read=done;}return done==count?S_OK:S_FALSE;}catch(...){return STG_E_READFAULT;}
+        try{while(done<count&&position<size){const auto length=uint32_t(std::min<uint64_t>({count-done,size-position,ClipboardChunk}));auto b=content->read(item,position,length);if(b.size()!=length)return STG_E_READFAULT;memcpy(static_cast<uint8_t*>(buffer)+done,b.data(),length);position+=length;done+=length;if(read)*read=done;}return done==count?S_OK:S_FALSE;}catch(const ClipboardReadError& e){return clipboard_read_result(uint32_t(e.result));}catch(...){return STG_E_READFAULT;}
     }
     HRESULT STDMETHODCALLTYPE Write(const void*,ULONG,ULONG*)override{return STG_E_ACCESSDENIED;}
     HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move,DWORD origin,ULARGE_INTEGER* result)override{
@@ -94,7 +94,11 @@ public:
     HRESULT STDMETHODCALLTYPE GetData(FORMATETC* f,STGMEDIUM* medium)override{
         struct Reading {std::shared_ptr<std::atomic<unsigned>> counter;Reading(decltype(counter) c):counter(std::move(c)){if(counter)++*counter;}~Reading(){if(counter)--*counter;}}reading{activity};
         if(!medium)return E_POINTER;*medium={};const auto valid=QueryGetData(f);if(FAILED(valid))return valid;
-        try{if(f->cfFormat==contents_format()){if(f->lindex<0)return DV_E_LINDEX;medium->tymed=TYMED_ISTREAM;medium->pstm=new FileStream(content,uint32_t(content->offer.images.size()+f->lindex),content->offer.files[f->lindex].size);return S_OK;}
+        try{if(f->cfFormat==contents_format()){if(f->lindex<0)return DV_E_LINDEX;const auto item=uint32_t(content->offer.images.size()+f->lindex);const auto size=content->offer.files[f->lindex].size;
+                // Empty streams never call Read during paste. Validate their
+                // source too, rather than silently fabricating a deleted file.
+                if(!size)content->read(item,0,0);
+                auto stream=new FileStream(content,item,size);medium->tymed=TYMED_ISTREAM;medium->pstm=stream;return S_OK;}
             HGLOBAL h=nullptr;
             if(f->cfFormat==CF_UNICODETEXT)h=global_copy(content->offer.text.c_str(),(content->offer.text.size()+1)*2);
             else if(f->cfFormat==effect_format()){DWORD effect=DROPEFFECT_COPY;h=global_copy(&effect,sizeof(effect));}
@@ -103,7 +107,7 @@ public:
                 for(size_t i=0;i<content->offer.files.size();++i){auto& d=group->fgd[i];const auto& file=content->offer.files[i];d.dwFlags=DWORD(FD_ATTRIBUTES|FD_FILESIZE|FD_WRITESTIME|FD_PROGRESSUI|FD_UNICODE);d.dwFileAttributes=file.directory?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL;d.nFileSizeHigh=DWORD(file.size>>32);d.nFileSizeLow=DWORD(file.size);d.ftLastWriteTime=file_time(file.modified);wcscpy_s(d.cFileName,file.name.c_str());}h=global_copy(b.data(),b.size());
             }else{for(uint32_t i=0;i<content->offer.images.size();++i)if(native_format(content->offer.images[i].format)==f->cfFormat){Bytes b;const auto size=content->offer.images[i].size;b.reserve(size);while(b.size()<size){auto next=content->read(i,b.size(),uint32_t(std::min<uint64_t>(ClipboardChunk,size-b.size())));if(next.empty()||next.size()>size-b.size())return STG_E_READFAULT;b.insert(b.end(),next.begin(),next.end());}if(!bitmap_bytes(b,content->offer.images[i].format))return DV_E_FORMATETC;h=global_copy(b.data(),b.size());break;}}
             if(!h)return DV_E_FORMATETC;medium->tymed=TYMED_HGLOBAL;medium->hGlobal=h;return S_OK;
-        }catch(...){return STG_E_READFAULT;}
+        }catch(const ClipboardReadError& e){return clipboard_read_result(uint32_t(e.result));}catch(...){return STG_E_READFAULT;}
     }
     HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*,STGMEDIUM*)override{return DATA_E_FORMATETC;}
     HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*,FORMATETC* out)override{if(!out)return E_POINTER;out->ptd=nullptr;return E_NOTIMPL;}
@@ -137,16 +141,30 @@ Clipboard capture_clipboard(HWND owner){
     auto add=[&](const std::filesystem::path& path,const std::wstring& name){
         if(content->offer.files.size()>=4096)throw std::runtime_error("Clipboard file count exceeds 4096");
         Handle file{CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
-        if(file.h==INVALID_HANDLE_VALUE)throw std::runtime_error("Clipboard source unavailable");const auto info=file_info(file.h);const bool dir=(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
-        content->offer.files.push_back({name,dir?0:(uint64_t(info.nFileSizeHigh)<<32)|info.nFileSizeLow,time_value(info.ftLastWriteTime),dir});files->push_back({path,info});
+        if(file.h==INVALID_HANDLE_VALUE){const auto error=GetLastError();
+            if(error==ERROR_FILE_NOT_FOUND||error==ERROR_PATH_NOT_FOUND||error==ERROR_ACCESS_DENIED||error==ERROR_SHARING_VIOLATION)return false;
+            throw std::runtime_error("Clipboard source unavailable");}
+        BY_HANDLE_FILE_INFORMATION info{};if(!GetFileInformationByHandle(file.h,&info)||(info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))return false;
+        const bool dir=(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+        content->offer.files.push_back({name,dir?0:(uint64_t(info.nFileSizeHigh)<<32)|info.nFileSizeLow,time_value(info.ftLastWriteTime),dir});files->push_back({path,info});return true;
     };
-    for(const auto& path:paths){const auto name=path.filename().wstring();add(path,name);if(content->offer.files.back().directory){for(const auto& entry:std::filesystem::recursive_directory_iterator(path))add(entry.path(),name+L"\\"+entry.path().lexically_relative(path).wstring());}}
+    size_t skipped=0;
+    for(const auto& path:paths){const auto name=path.filename().wstring();if(!add(path,name)){++skipped;continue;}
+        if(content->offer.files.back().directory){
+            std::error_code error;std::filesystem::recursive_directory_iterator it(path,std::filesystem::directory_options::skip_permission_denied,error),end;
+            if(error)++skipped;
+            while(it!=end){if(!add(it->path(),name+L"\\"+it->path().lexically_relative(path).wstring())){++skipped;it.disable_recursion_pending();}
+                it.increment(error);if(error){++skipped;break;}}
+        }
+    }
+    if(skipped)log("Clipboard: skipped "+std::to_string(skipped)+" unavailable source entries.");
     if(!valid_clipboard_offer(content->offer))throw std::runtime_error("Unsupported clipboard names, format or size");
     content->read=[blobs,files](uint32_t item,uint64_t offset,uint32_t count){
         if(count>ClipboardChunk)throw std::runtime_error("Clipboard chunk too large");if(item<blobs->size()){const auto& b=(*blobs)[item];if(offset>b.size()||count>b.size()-offset)throw std::runtime_error("Clipboard image range");return Bytes(b.begin()+size_t(offset),b.begin()+size_t(offset)+count);}
         item-=uint32_t(blobs->size());if(item>=files->size())throw std::runtime_error("Clipboard file index");const auto& source=(*files)[item];
         Handle file{CreateFileW(source.path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_SEQUENTIAL_SCAN,nullptr)};
-        if(file.h==INVALID_HANDLE_VALUE||!same_file(file_info(file.h),source.identity))throw std::runtime_error("Clipboard source changed or is busy");
+        if(file.h==INVALID_HANDLE_VALUE){const auto error=GetLastError();throw ClipboardReadError(error==ERROR_FILE_NOT_FOUND||error==ERROR_PATH_NOT_FOUND?STG_E_FILENOTFOUND:error==ERROR_ACCESS_DENIED||error==ERROR_SHARING_VIOLATION?STG_E_ACCESSDENIED:STG_E_READFAULT);}
+        if(!same_file(file_info(file.h),source.identity))throw ClipboardReadError(STG_E_REVERTED);
         const auto size=(uint64_t(source.identity.nFileSizeHigh)<<32)|source.identity.nFileSizeLow;if(offset>size||count>size-offset)throw std::runtime_error("Clipboard file range");
         LARGE_INTEGER position{};position.QuadPart=offset;if(!SetFilePointerEx(file.h,position,nullptr,FILE_BEGIN))throw std::runtime_error("Clipboard seek failed");Bytes b(count);DWORD read=0;if(!ReadFile(file.h,b.data(),count,&read,nullptr)||read!=count)throw std::runtime_error("Clipboard file read failed");return b;
     };return content;

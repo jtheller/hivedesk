@@ -19,7 +19,12 @@ using Microsoft::WRL::ComPtr;
 using Bytes=std::vector<uint8_t>;
 void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 template<class F>void until(F predicate,const char* message){const auto end=GetTickCount64()+5000;while(!predicate()){if(GetTickCount64()>end)throw std::runtime_error(message);MSG m{};while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}Sleep(2);}}
-void set_native(HWND owner,UINT format,const Bytes& bytes){require(OpenClipboard(owner)!=FALSE,"Open isolated clipboard");EmptyClipboard();auto h=GlobalAlloc(GMEM_MOVEABLE,bytes.size());auto p=GlobalLock(h);memcpy(p,bytes.data(),bytes.size());GlobalUnlock(h);require(SetClipboardData(format,h)!=nullptr,"Set isolated clipboard");CloseClipboard();}
+void set_native(HWND owner,UINT format,const Bytes& bytes,bool clear=true){require(OpenClipboard(owner)!=FALSE,"Open isolated clipboard");if(clear)EmptyClipboard();auto h=GlobalAlloc(GMEM_MOVEABLE,bytes.size());auto p=GlobalLock(h);memcpy(p,bytes.data(),bytes.size());GlobalUnlock(h);require(SetClipboardData(format,h)!=nullptr,"Set isolated clipboard");CloseClipboard();}
+void set_files(HWND owner,const std::vector<std::filesystem::path>& files){
+    std::wstring paths;for(const auto& file:files){paths+=file.wstring();paths.push_back(0);}paths.push_back(0);
+    Bytes bytes(sizeof(DROPFILES)+paths.size()*sizeof(wchar_t));auto header=reinterpret_cast<DROPFILES*>(bytes.data());header->pFiles=sizeof(DROPFILES);header->fWide=TRUE;
+    memcpy(bytes.data()+sizeof(DROPFILES),paths.data(),paths.size()*sizeof(wchar_t));set_native(owner,CF_HDROP,bytes);
+}
 Bytes data(IDataObject* object,UINT format,LONG index=-1){FORMATETC f{CLIPFORMAT(format),nullptr,DVASPECT_CONTENT,index,TYMED_HGLOBAL};STGMEDIUM m{};require(SUCCEEDED(object->GetData(&f,&m)),"Render clipboard format");const auto p=static_cast<uint8_t*>(GlobalLock(m.hGlobal));Bytes b(p,p+GlobalSize(m.hGlobal));GlobalUnlock(m.hGlobal);ReleaseStgMedium(&m);return b;}
 ComPtr<IStream> stream(IDataObject* object,UINT index){FORMATETC f{CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILECONTENTS)),nullptr,DVASPECT_CONTENT,LONG(index),TYMED_ISTREAM};STGMEDIUM m{};require(SUCCEEDED(object->GetData(&f,&m)),"Get virtual file stream");ComPtr<IStream> result=m.pstm;ReleaseStgMedium(&m);return result;}
 void isolated_station(){
@@ -123,6 +128,48 @@ int probe(){
     require(std::filesystem::exists(file),"Copy removed source");Sleep(50);require(changed==0,"Remote clipboard echoed through listener");
     std::filesystem::create_directory(root/L"cross-process");consume_process(L"files",root/L"cross-process");
     {std::ifstream in(root/L"cross-process"/L"folder"/L"\u6d4b\u8bd5.bin",std::ios::binary);Bytes copy((std::istreambuf_iterator<char>(in)),{});require(copy==file_bytes&&std::filesystem::is_directory(root/L"cross-process"/L"folder"/L"empty"),"Cross-process folder paste contents");}
+    {
+        const auto missing=root/L"source"/L"deleted.bin",empty=root/L"source"/L"deleted-empty.txt";
+        {std::ofstream out(missing,std::ios::binary);out<<"delete after copy";}{std::ofstream out(empty,std::ios::binary);}
+        const std::vector<std::filesystem::path> selected{missing,empty,root/L"source"/L"folder",root/L"source"/L"zero.txt"};
+        set_files(owner,selected);auto original=hive::capture_clipboard(owner);
+        {std::lock_guard lock(mutex);received.reset();}require(sender.send(id,original),"Offer soon-deleted sources");
+        until([&]{std::lock_guard lock(mutex);return bool(received);},"Receive soon-deleted sources");
+        hive::Clipboard stale;{std::lock_guard lock(mutex);stale=received;}
+        desktop.apply(stale);ComPtr<IDataObject> stale_object;stale_object.Attach(hive::clipboard_data_object(stale));
+        auto deleted_stream=stream(stale_object.Get(),0);
+        require(DeleteFileW(missing.c_str())&&DeleteFileW(empty.c_str()),"Delete copied fixture sources");
+        const auto started=GetTickCount64();ULONG count=99;uint8_t buffer[32]{};
+        require(deleted_stream->Read(buffer,sizeof(buffer),&count)==STG_E_FILENOTFOUND&&count==0,"Deleted source did not return item-scoped file-not-found");
+        require(GetTickCount64()-started<2000,"Deleted source waited for clipboard timeout");
+        FORMATETC format{CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILECONTENTS)),nullptr,DVASPECT_CONTENT,1,TYMED_ISTREAM};STGMEDIUM medium{};
+        require(stale_object->GetData(&format,&medium)==STG_E_FILENOTFOUND&&medium.tymed==TYMED_NULL,"Deleted empty source silently became a new empty file");
+        // The first .bin was deleted; find the still-present nested sibling.
+        size_t good=0;while(good<stale->offer.files.size()&&stale->offer.files[good].name.find(L"folder\\")!=0)++good;
+        while(good<stale->offer.files.size()&&stale->offer.files[good].directory)++good;
+        require(good<stale->offer.files.size(),"Surviving sibling missing from original offer");
+        auto healthy=stream(stale_object.Get(),UINT(good));require(healthy->Read(buffer,sizeof(buffer),&count)==S_OK&&count==sizeof(buffer)&&std::equal(buffer,buffer+count,file_bytes.begin()),"Failed item poisoned another stream in the same offer");
+        desktop.apply(hive::text_clipboard(L"Copy after deleted file"));require(desktop.cached()->offer.text==L"Copy after deleted file"&&!desktop.busy(),"Failed paste stranded clipboard ownership/activity");
+        // A stale CF_HDROP list is captured after deletion: retain the siblings.
+        set_files(owner,selected);auto survivors=hive::capture_clipboard(owner);
+        require(survivors->offer.files.size()==4,"Missing file discarded the rest of the copied batch");
+        {std::lock_guard lock(mutex);received.reset();}require(sender.send(id,survivors),"Offer surviving files after failed copy");
+        until([&]{std::lock_guard lock(mutex);return bool(received);},"Receive surviving files after failed copy");
+        {std::lock_guard lock(mutex);desktop.apply(received);}
+        std::filesystem::create_directory(root/L"after-delete");consume_process(L"files",root/L"after-delete");
+        require(std::filesystem::file_size(root/L"after-delete"/L"folder"/L"\u6d4b\u8bd5.bin")==file_bytes.size(),"Subsequent native file paste failed after missing source");
+        require(left.connection_token(id)!=0&&right.connection_token("clip-a")!=0,"File failure closed peer connection");
+        set_files(owner,{missing,empty});
+        require(hive::capture_clipboard(owner)->offer.files.empty(),"Entirely deleted batch failed capture");
+        const std::wstring kept=L"Text beside deleted files";Bytes text((kept.size()+1)*sizeof(wchar_t));memcpy(text.data(),kept.c_str(),text.size());set_native(owner,CF_UNICODETEXT,text,false);
+        Bytes bitmap(sizeof(BITMAPINFOHEADER)+4);auto mixed_header=reinterpret_cast<BITMAPINFOHEADER*>(bitmap.data());mixed_header->biSize=sizeof(BITMAPINFOHEADER);mixed_header->biWidth=mixed_header->biHeight=1;mixed_header->biPlanes=1;mixed_header->biBitCount=32;
+        set_native(owner,CF_DIB,bitmap,false);const auto mixed=hive::capture_clipboard(owner);
+        // Windows may synthesize DIBV5 from CF_DIB; either representation must
+        // remain readable even when every file in CF_HDROP is gone.
+        require(mixed->offer.files.empty()&&mixed->offer.text==kept&&!mixed->offer.images.empty(),"Missing files discarded text/image formats in the same clipboard");
+        require(mixed->read(0,0,uint32_t(mixed->offer.images[0].size)).size()==mixed->offer.images[0].size,"Mixed clipboard image became unreadable");
+        std::puts("PASS deleted-source recovery: typed prompt failure, empty file validation, same-offer sibling reads, subsequent text and actual Shell file paste, connection retained");
+    }
     // Native DIBV5 (including alpha) survives offer + lazy reads byte-for-byte.
     Bytes dib(sizeof(BITMAPV5HEADER)+16*8*4);auto bitmap=reinterpret_cast<BITMAPV5HEADER*>(dib.data());bitmap->bV5Size=sizeof(BITMAPV5HEADER);bitmap->bV5Width=16;bitmap->bV5Height=-8;bitmap->bV5Planes=1;bitmap->bV5BitCount=32;bitmap->bV5Compression=BI_BITFIELDS;bitmap->bV5RedMask=0x00ff0000;bitmap->bV5GreenMask=0x0000ff00;bitmap->bV5BlueMask=0x000000ff;bitmap->bV5AlphaMask=0xff000000;for(size_t i=sizeof(BITMAPV5HEADER);i<dib.size();++i)dib[i]=uint8_t(i);
     set_native(owner,CF_DIBV5,dib);auto picture=hive::capture_clipboard(owner);require(picture->offer.images.size()==1,"Capture native alpha bitmap");{std::lock_guard lock(mutex);received.reset();}require(sender.send(id,picture),"Offer image");until([&]{std::lock_guard lock(mutex);return bool(received);},"Receive image offer");{std::lock_guard lock(mutex);remote=received;}ComPtr<IDataObject> image;image.Attach(hive::clipboard_data_object(remote));require(data(image.Get(),CF_DIBV5)==dib,"Remote image pixels changed");
@@ -139,7 +186,7 @@ int probe(){
     {std::lock_guard lock(mutex);received.reset();}require(sender.send(id,large),"Offer file beyond 4 GiB");until([&]{std::lock_guard lock(mutex);return bool(received);},"Receive large file metadata");ComPtr<IDataObject> large_object;{std::lock_guard lock(mutex);large_object.Attach(hive::clipboard_data_object(received));}auto large_stream=stream(large_object.Get(),0);require(SUCCEEDED(large_stream->Stat(&stat,STATFLAG_NONAME))&&stat.cbSize.QuadPart==large->offer.files[0].size,"Large file size truncated");seek.QuadPart=4ull*1024*1024*1024+123;require(SUCCEEDED(large_stream->Seek(seek,STREAM_SEEK_SET,nullptr)),"Large file seek");require(large_stream->Read(actual.data(),1024,&got)==S_OK&&got==1024,"Large file read");for(unsigned i=0;i<1024;++i)require(actual[i]==uint8_t((uint64_t(seek.QuadPart)+i)%251),"Large file offset truncated on wire");
     // Range failures and changed sources must fail, never supply another copy.
     bool failed=false;try{remote->read(0,UINT64_MAX,16);}catch(...){failed=true;}require(failed,"Reject overflowed range");
-    {std::ofstream out(file,std::ios::binary|std::ios::trunc);out<<"changed";}seek.QuadPart=0;input->Seek(seek,STREAM_SEEK_SET,nullptr);require(FAILED(input->Read(actual.data(),16,&got)),"Changed source supplied mismatching bytes");
+    {std::ofstream out(file,std::ios::binary|std::ios::trunc);out<<"changed";}seek.QuadPart=0;input->Seek(seek,STREAM_SEEK_SET,nullptr);require(input->Read(actual.data(),16,&got)==STG_E_REVERTED,"Changed source supplied mismatching bytes or lost its error status");
     desktop.apply(hive::text_clipboard(L"Unicode \u4e2d\u6587 \U0001f642"));require(desktop.cached()->offer.text==L"Unicode \u4e2d\u6587 \U0001f642","Legacy Unicode handoff");
     const auto old_connection=left.connection_token(id);right.stop();until([&]{return left.connection_token(id)==0;},"Detect clipboard connection teardown");require(right.start({"clip-b","Clipboard B","clipboard-test",48221,false},b,error),error.c_str());require(left.connect("127.0.0.1",48221,id,error),error.c_str());require(left.connection_token(id)!=old_connection,"Reconnect reused connection token");
     {std::lock_guard lock(mutex);received.reset();}require(sender.send(id,picture),"Reoffer PNG after reconnect");until([&]{std::lock_guard lock(mutex);return bool(received);},"Receive reconnected PNG");hive::Clipboard fresh;{std::lock_guard lock(mutex);fresh=received;}require(fresh!=remote&&fresh->read(0,0,16)==Bytes(png.begin(),png.begin()+16),"Reconnected offer retained stale reader");

@@ -62,7 +62,7 @@ struct ClipboardTransfer::Impl : std::enable_shared_from_this<Impl> {
     // finish after a subsequent copy. No file bytes are retained in these grants.
     std::map<std::string,std::deque<Grant>> grants;
     std::map<uint64_t,std::weak_ptr<const ClipboardContent>> known;
-    struct Pending {std::string peer;uint64_t connection=0;uint32_t count=0;bool done=false,ok=false;Bytes bytes;};
+    struct Pending {std::string peer;uint64_t connection=0;uint32_t count=0;bool done=false,ok=false;HRESULT failure=STG_E_READFAULT;Bytes bytes;};
     std::map<uint64_t,std::shared_ptr<Pending>> pending;
     std::deque<std::function<void()>> jobs;std::thread worker;
     explicit Impl(Transport& t):transport(t){}
@@ -76,7 +76,8 @@ struct ClipboardTransfer::Impl : std::enable_shared_from_this<Impl> {
         if(!transport.send_clipboard_packet(peer,b))throw std::runtime_error("Clipboard transfer channel unavailable");
         std::unique_lock lock(mutex);const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(15);
         while(!p->done&&!stopped&&transport.connection_token(peer)==connection){if(std::chrono::steady_clock::now()>=deadline)break;wake.wait_for(lock,std::chrono::milliseconds(100));}
-        if(!p->done||!p->ok||stopped||transport.connection_token(peer)!=connection)throw std::runtime_error("Clipboard transfer canceled, expired or source changed");return std::move(p->bytes);
+        if(!p->done||stopped||transport.connection_token(peer)!=connection)throw std::runtime_error("Clipboard transfer canceled, expired or source changed");
+        if(!p->ok)throw ClipboardReadError(p->failure);return std::move(p->bytes);
     }
 };
 ClipboardTransfer::ClipboardTransfer(Transport& t):impl_(std::make_shared<Impl>(t)){impl_->start();}
@@ -108,7 +109,10 @@ void ClipboardTransfer::packet(const std::string& peer,const Bytes& b){
     impl_->last_activity=GetTickCount64();Read r{b};const auto kind=r.get(1),request=r.get(8);if(!request||!r.ok)return;
     if(kind==2){const auto ok=r.get(1);std::lock_guard lock(impl_->mutex);auto it=impl_->pending.find(request);if(it==impl_->pending.end())return;auto& p=*it->second;
         if(p.peer!=peer||p.connection!=impl_->transport.connection_token(peer)||!r.ok||ok>1)return;
-        p.ok=ok&&b.size()-r.at==p.count;p.bytes.assign(b.begin()+r.at,b.end());p.done=true;impl_->wake.notify_all();return;}
+        // Optional failure detail is backward compatible: old readers already
+        // consume ok=0 as a failed item, regardless of its trailing bytes.
+        if(!ok&&b.size()-r.at==4)p.failure=clipboard_read_result(uint32_t(r.get(4)));
+        p.ok=ok&&b.size()-r.at==p.count;if(p.ok)p.bytes.assign(b.begin()+r.at,b.end());p.done=true;impl_->wake.notify_all();return;}
     if(kind!=1)return;const auto offer=r.get(8);const auto item=uint32_t(r.get(4));const auto offset=r.get(8);const auto count=uint32_t(r.get(4));if(!r.ok||r.at!=b.size()||count>ClipboardChunk)return;
     std::lock_guard lock(impl_->mutex);if(impl_->stopped||impl_->jobs.size()>=32)return;Clipboard source;const auto token=impl_->transport.connection_token(peer);
     auto found=impl_->grants.find(peer);if(found!=impl_->grants.end())for(const auto& grant:found->second)if(grant.connection==token&&grant.content->offer.id==offer){source=grant.content;break;}
@@ -116,7 +120,8 @@ void ClipboardTransfer::packet(const std::string& peer,const Bytes& b){
         struct Active {Impl& p;Active(Impl& s):p(s){++p.active_reads;}~Active(){p.last_activity=GetTickCount64();--p.active_reads;}}active{*self};
         Bytes reply{2};put(reply,request,8);reply.push_back(0);
         try{if(!source||!source->read)throw std::runtime_error("Clipboard grant expired");const auto size=item_size(source->offer,item);
-            if(offset>size||count>size-offset)throw std::runtime_error("Clipboard range rejected");auto data=source->read(item,offset,count);if(data.size()!=count)throw std::runtime_error("Clipboard source truncated");reply[9]=1;reply.insert(reply.end(),data.begin(),data.end());}catch(...){}
+            if(offset>size||count>size-offset)throw std::runtime_error("Clipboard range rejected");auto data=source->read(item,offset,count);if(data.size()!=count)throw std::runtime_error("Clipboard source truncated");reply[9]=1;reply.insert(reply.end(),data.begin(),data.end());}
+        catch(const ClipboardReadError& e){put(reply,uint32_t(clipboard_read_result(uint32_t(e.result))),4);}catch(...){}
         if(self->transport.connection_token(peer)==token)self->transport.send_clipboard_packet(peer,reply);
     });impl_->wake.notify_all();
 }
