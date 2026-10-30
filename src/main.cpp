@@ -1,3 +1,4 @@
+#include "media_diagnostics.h"
 #include "hivedesk/config.h"
 #include "hivedesk/media.h"
 #include "hivedesk/shell.h"
@@ -591,6 +592,12 @@ private:
             }
             relay_tick();shell_.update_peers(transport_.visible_peers());wake_.notify_one();
         }};
+        callbacks.media_probe_request=[this](const hive::Peer& peer,uint64_t request,uint32_t mode){
+            const auto connection=transport_.connection_token(peer.id);
+            media_diagnostics_.request(request,mode,peer.address,
+                [this,id=peer.id,connection]{return !closing_&&!updating_&&!active_.load()&&!hosting_.load()&&!peek_requested_&&!preparing_&&transport_.connection_token(id)==connection;},
+                [this,id=peer.id,connection](hive::MediaProbeReport report){if(!closing_&&transport_.connection_token(id)==connection)transport_.send_media_probe_report(id,report);});
+        };
         callbacks.view_route_changed=[this]{route_changed();};
         callbacks.status=[this](const std::string& text){status(text);};
         callbacks.frame_ready=[this](const std::string& peer){
@@ -1068,7 +1075,7 @@ private:
         {const std::lock_guard lock(warm_mutex_);warm.swap(warm_views_);warm_visible_.clear();}
         for(const auto& item:warm)retire_warm(item.second);
         prepare_lane_.stop();retire_lane_.stop();
-        clipboard_transfer_.stop();transport_.stop();hive::release_injected_input();
+        media_diagnostics_.stop();clipboard_transfer_.stop();transport_.stop();hive::release_injected_input();
         telemetry_.clear(MonitorSide::View);telemetry_.clear(MonitorSide::Host);
     }
     void shutdown() {
@@ -1116,6 +1123,7 @@ private:
     hive::Transport transport_;
     hive::ClipboardTransfer clipboard_transfer_{transport_};
     hive::HostBridge host_;
+    hive::MediaDiagnostics media_diagnostics_;
     std::shared_ptr<const hive::ViewerSurface> view_surface_;
     std::weak_ptr<const hive::ViewerSurface> last_attempt_surface_; // Command worker, including failed attempts.
     std::atomic<std::shared_ptr<hive::MediaViewer>> viewer_{std::make_shared<hive::MediaViewer>()};

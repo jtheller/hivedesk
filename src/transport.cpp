@@ -52,7 +52,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41, HiveSummon=42, HiveSummoned=43 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41, HiveSummon=42, HiveSummoned=43, MediaProbeRequest=44, MediaProbeReply=45 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -214,7 +214,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -1002,6 +1002,18 @@ struct Transport::Impl {
             if(!(c.peer.features&FeatureStreamDiagnostics)||!valid_diagnostics(d)||!r.end())return false;
             if(callbacks.diagnostics)callbacks.diagnostics(c.peer.id,d);return true;
         }
+        case MediaProbeRequest: {
+            const auto request=r.qword();const auto mode=r.dword();
+            if(!(c.peer.features&FeatureMediaProbe)||!request||mode<1||mode>3||!r.end())return false;
+            if(callbacks.media_probe_request)callbacks.media_probe_request(c.peer,request,mode);
+            else {Bytes reply{MediaProbeReply};u64(reply,request);u32(reply,ERROR_NOT_SUPPORTED);const std::string message="Media diagnostic unavailable in this process";reply.insert(reply.end(),message.begin(),message.end());c.enqueue(std::move(reply));}
+            return true;
+        }
+        case MediaProbeReply: {
+            MediaProbeReport report;report.request=r.qword();report.result=r.dword();
+            if(!(c.peer.features&FeatureMediaProbe)||!report.request||!r.good||b.size()-r.at>MaxMediaProbeReport)return false;
+            report.text.assign(b.begin()+r.at,b.end());if(callbacks.media_probe_report)callbacks.media_probe_report(c.peer.id,std::move(report));return true;
+        }
         case NativeSnapshotRequest:
         case SnapshotRequest: {
             const bool native=b[0]==NativeSnapshotRequest;
@@ -1516,6 +1528,14 @@ bool Transport::send_clipboard_packet(const std::string& peer,const std::vector<
     if(!c)return false;Bytes b{ClipboardData};b.insert(b.end(),bytes.begin(),bytes.end());return c->enqueue(std::move(b));
 }
 bool Transport::send_clipboard(const std::string& peer, const std::wstring& value) { auto c = impl_->find(peer); if (!c || !utf16_ok(value)) return false; Bytes b{ClipboardText}; b.reserve(5+value.size()*2); u32(b,uint32_t(value.size())); for (wchar_t ch : value) u16(b,uint16_t(ch)); return c->enqueue(std::move(b)); }
+bool Transport::request_media_probe(const std::string& peer,uint64_t request,uint32_t mode) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureMediaProbe)||!request||mode<1||mode>3)return false;
+    Bytes b{MediaProbeRequest};u64(b,request);u32(b,mode);return c->enqueue(std::move(b));
+}
+bool Transport::send_media_probe_report(const std::string& peer,const MediaProbeReport& report) {
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureMediaProbe)||!report.request||report.text.size()>MaxMediaProbeReport)return false;
+    Bytes b{MediaProbeReply};u64(b,report.request);u32(b,report.result);b.insert(b.end(),report.text.begin(),report.text.end());return c->enqueue(std::move(b));
+}
 bool Transport::request_snapshot(const std::string& peer,uint64_t request) {
     auto c=impl_->find(peer);if(!c||!(c->peer.features&FeatureDesktopAux)||!request)return false;
     Bytes b{uint8_t((c->peer.features&FeatureNativeSnapshot)?NativeSnapshotRequest:SnapshotRequest)};u64(b,request);return c->enqueue(std::move(b));
@@ -1864,6 +1884,18 @@ bool Transport::self_test(std::string& result) {
                     " held="+std::to_string(held)+" authenticated="+std::to_string(authenticated)+" owned="+std::to_string(owned);return false;
             }
         }
+    }
+    {
+        Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);control.channel=0;control.peer.features=FeatureMediaProbe;
+        bool called=false;owner.callbacks.media_probe_request=[&](const Peer&,uint64_t id,uint32_t mode){called=id==9&&mode==2;};
+        Bytes request{MediaProbeRequest};u64(request,9);u32(request,2);
+        if(!owner.dispatch(control,request)||!called){result="Media probe dispatch failed";return false;}
+        control.peer.features=0;if(owner.dispatch(control,request)){result="Unnegotiated media probe accepted";return false;}
+        control.peer.features=FeatureMediaProbe;request.back()=255;
+        if(owner.dispatch(control,request)){result="Invalid media probe mode accepted";return false;}
+        request.resize(5);if(owner.dispatch(control,request)){result="Truncated media probe accepted";return false;}
+        Bytes reply{MediaProbeReply};u64(reply,9);u32(reply,0);reply.resize(MaxMediaProbeReport+14,'x');
+        if(owner.dispatch(control,reply)){result="Oversized media diagnostic report accepted";return false;}
     }
     {
         Transport endpoint;auto& owner=*endpoint.impl_;Impl::Conn control(&owner,INVALID_SOCKET);

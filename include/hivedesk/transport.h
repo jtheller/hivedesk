@@ -61,6 +61,8 @@ struct TransportCallbacks {
     std::function<void(const std::string&, const ReturnRequest&)> return_request;
     std::function<void(const std::string&, const ReturnReply&)> return_reply;
     std::function<void()> view_route_changed;
+    std::function<void(const Peer&,uint64_t,uint32_t)> media_probe_request;
+    std::function<void(const std::string&,MediaProbeReport)> media_probe_report;
 };
 // Explicit developer diagnostic: generated data only, bounded duration/rate.
 struct PathProbeResult {
@@ -109,6 +111,8 @@ public:
     bool send_clipboard(const std::string& peer, const std::wstring&);
     bool send_clipboard_offer(const std::string&,const ClipboardOffer&);
     bool send_clipboard_packet(const std::string&,const std::vector<uint8_t>&);
+    bool request_media_probe(const std::string& peer,uint64_t request,uint32_t mode);
+    bool send_media_probe_report(const std::string& peer,const MediaProbeReport&);
     bool request_snapshot(const std::string& peer, uint64_t request);
     bool send_snapshot(const std::string& peer, const Snapshot&);
     bool send_cursor(const std::string& peer, const CursorState&);

@@ -101,6 +101,7 @@ void amd(ID3D11Device* device){
 int main(int argc,char** argv){
     const bool roundtrip=argc==2&&std::strcmp(argv[1],"--intel-roundtrip")==0;
     if(argc>1&&!roundtrip){std::puts("Usage: HiveDeskMediaProbe [--intel-roundtrip]");return 1;}
+    setvbuf(stdout,nullptr,_IONBF,0);
     unsigned tested=0,failed=0;
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32|LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
     std::puts("HiveDesk media capability probe " HIVEDESK_VERSION " - no capture, no codec fallback, no production backend changes");
@@ -109,6 +110,11 @@ int main(int argc,char** argv){
         ComPtr<IDXGIAdapter1> adapter;if(FAILED(factory->EnumAdapters1(i,&adapter)))break;
         DXGI_ADAPTER_DESC1 d{};if(FAILED(adapter->GetDesc1(&d)))continue;
         std::printf("adapter=%u name=%s vendor=0x%04x device=0x%04x luid=%08x:%08x\n",i,utf8(d.Description).c_str(),d.VendorId,d.DeviceId,d.AdapterLuid.HighPart,d.AdapterLuid.LowPart);
+        LARGE_INTEGER driver{};
+        if(SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice),&driver)))
+            std::printf("  driver=%u.%u.%u.%u\n",unsigned(HIWORD(driver.HighPart)),unsigned(LOWORD(driver.HighPart)),unsigned(HIWORD(driver.LowPart)),unsigned(LOWORD(driver.LowPart)));
+        for(UINT n=0;;++n){ComPtr<IDXGIOutput> output;if(FAILED(adapter->EnumOutputs(n,&output)))break;DXGI_OUTPUT_DESC screen{};
+            if(SUCCEEDED(output->GetDesc(&screen)))std::printf("  display=%s attached=%d size=%ldx%ld primary=%d\n",utf8(screen.DeviceName).c_str(),screen.AttachedToDesktop,screen.DesktopCoordinates.right-screen.DesktopCoordinates.left,screen.DesktopCoordinates.bottom-screen.DesktopCoordinates.top,screen.Monitor==MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY));}
         if(d.VendorId!=0x8086&&d.VendorId!=0x1002){std::puts("  existing NVIDIA path untouched; foreign probe skipped");continue;}
         try{
             ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;

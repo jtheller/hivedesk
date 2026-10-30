@@ -376,3 +376,12 @@ are stored under the current user's LOCALAPPDATA/HiveDesk directory. Logs rotate
 Live Peek (0.7.0): hover a remote card in Hive for a fading, read-only live preview;
 leave to restore the current desktop, click to take control. Both ends need 0.7.0.
 Only the hovered warm host streams continuously. See [Peek behavior](docs/PEEK.zh-CN.md).
+
+Remote media qualification (0.13.5+): `HiveDeskRemoteMediaProbe <IPv4> capabilities`
+returns adapter/driver/display and codec capability results over the authenticated
+HiveDesk connection. `intel-roundtrip` runs the existing generated HEVC444 probe;
+`receive` previews the requesting computer on the target for 15 seconds. These are
+explicit developer diagnostics, subject to idle admission and a 30-second cooldown.
+No shell, input, clipboard or arbitrary file access is exposed. A received picture
+is connectivity evidence, not a motion smoothness benchmark. Intel production
+encoding remains unimplemented until real hardware qualification and integration.
