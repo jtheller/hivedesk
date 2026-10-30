@@ -30,8 +30,8 @@ Since 0.14.3 the hardware codec owns a separate D3D11 device on the same
 adapter. The capture/color device is not given to Media SDK: system-memory
 AYUV already separates their resource ownership, so blocking DXGI acquisition
 need not share a device/context lock with codec workers. Real-device latency
-comparison remains necessary; the shared-device contention hypothesis is not
-proven by a source change alone. The generated qualification also checks
+comparison is recorded below; source changes alone were not treated as proof
+of contention. The generated qualification also checks
 completion while the capture-context multithread lock is held.
 Intel hardware receiving remains separate work. AMD hosting is not implemented.
 
@@ -161,6 +161,42 @@ recovery test failed; its unchanged binary then passed an isolated rerun,
 three repeats, the full suite and six further repeats. That intermittent
 failure was not reproduced or declared fixed. NVIDIA codec implementations
 were not changed by the Intel integration.
+
+## Intel device isolation validation (0.14.3)
+
+Before the change, a five-minute real DEVG-viewing-JT session on 0.14.2 retained
+one session throughout, with no new input and no receive-queue accumulation.
+Its 296 telemetry snapshots had median codec cost 279.67 ms, p95 450.40 ms and
+maximum 603.87 ms; color conversion median was 5.88 ms and NVDEC median 2.32 ms.
+There were 333 distinct presentations, no sequence gaps and one expired frame.
+This was a sparse static-desktop baseline, not sustained-motion throughput.
+
+After idle OTA, JT reported 0.14.3 at 14:22 UTC on 2026-10-30. Both generated
+tests completed while the capture-context lock was held. The original 48-frame
+640x360 test passed; twelve generated frames at native 2736x1824 also passed
+color, sequence and forced-IDR checks, with non-IDR codec median 12.97 ms.
+Actual primary capture and recovery passed. A 15-second JT-to-DEVG preview
+presented all 21 received pictures; three fresh starts passed. Reverse receiving
+also passed (605 received / 568 presented in 15 seconds). These reverse counts
+use changing desktop content and are not an A/B performance comparison.
+
+Following a further 60 seconds without a stream, a two-minute real desktop
+preview through the same observer used for the earlier 0.14.2 timing samples
+received 130 pictures and presented 128. Its 118 nonzero source telemetry
+samples had median codec cost 11.07 ms, p95 12.03 ms and maximum 29.79 ms.
+Color median was 5.80 ms, receiver NVDEC median 2.27 ms; receive queue, sequence
+gaps, age expiration and overflow remained zero. The before/after windows and
+content are not identical, but codec latency did not return to hundreds of
+milliseconds under sparse updates after idle. This supports the shared-device
+contention diagnosis; it does not establish sustained 60 FPS or USB latency.
+
+The only production-code change from 0.14.2 is inside IntelEncoder. The tested
+core commit 24cd78a passed all 52 native tests, managed bridges and real WinUI
+light/dark checks. Final release commit 0d339cd adds native-resolution diagnostics
+and documentation to that same production code. All six published asset hashes
+were verified, DEVG's eleven installed binary hashes matched, and JT's version
+was observed over the authenticated transport. Active viewing deferred OTA
+until the user returned locally; no control input was injected by these tests.
 
 SDK sources and licenses are pinned under `third_party/onevpl` and
 `third_party/amf`. No additional vendor runtime is bundled or required by the
