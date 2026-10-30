@@ -659,17 +659,17 @@ private:
                 return_barrier_->sent=true;
                 if(closing_||view_control_!=target||target->generation!=generation_||!transport_.send_return_request(peer,return_barrier_->request))failed=return_barrier_->request;
             }
-            if(failed&&!closing_)shell_.returned(peer,{failed->session,failed->id,hive::ReturnResult::Stale,failed->summon});
+            if(failed&&!closing_)shell_.returned(peer,{failed->session,failed->id,hive::ReturnResult::Stale,failed->summon,failed->stats});
         };
         callbacks.return_request=[this](const std::string& peer,const hive::ReturnRequest& request){
             const auto control=hosting_.load();
-            const auto authorized=[this,control,peer,session=request.session,summon=request.summon]{return (!summon||hive::input_desktop_name()==L"Default")&&!closing_&&control&&hosting_.load()==control&&!control->revoked&&!control->warming&&control->input_enabled&&control->peer==peer&&control->session==session&&control->connection==transport_.connection_token(peer);};
-            if(!authorized()){transport_.send_return_reply(peer,{request.session,request.id,hive::ReturnResult::Stale,request.summon});return;}
+            const auto authorized=[this,control,peer,session=request.session,ui=request.summon||request.stats]{return (!ui||hive::input_desktop_name()==L"Default")&&!closing_&&control&&hosting_.load()==control&&!control->revoked&&!control->warming&&control->input_enabled&&control->peer==peer&&control->session==session&&control->connection==transport_.connection_token(peer);};
+            if(!authorized()){transport_.send_return_reply(peer,{request.session,request.id,hive::ReturnResult::Stale,request.summon,request.stats});return;}
             // The secure desktop hides this user's outbound viewer. The
             // controller is looking at this machine's lock/login screen,
             // not at a nested viewer left open behind it.
             if(hive::input_desktop_name()!=L"Default"){
-                transport_.send_return_reply(peer,{request.session,request.id,request.summon?hive::ReturnResult::Stale:hive::ReturnResult::Leaf,request.summon});return;
+                transport_.send_return_reply(peer,{request.session,request.id,(request.summon||request.stats)?hive::ReturnResult::Stale:hive::ReturnResult::Leaf,request.summon,request.stats});return;
             }
             shell_.return_one(peer,request,authorized);
         };

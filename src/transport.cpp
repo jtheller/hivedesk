@@ -53,7 +53,7 @@ constexpr size_t kMaxConnections = 128;
 constexpr auto kVideoQueueAge = std::chrono::milliseconds(50);
 enum : uint8_t { Start = 1, Stop = 2, Frame = 3, Input = 4, ClipboardText = 5, SnapshotRequest = 6, SnapshotReply = 7, Cursor = 8,
     AutoStart=9, Feedback=10, Health=11, AutoFrame=12, Rename=13, Diagnostics=14, HostEnded=15,
-    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41, HiveSummon=42, HiveSummoned=43, MediaProbeRequest=44, MediaProbeReply=45, WakeIdentity=46 };
+    InputEnable=16, InputReady=17, InputData=18, InputComplete=19, InputRevoke=20, AutoFrameTimed=21, FrameCursor=22, BuildVersion=23, NativeSnapshotRequest=24, NativeSnapshotReply=25, WarmStart=26, WarmCancel=27, RichClipboard=28, ClipboardData=29, LivePeek=30, ProbeStart=31, ProbeReady=32, ProbeDone=33, ProbePayload=34, DatagramOffer=35, DatagramResume=36, ScopedCursor=37, ReturnStep=38, ReturnDone=39, RoutedInput=40, ViewRouteState=41, HiveSummon=42, HiveSummoned=43, MediaProbeRequest=44, MediaProbeReply=45, WakeIdentity=46, StatsToggle=47, StatsToggled=48 };
 constexpr std::array<uint8_t,8> feature_marker{'H','V','C','A','P','S',0,1};
 
 void u16(Bytes& b, uint16_t n) { b.push_back(uint8_t(n >> 8)); b.push_back(uint8_t(n)); }
@@ -215,7 +215,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe|FeatureWake;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe|FeatureWake|FeatureCompactStats;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -1060,17 +1060,17 @@ struct Transport::Impl {
         }
         case Start: { StreamSettings settings; settings.fps = r.dword(); settings.bitrate_mbps = r.dword(); if (!r.end() || !settings.bitrate_mbps || settings.bitrate_mbps > 10000) return false; if (callbacks.start_stream) callbacks.start_stream(c.peer.id,settings); return true; }
         case Stop: if (!r.end()) return false; if (callbacks.stop_stream) callbacks.stop_stream(c.peer.id); return true;
-        case ReturnStep: case ReturnDone: case HiveSummon: case HiveSummoned: {
-            const bool summon=type==HiveSummon||type==HiveSummoned;
+        case ReturnStep: case ReturnDone: case HiveSummon: case HiveSummoned: case StatsToggle: case StatsToggled: {
+            const bool summon=type==HiveSummon||type==HiveSummoned,stats=type==StatsToggle||type==StatsToggled;
             const auto session=r.qword(),id=r.qword();const auto value=r.byte();
-            if(!(c.peer.features&(summon?FeatureRemoteHive:FeatureNestedReturn))||!session||!id||!r.end())return false;
-            if(summon&&find(c.peer.id).get()!=&c)return true;
-            if(type==ReturnStep||type==HiveSummon){
+            if(!(c.peer.features&(stats?FeatureCompactStats:summon?FeatureRemoteHive:FeatureNestedReturn))||!session||!id||!r.end())return false;
+            if((summon||stats)&&find(c.peer.id).get()!=&c)return true;
+            if(type==ReturnStep||type==HiveSummon||type==StatsToggle){
                 if(value>16)return false;
-                if(callbacks.return_request)callbacks.return_request(c.peer.id,{session,id,value,summon});
+                if(callbacks.return_request)callbacks.return_request(c.peer.id,{session,id,value,summon,stats});
             }else {
                 if(value>uint8_t(ReturnResult::Timeout))return false;
-                if(callbacks.return_reply)callbacks.return_reply(c.peer.id,{session,id,ReturnResult(value),summon});
+                if(callbacks.return_reply)callbacks.return_reply(c.peer.id,{session,id,ReturnResult(value),summon,stats});
             }return true;
         }
         case HostEnded: {
@@ -1356,12 +1356,12 @@ bool Transport::end_stream(const std::string& peer,uint64_t session) {
     Bytes b{HostEnded};u64(b,session);const bool control_notified=control->enqueue(std::move(b));return input_notified||control_notified;
 }
 bool Transport::send_return_request(const std::string& peer,const ReturnRequest& request) {
-    auto c=impl_->find(peer);if(!c||!(c->peer.features&(request.summon?FeatureRemoteHive:FeatureNestedReturn))||!request.session||!request.id||request.hops>16)return false;
-    Bytes b{uint8_t(request.summon?HiveSummon:ReturnStep)};u64(b,request.session);u64(b,request.id);b.push_back(request.hops);return c->enqueue(std::move(b));
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&(request.stats?FeatureCompactStats:request.summon?FeatureRemoteHive:FeatureNestedReturn))||(request.stats&&request.summon)||!request.session||!request.id||request.hops>16)return false;
+    Bytes b{uint8_t(request.stats?StatsToggle:request.summon?HiveSummon:ReturnStep)};u64(b,request.session);u64(b,request.id);b.push_back(request.hops);return c->enqueue(std::move(b));
 }
 bool Transport::send_return_reply(const std::string& peer,const ReturnReply& reply) {
-    auto c=impl_->find(peer);if(!c||!(c->peer.features&(reply.summon?FeatureRemoteHive:FeatureNestedReturn))||!reply.session||!reply.id||uint8_t(reply.result)>uint8_t(ReturnResult::Timeout))return false;
-    Bytes b{uint8_t(reply.summon?HiveSummoned:ReturnDone)};u64(b,reply.session);u64(b,reply.id);b.push_back(uint8_t(reply.result));return c->enqueue(std::move(b));
+    auto c=impl_->find(peer);if(!c||!(c->peer.features&(reply.stats?FeatureCompactStats:reply.summon?FeatureRemoteHive:FeatureNestedReturn))||(reply.stats&&reply.summon)||!reply.session||!reply.id||uint8_t(reply.result)>uint8_t(ReturnResult::Timeout))return false;
+    Bytes b{uint8_t(reply.stats?StatsToggled:reply.summon?HiveSummoned:ReturnDone)};u64(b,reply.session);u64(b,reply.id);b.push_back(uint8_t(reply.result));return c->enqueue(std::move(b));
 }
 bool Transport::send_frame(const std::string& peer, const EncodedFrame& frame) {
     auto c = impl_->find(peer,true); if (!c || frame.data.empty() || frame.data.size() > kMaxFrame || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384) return false;
@@ -1698,6 +1698,16 @@ bool Transport::self_test(std::string& result) {
         malformed=summon_packet;malformed.back()=17;if(owner.dispatch(*control,malformed)){result="Remote Hive hop limit accepted";return false;}
         malformed=summon_packet;malformed.pop_back();if(owner.dispatch(*control,malformed)){result="Truncated remote Hive request accepted";return false;}
         if(!sender.send_return_reply("return-peer",{91,8,ReturnResult::Returned,true})||!owner.dispatch(*control,control->control.back())||!reply.summon||reply.id!=8){result="Remote Hive reply serialization";return false;}
+        if(sender.send_return_request("return-peer",{91,9,15,false,true})){result="Stats sent to old peer";return false;}
+        control->peer.features|=FeatureCompactStats;
+        if(!sender.send_return_request("return-peer",{91,9,15,false,true})||!owner.dispatch(*control,control->control.back())||!request.stats||request.summon||request.id!=9){result="Stats request wire mode";return false;}
+        const auto stats_packet=control->control.back();
+        malformed=stats_packet;malformed.back()=17;if(owner.dispatch(*control,malformed)){result="Stats hop limit";return false;}
+        if(sender.send_return_request("return-peer",{91,9,15,true,true})){result="Ambiguous stats operation accepted";return false;}
+        if(!sender.send_return_reply("return-peer",{91,9,ReturnResult::Leaf,false,true})||!owner.dispatch(*control,control->control.back())||!reply.stats||reply.summon){result="Stats reply wire mode";return false;}
+        control->peer.features&=~FeatureCompactStats;
+        if(owner.dispatch(*control,stats_packet)){result="Unnegotiated stats received";return false;}
+
         request={};owner.connected.clear();
         if(!owner.dispatch(*control,summon_packet)||request.id){result="Retired connection summoned Hive";return false;}
         control->peer.features=0;

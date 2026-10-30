@@ -10,6 +10,12 @@ Existing alpha installations can upgrade through the same signed, idle-only OTA.
 [Download the latest Windows installer](https://github.com/jtheller/hivedesk/releases/latest)
 from the [public repository](https://github.com/jtheller/hivedesk).
 
+0.16.0 adds a compact, click-through stats strip: **Ctrl+Alt+I** toggles this
+viewer, and **Ctrl+Shift+Alt+I** toggles only the deepest viewed link in a nested
+chain. Warnings integrate into the row and still appear with stats off.
+Connection hints share the same translucent top-left styling. The large debug
+panel remains in Settings; logs are independent. See [0.16.0](docs/releases/0.16.0.md).
+
 0.9.0 adds automatic HEVC 4:4:4 software decoding when the viewer's hardware
 backend is unavailable. CPU decoding keeps full chroma, then uses vendor-neutral
 D3D11 upload/color conversion and the existing latest-picture presentation path.

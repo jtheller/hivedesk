@@ -53,3 +53,18 @@ high-RTT remote hardware, AMD/Intel production streaming and early R500 drivers
 still require their corresponding environments. Capability enumeration is not an
 AMD/Intel streaming test. Report those gaps explicitly rather than marking them
 passed, and never replace a failed result with an unsupported zero-regression claim.
+
+## Compact HUD (0.16.0)
+
+`compact_hud` checks stale samples, inline/off-state warnings, Unicode,
+premultiplied translucency, narrow clipping and 96/120/144/192 DPI; it writes
+`compact-hud-native.bmp` in the test working directory for visual review.
+`input_routing` exercises actual hook callbacks on an invisible station for
+both stats chords, repeat suppression and key-up consumption. `waiting_screen`
+exercises real Shell local/deep toggles, detailed-panel replacement, duplicate
+and unauthorized requests, and unsupported peers. `nested_return` covers
+A-B-C-D deepest-only completion and stale/revoked/timed-out/cancelled replies;
+`transport` covers negotiated wire modes, malformed hops and legacy peers.
+`preferences` verifies both reserved chords and old-config migration.
+These checks do not certify subjective appearance or physical nested use on
+every combination of machines.

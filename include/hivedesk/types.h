@@ -13,7 +13,7 @@ struct DesktopPreferences {
     bool relative_mouse=false;
 };
 inline bool valid_hive_hotkey(uint32_t modifiers,uint32_t key){
-    return !(modifiers==7&&key=='H')&&modifiers>0&&modifiers<=15&&(modifiers&11)&&
+    return !(key=='I'&&(modifiers==3||modifiers==7))&&!(modifiers==7&&key=='H')&&modifiers>0&&modifiers<=15&&(modifiers&11)&&
         ((key>='A'&&key<='Z')||(key>='0'&&key<='9')||(key>=0x70&&key<=0x7a));
 }
 struct Peer {
@@ -54,6 +54,7 @@ constexpr uint32_t FeatureRemoteHive = 33554432;
 constexpr uint32_t FeatureMediaProbe = 67108864;
 constexpr uint32_t FeatureHostProbe = 134217728;
 constexpr uint32_t FeatureWake = 268435456; // Authenticated MAC announcement and read-only power report.
+constexpr uint32_t FeatureCompactStats = 536870912; // Session-scoped deepest-viewer HUD toggle.
 constexpr size_t MaxMediaProbeReport = 48 * 1024;
 struct MediaProbeReport { uint64_t request=0; uint32_t result=0; std::string text; };
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;

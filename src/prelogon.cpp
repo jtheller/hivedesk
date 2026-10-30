@@ -60,7 +60,7 @@ public:
             const bool authorized=current(c)&&!c->warming&&c->input_enabled&&c->peer==peer&&c->session==request.session&&c->connection==transport_.connection_token(peer);
             // There is no outbound viewer before logon, but advertise/answer
             // the same protocol so escape never waits for a nonexistent Shell.
-            transport_.send_return_reply(peer,{request.session,request.id,authorized&&!request.summon?ReturnResult::Leaf:ReturnResult::Stale,request.summon});
+            transport_.send_return_reply(peer,{request.session,request.id,authorized&&!request.summon&&!request.stats?ReturnResult::Leaf:ReturnResult::Stale,request.summon,request.stats});
         };
         cb.input_packet=[this](const std::string& peer,const InputPacket& packet){
             auto c=current_.load();if(!current(c)||c->warming||!c->input_enabled||c->peer!=peer||c->session!=packet.session){transport_.end_stream(peer,packet.session);return;}

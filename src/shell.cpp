@@ -5,6 +5,7 @@
 #include "taskbar_peek.h"
 #include "viewer_geometry.h"
 #include "debug_model.h"
+#include "compact_hud.h"
 #include <optional>
 #include "hivedesk/network_key.h"
 #include "hivedesk/desktop_aux.h"
@@ -165,6 +166,7 @@ struct Shell::Impl {
     struct PendingSource {std::string peer;SourceDiagnostics value;uint64_t generation;ULONGLONG received;};
     std::mutex source_mutex;std::optional<PendingSource> pending_source;
     InputDiagnostics input_diagnostics{};
+    CompactHudSurface compact_surface,waiting_hud;bool compact_stats=false,hud_warning=false;uint64_t hud_shown_at=0,hud_notice_until=0;std::wstring hud_notice;
     DebugSurface debug_surface;HFONT debug_font{};std::array<DiagnosticPulse,6> debug_pulses{};
     HFONT font{},title_font{},small_font{}; HBRUSH background_brush{},edit_brush{};
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
@@ -432,14 +434,11 @@ struct Shell::Impl {
         message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
         RemovePropW(waiting,L"HiveDesk.ConnectionHintVisible");
         if(connection_hint_visible){
-        const int left=px(24),bottom=height-px(24);
-        RECT badge{left,bottom-px(74),std::min(width-left,left+px(480)),bottom};fill(dc,badge,Background);
-        fill(dc,{left,badge.top,left+px(3),bottom},accent);
-        draw_text(dc,title_font,label,{left+px(16),badge.top+px(5),badge.right-px(12),badge.top+px(38)},Text);
-        draw_text(dc,small_font,message,{left+px(16),badge.top+px(39),badge.right-px(12),bottom-px(5)},Muted);
         SetPropW(waiting,L"HiveDesk.ConnectionHintVisible",reinterpret_cast<HANDLE>(1));
         }
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
+        if(connection_hint_visible&&waiting_hud.render(connecting_hud(waiting_retry,label),std::max(1,std::min(px(352),width-px(32))),px(28),dpi))
+            waiting_hud.composite(rgba,width,height,px(16),px(16));
         try{waiting_composition.present(pixels,width,height,false);waiting_composition.cover(float(width),float(height),false);}
         catch(...){SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);throw;}
         SelectObject(dc,previous);DeleteObject(bitmap);DeleteDC(dc);
@@ -475,7 +474,7 @@ struct Shell::Impl {
     }
     void reset_remote_cursor() {
         cursor_position_gate.reset(0);cursor_trace_count=0;
-        stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;debug_pulses={};slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
+        hud_notice_until=0;stream_health={};source_diagnostics={};viewer_diagnostics={};input_diagnostics={};source_stats_time=health_time=0;debug_pulses={};slow_indicator.reset();if(health_badge)ShowWindow(health_badge,SW_HIDE);
         SetCursor(LoadCursorW(nullptr,IDC_ARROW));if(remote_cursor)DestroyCursor(remote_cursor);
         remote_cursor=nullptr;remote_cursor_visible=true;remote_cursor_received=false;remote_pointer={};
         remote_cursor_composition.reset();
@@ -542,23 +541,43 @@ struct Shell::Impl {
         return {selection_armed?(pending_id.empty()?active_id:pending_id):active_id,input_session,generation.load()};
     }
     bool return_parent_valid()const{return !return_authorized||return_authorized();}
+    bool hud_notice_visible()const{return GetTickCount64()<hud_notice_until;}
+    bool detailed_hud()const{return config.desktop.debug_overlay&&!hud_notice_visible();}
+    void stats_unavailable(const wchar_t* message){hud_notice=message;hud_notice_until=GetTickCount64()+3500;}
+    void toggle_stats() {
+        // A shortcut selects the compact HUD, even if detailed debugging was on.
+        // Save through the same preference path so a restart does not restore
+        // the giant panel on top of the user's chosen compact presentation.
+        if(config.desktop.debug_overlay){
+            auto desktop=config.desktop;desktop.debug_overlay=false;
+            if(callbacks.save_preferences&&!callbacks.save_preferences(config.device_name,desktop)){
+                status=L"Could not switch from detailed debug to compact stats.";return;
+            }
+            config.desktop=desktop;
+        }
+        hud_notice_until=0;compact_stats=!compact_stats;
+        SetPropW(owner,L"HiveDesk.CompactStats",reinterpret_cast<HANDLE>(ULONG_PTR(compact_stats)));
+        if(health_badge)InvalidateRect(health_badge,nullptr,FALSE);
+    }
     void return_complete(std::optional<NestedReturn::Completion> done) {
         if(!done)return;
         return_authorized={};
         if(callbacks.return_finished)callbacks.return_finished(done->view.peer,done->view.session);
+        if(done->toggle_stats)toggle_stats();
         if(done->close)local(true);
         else {publish_input();confine_mouse();}
-        log(std::string(done->summon?"Remote Hive: peer=":"Nested return: peer=")+done->view.peer+" session="+std::to_string(done->view.session)+" result="+std::to_string(int(done->result))+" closed="+std::to_string(done->close));
+        log(std::string(done->stats?"Remote stats: peer=":done->summon?"Remote Hive: peer=":"Nested return: peer=")+done->view.peer+" session="+std::to_string(done->view.session)+" result="+std::to_string(int(done->result))+" closed="+std::to_string(done->close));
         if(!done->parent.peer.empty()) {
-            if(callbacks.return_reply)callbacks.return_reply(done->parent.peer,{done->parent.request.session,done->parent.request.id,done->result,done->summon});
+            if(callbacks.return_reply)callbacks.return_reply(done->parent.peer,{done->parent.request.session,done->parent.request.id,done->result,done->summon,done->stats});
         }else if(done->result!=ReturnResult::Returned){
-            status=done->summon?L"Remote Hive unavailable. Update every computer in the chain and try again.":L"Could not return one level. Ctrl+Alt+Backspace returns directly to this computer.";
+            if(done->stats)stats_unavailable(L"Remote stats unavailable \x00b7 Try again");
+            status=done->stats?L"Remote stats unavailable. Update every computer in the chain and try again.":done->summon?L"Remote Hive unavailable. Update every computer in the chain and try again.":L"Could not return one level. Ctrl+Alt+Backspace returns directly to this computer.";
         }
     }
-    void return_begin(NestedReturn::Parent parent={},std::function<bool()> authorized={},bool summon=false) {
-        summon=summon||parent.request.summon;
-        const auto respond=[&](ReturnResult result){if(!parent.peer.empty()&&callbacks.return_reply)callbacks.return_reply(parent.peer,{parent.request.session,parent.request.id,result,summon});};
-        if(shutting_down||(authorized&&!authorized())){respond(ReturnResult::Stale);return;}
+    void return_begin(NestedReturn::Parent parent={},std::function<bool()> authorized={},bool summon=false,bool stats=false) {
+        summon=summon||parent.request.summon;stats=stats||parent.request.stats;
+        const auto respond=[&](ReturnResult result){if(!parent.peer.empty()&&callbacks.return_reply)callbacks.return_reply(parent.peer,{parent.request.session,parent.request.id,result,summon,stats});};
+        if((summon&&stats)||shutting_down||(authorized&&!authorized())){respond(ReturnResult::Stale);return;}
         if(!parent.peer.empty()){
             if(return_parent_peer!=parent.peer||return_parent_session!=parent.request.session){
                 return_parent_peer=parent.peer;return_parent_session=parent.request.session;return_parent_id=0;
@@ -569,7 +588,8 @@ struct Shell::Impl {
         if(nested_return.busy()){respond(ReturnResult::Busy);return;}
         const auto view=return_view();
         if(view.peer.empty()){
-            if(summon){toggle_panel();respond(ReturnResult::Returned);}
+            if(stats){if(parent.peer.empty())toggle_stats();else respond(ReturnResult::Leaf);}
+            else if(summon){toggle_panel();respond(ReturnResult::Returned);}
             else if(parent.peer.empty())local(true);else respond(ReturnResult::Leaf);
             return;
         }
@@ -578,21 +598,26 @@ struct Shell::Impl {
         const auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==view.peer;});
         // Connecting has no active input lease yet. An old peer cannot report
         // a nested view; retain the pre-upgrade one-hop escape for that boundary.
+        if(stats&&(!view.session||peer==peers.end()||!(peer->features&FeatureCompactStats))){
+            status=L"Remote stats unavailable. Update every computer in the chain and try again.";
+            if(parent.peer.empty())stats_unavailable(L"Remote stats unavailable \x00b7 Update the chain");
+            respond(ReturnResult::Stale);return;
+        }
         if(summon&&(!view.session||peer==peers.end()||!(peer->features&FeatureRemoteHive))){
             status=L"Remote Hive unavailable. Update every computer in the chain and try again.";
             respond(ReturnResult::Stale);return;
         }
-        if(!summon&&(!view.session||peer==peers.end()||!(peer->features&FeatureNestedReturn))){
+        if(!summon&&!stats&&(!view.session||peer==peers.end()||!(peer->features&FeatureNestedReturn))){
             local(true);respond(ReturnResult::Returned);return;
         }
         // Reveal the child beneath this layer's own Hive/Peek before asking
         // the deepest layer to show its panel. Keep the active viewer alive.
         if(summon)hide_panel(true);
         return_authorized=std::move(authorized);
-        const auto request=nested_return.begin(view,std::move(parent),uint8_t(hops-1),GetTickCount64(),summon);
+        const auto request=nested_return.begin(view,std::move(parent),uint8_t(hops-1),GetTickCount64(),summon,stats);
         publish_input();ClipCursor(nullptr);
         if(!callbacks.return_request||!callbacks.return_request(view.peer,request))
-            return_complete(nested_return.reply(view.peer,{request.session,request.id,ReturnResult::Stale,summon},return_view(),return_parent_valid()));
+            return_complete(nested_return.reply(view.peer,{request.session,request.id,ReturnResult::Stale,summon,stats},return_view(),return_parent_valid()));
     }
     void local(bool notify) {
         return_complete(nested_return.cancel());
@@ -747,12 +772,18 @@ struct Shell::Impl {
         return build_debug_rows({remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time,
             wide(HIVEDESK_VERSION),peer==peers.end()?std::wstring{}:wide(peer->version)},debug_pulses);
     }
+    DebugOverlayState compact_state()const {
+        return {remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time};
+    }
     void paint_health() {
-        RECT rect{};GetClientRect(health_badge,&rect);DebugRows rows;
-        if(reconnecting)rows={{{waiting_retry?L"Reconnecting...  Ctrl + Alt + ` to cancel":L"Connecting...  Ctrl + Alt + ` to cancel",DiagnosticTone::Warning}}};
-        else if(config.desktop.debug_overlay)rows=debug_rows();
-        else rows={{{(stream_health.pressure&PressureNetwork)?L"Slow connection":L"Reduced frame rate",DiagnosticTone::Warning}}};
-        if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,rows,reconnecting||!config.desktop.debug_overlay))debug_surface.present(health_badge);
+        RECT rect{};GetClientRect(health_badge,&rect);
+        if(!reconnecting&&detailed_hud()){
+            compact_surface.invalidate_present();
+            if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,debug_rows()))debug_surface.present(health_badge);
+        }else {
+            const auto model=reconnecting?connecting_hud(waiting_retry,pending_name):hud_notice_visible()?CompactHud{352,HudTone::Red,{{22,320,hud_notice,HudTone::Red}}}:compact_hud(compact_state(),compact_stats,hud_warning);
+            if(compact_surface.render(model,rect.right,rect.bottom,dpi))compact_surface.present(health_badge,BYTE(std::min<uint64_t>(255,(GetTickCount64()-hud_shown_at)*255/120)));
+        }
     }
     void timer() {
         return_complete(nested_return.tick(GetTickCount64(),return_view(),return_parent_valid()));
@@ -763,15 +794,16 @@ struct Shell::Impl {
         if(incoming&&incoming->generation==generation.load()&&incoming->peer==active_id&&incoming->value.session==input_session){source_diagnostics=incoming->value;source_stats_time=incoming->received;}
         sample_cursor();
         if(GetTickCount64()-last_stream_tick>=100){last_stream_tick=GetTickCount64();if(callbacks.stream_tick)callbacks.stream_tick();}
-        const bool warning=slow_indicator.update(GetTickCount64(),stream_health);
+        const bool warning=slow_indicator.update(GetTickCount64(),stream_health);hud_warning=warning;
         if(health_badge) {
-            if(remote&&!waiting_visible&&(reconnecting?connection_hint_visible:(warning||config.desktop.debug_overlay))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
-                if(!reconnecting&&config.desktop.debug_overlay&&callbacks.debug_tick)callbacks.debug_tick();
+            if(remote&&!waiting_visible&&(reconnecting?connection_hint_visible:(warning||compact_stats||config.desktop.debug_overlay||hud_notice_visible()))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
+                if(!reconnecting&&(config.desktop.debug_overlay||compact_stats)&&callbacks.debug_tick)callbacks.debug_tick();
                 const auto client=viewer_client();
-                const int width=std::min(px(reconnecting?280:config.desktop.debug_overlay?460:184),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&config.desktop.debug_overlay?474:30),std::max(px(30),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
+                const int width=std::min(px(reconnecting?352:detailed_hud()?460:(compact_stats||hud_notice_visible())?352:184),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&detailed_hud()?474:28),std::max(px(28),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
                 const int left=client.left+px(16),top=client.top+px(16);
-                if(!IsWindowVisible(health_badge)||bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOP,left,top,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);InvalidateRect(health_badge,nullptr,FALSE);}
-                if(config.desktop.debug_overlay||reconnecting)InvalidateRect(health_badge,nullptr,FALSE);
+                if(!IsWindowVisible(health_badge))hud_shown_at=GetTickCount64();
+                if(!IsWindowVisible(health_badge)||bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOP,left,top,width,height,SWP_NOACTIVATE);paint_health();ShowWindow(health_badge,SW_SHOWNOACTIVATE);}
+                InvalidateRect(health_badge,nullptr,FALSE);
             }else if(IsWindowVisible(health_badge))ShowWindow(health_badge,SW_HIDE);
         }
         if(panel_mode&&!thumbnail_fades.empty())InvalidateRect(panel,nullptr,FALSE);
@@ -864,6 +896,7 @@ struct Shell::Impl {
         if(panel_mode==1)card(preview_index(),px(12));
         else for(int i=scroll;i<=static_cast<int>(peers.size())&&i<scroll+visible_tiles();++i)card(i,px(12)+(i-scroll)*tile_stride());
         GdiFlush();auto* rgba=static_cast<uint32_t*>(pixels);for(size_t i=0;i<size_t(width)*height;++i)rgba[i]|=0xff000000u;
+
         panel_pixels.assign(rgba,rgba+size_t(width)*height);pixels_width=width;pixels_height=height;
         bool rendered=false;
         try{composition.present(pixels,width,height,commit);rendered=true;}
@@ -934,6 +967,7 @@ struct Shell::Impl {
         if(hotkey_changed&&!RegisterHotKey(owner,next_id,desktop.hotkey_modifiers|MOD_NOREPEAT,desktop.hotkey_key))return false;
         if(callbacks.save_preferences&&!callbacks.save_preferences(name,desktop)){if(hotkey_changed)UnregisterHotKey(owner,next_id);return false;}
         if(hotkey_changed){UnregisterHotKey(owner,hotkey_id);hotkey_id=next_id;hotkey_registered=true;}
+        if(desktop.debug_overlay)compact_stats=false;
         config.device_name=name;config.desktop=desktop;set_relative(desktop.relative_mouse);publish_input();tray();if(health_badge){ShowWindow(health_badge,SW_HIDE);InvalidateRect(health_badge,nullptr,FALSE);}InvalidateRect(panel,nullptr,FALSE);return true;
     }
     void settings_ui() {
@@ -989,7 +1023,9 @@ struct Shell::Impl {
             switch(message) {
             case WM_HOTKEY:
                 if(int(w)==s->hotkey_id)s->toggle_panel();
-                else if(w==83&&!s->recording_hotkey)s->return_begin({}, {},true);return 0;
+                else if(w==83&&!s->recording_hotkey)s->return_begin({}, {},true);
+                else if(w==84&&!s->recording_hotkey)s->toggle_stats();
+                else if(w==85&&!s->recording_hotkey)s->return_begin({}, {},false,true);return 0;
             case CaptureActionMessage:{
                 const auto action=CaptureAction(w);
                 if(action==CaptureAction::KickController){if(!s->shutting_down&&s->callbacks.kick_controller)s->callbacks.kick_controller();return 0;}
@@ -1002,6 +1038,8 @@ struct Shell::Impl {
                 case CaptureAction::HidePanelAnimated:s->hide_panel(true,s->taskbar_peek.active());break;
                 case CaptureAction::Summon:s->toggle_panel();break;
                 case CaptureAction::SummonRemote:s->return_begin({}, {},true);break;
+                case CaptureAction::ToggleStats:s->toggle_stats();break;
+                case CaptureAction::ToggleRemoteStats:s->return_begin({}, {},false,true);break;
                 default:break;
                 }return 0;
             }
@@ -1185,6 +1223,8 @@ struct Shell::Impl {
         },error))return false;
         hotkey_registered=RegisterHotKey(owner,hotkey_id,config.desktop.hotkey_modifiers|MOD_NOREPEAT,config.desktop.hotkey_key)!=FALSE;
         if(!hotkey_registered)log_hotkey_conflict();
+        if(!RegisterHotKey(owner,84,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'I'))log("Stats shortcut Ctrl+Alt+I is already in use.");
+        if(!RegisterHotKey(owner,85,MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_NOREPEAT,'I'))log("Remote stats shortcut Ctrl+Alt+Shift+I is already in use.");
         if(!RegisterHotKey(owner,83,MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_NOREPEAT,'H'))log("Remote Hive shortcut Ctrl+Alt+Shift+H is already in use.");
         taskbar_created=RegisterWindowMessageW(L"TaskbarCreated");tray();SetTimer(owner,1,16,nullptr);read_clipboard(false);
         worker=std::thread([this]{for(;;){std::function<void()> f;{std::unique_lock lock(work_mutex);work_ready.wait(lock,[this]{return stop_worker||!work.empty();});if(stop_worker)break;f=std::move(work.front());work.pop_front();}
@@ -1201,7 +1241,7 @@ struct Shell::Impl {
         log("Shell shutdown: background operations");
         {std::lock_guard lock(work_mutex);stop_worker=true;work.clear();}work_ready.notify_one();if(worker.joinable())worker.join();
         log("Shell shutdown: native windows");
-        if(owner){UnregisterHotKey(owner,hotkey_id);UnregisterHotKey(owner,83);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
+        if(owner){UnregisterHotKey(owner,hotkey_id);UnregisterHotKey(owner,83);UnregisterHotKey(owner,84);UnregisterHotKey(owner,85);KillTimer(owner,1);KillTimer(owner,3);tray(true);}
         if(settings_process){if(auto window=external_settings_window())PostMessageW(window,WM_CLOSE,0,0);CloseHandle(settings_process);settings_process=nullptr;settings=nullptr;}
         if(settings)DestroyWindow(settings);if(panel)DestroyWindow(panel);if(health_badge)DestroyWindow(health_badge);if(waiting)DestroyWindow(waiting);if(viewer)DestroyWindow(viewer);
         for(const auto& surface:retired_viewers)DestroyWindow(surface->window);
@@ -1379,10 +1419,10 @@ void Shell::update_source_diagnostics(const std::string& peer,const SourceDiagno
     std::lock_guard lock(impl_->source_mutex);impl_->pending_source=Impl::PendingSource{peer,value,generation,received};
 }
 void Shell::update_viewer_diagnostics(const std::string& peer,const ViewerDiagnostics& value){
-    const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id)return;s->viewer_diagnostics=value;if(s->config.desktop.debug_overlay)InvalidateRect(s->health_badge,nullptr,FALSE);});
+    const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id)return;s->viewer_diagnostics=value;if(s->config.desktop.debug_overlay||s->compact_stats)InvalidateRect(s->health_badge,nullptr,FALSE);});
 }
 void Shell::update_input_diagnostics(const std::string& peer,const InputDiagnostics& value){
-    const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id||value.session!=s->input_session)return;s->input_diagnostics=value;if(s->config.desktop.debug_overlay)InvalidateRect(s->health_badge,nullptr,FALSE);});
+    const auto generation=impl_->generation.load();impl_->dispatch([s=impl_,peer,value,generation]{if(generation!=s->generation.load()||peer!=s->active_id||value.session!=s->input_session)return;s->input_diagnostics=value;if(s->config.desktop.debug_overlay||s->compact_stats)InvalidateRect(s->health_badge,nullptr,FALSE);});
 }
 void Shell::update_cursor(const std::string& peer,CursorState cursor) {
     const auto generation=impl_->generation.load();

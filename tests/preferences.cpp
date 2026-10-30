@@ -5,6 +5,7 @@
 
 int main(){try{
     auto require=[](bool ok,const char* message){if(!ok)throw std::runtime_error(message);};
+    require(!hive::valid_hive_hotkey(3,'I')&&!hive::valid_hive_hotkey(7,'I')&&hive::valid_hive_hotkey(3,'H'),"Stats chords not reserved or default Hive blocked");
     wchar_t previous[32768]{};const auto size=GetEnvironmentVariableW(L"LOCALAPPDATA",previous,32768);
     require(size&&size<32768,"Missing isolated preference test environment");
     const auto root=std::filesystem::temp_directory_path()/(L"HiveDesk-preferences-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
@@ -28,5 +29,10 @@ int main(){try{
     loaded.desktop.relative_mouse=false;hive::save_config(loaded);require(!hive::load_config().desktop.relative_mouse,"Relative input preference did not disable");
     require(WritePrivateProfileStringW(L"HiveDesk",L"RelativeMouse",nullptr,ini.c_str())!=FALSE,"Prepare legacy preferences");
     require(!hive::load_config().desktop.relative_mouse,"Legacy settings did not default to absolute input");
+    for(const auto* modifiers:{L"3",L"7"}){
+        WritePrivateProfileStringW(L"HiveDesk",L"HotkeyModifiers",modifiers,ini.c_str());
+        WritePrivateProfileStringW(L"HiveDesk",L"HotkeyKey",L"73",ini.c_str());
+        const auto reserved=hive::load_config();require(reserved.desktop.hotkey_key=='H'&&reserved.desktop.hotkey_modifiers==3,"Existing conflicting shortcut did not fall back safely");
+    }
     std::puts("PASS relative mouse preferences and retired cadence migration: default, durable enable/disable, old enabled/disabled cadence removed without changing other preferences; isolated storage, no input or registry changes.");return 0;
 }catch(const std::exception& error){std::printf("FAIL preferences: %s\n",error.what());return 1;}}

@@ -123,6 +123,9 @@ struct InputCapture::Impl {
             }
             s->summon_key_up=k.vkCode;s->post(CaptureAction::HidePanel,route.state->generation);return 1;
         }
+        if(route.enabled&&!route.state->recording_hotkey&&!up&&k.vkCode=='I'&&(s->fixed.modifiers()==3||s->fixed.modifiers()==7)){
+            s->summon_key_up=k.vkCode;s->emit(route,{InputKind::ReleaseAll},now);s->post(s->fixed.modifiers()==7?CaptureAction::ToggleRemoteStats:CaptureAction::ToggleStats,route.state->generation);return 1;
+        }
         if(route.enabled&&!route.state->recording_hotkey&&!up&&k.vkCode=='H'&&s->fixed.modifiers()==7){
             s->summon_key_up=k.vkCode;s->emit(route,{InputKind::ReleaseAll},now);s->post(CaptureAction::SummonRemote,route.state->generation);return 1;
         }
@@ -286,9 +289,15 @@ bool InputCapture::routing_self_test(std::string& result){
         require(press&&release&&press->event.kind==InputKind::Button&&release->event.kind==InputKind::Button&&
             press->event.b==0&&release->event.b==1,"Remote mouse button edges changed");
         key(VK_CONTROL,0x1d);key(VK_MENU,0x38);key(VK_SHIFT,0x2a);
+        require(key('I',0x17)==1,"Deep stats chord forwarded");action(CaptureAction::ToggleRemoteStats);
+        require(key('I',0x17)==1,"Stats repeat escaped");quiet();
+        require(key('I',0x17,true)==1,"Deep stats key-up forwarded");
         require(key('H',0x23)==1,"Remote Hive chord was forwarded");action(CaptureAction::SummonRemote);
         require(key('H',0x23)==1,"Repeated remote Hive chord escaped suppression");
         require(key('H',0x23,true)==1,"Remote Hive key-up was forwarded");
+        key(VK_SHIFT,0x2a,true);s.queue.clear();
+        require(key('I',0x17)==1,"Local stats chord forwarded");action(CaptureAction::ToggleStats);
+        require(key('I',0x17,true)==1,"Local stats key-up forwarded");quiet();key(VK_SHIFT,0x2a);
         require(key(VK_OEM_3,0x29)==1,"Kick chord was not intercepted");action(CaptureAction::KickController);
         key(VK_OEM_3,0x29,true);key(VK_SHIFT,0x2a,true);
         require(key(VK_OEM_3,0x29)==1,"Nested escape chord was not intercepted");action(CaptureAction::ReturnOne);
