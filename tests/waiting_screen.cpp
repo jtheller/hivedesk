@@ -102,9 +102,16 @@ int probe(){
     require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"First frame failed to cancel a pending hint");
     require(GetWindowLongPtrW(shell.viewer_window(),GWL_EXSTYLE)&WS_EX_TOPMOST,"First frame demoted the fullscreen viewer");
     require(!shown(waiting)&&shown(shell.viewer_window()),"First frame did not dismiss the waiting layer");
+    // Reboot removes discovery before the reconnect cover is painted.
+    shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true}});
     shell.show_reconnecting("c");
     require(!GetPropW(waiting,L"HiveDesk.ConnectionHintVisible"),"Reconnection flashed its hint without waiting");
     require(shown(waiting)&&title(waiting).find(L"Reconnecting")!=std::wstring::npos&&title(waiting).find(L"Computer C")!=std::wstring::npos,"Reconnection reused stale video instead of a waiting screen");
+    shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Renamed C","",47980,true}});
+    shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true}});
+    shell.update_thumbnail("c",image(220));
+    require(title(waiting).find(L"Renamed C")!=std::wstring::npos,"Reconnect lost the latest known name after rediscovery/removal");
+    shell.update_peers({{"a","Computer A","",47980,true},{"b","Computer B","",47980,true},{"c","Computer C","",47980,true}});
     auto failed_surface=shell.viewer_surface();
     auto renewal=shell.renew_viewer_surface(failed_surface);pump(20);auto recovered_surface=renewal.get();
     require(recovered_surface&&recovered_surface!=failed_surface&&IsWindow(failed_surface->window)&&!shown(failed_surface->window),"Retry reused or destroyed a still-leased failed renderer window");

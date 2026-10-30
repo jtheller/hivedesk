@@ -170,6 +170,7 @@ struct Shell::Impl {
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
     ShellConfig config; ShellCallbacks callbacks; std::vector<Peer> peers;
     std::string active_id,previous_id,pending_id;
+    std::wstring pending_name;
     bool windowed=false,sizing_viewer=false,dragging=false,viewer_layout_pending=false,viewer_maximized=false,viewer_restore_pending=false;HWND drag_focus{};
     int pressed_card=-1,drop_slot=-1;POINT drag_origin{};std::string dragged_peer;ULONGLONG last_drag_scroll=0;
     HWND drag_ghost{};POINT drag_anchor{};std::vector<uint32_t> panel_pixels;int pixels_width=0,pixels_height=0;
@@ -424,7 +425,8 @@ struct Shell::Impl {
             SelectObject(source,prior);DeleteDC(source);
         }
         auto peer=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==pending_id;});
-        const auto label=peer==peers.end()?wide(pending_id):wide(peer->name);
+        if(peer!=peers.end()&&!peer->name.empty())pending_name=wide(peer->name);
+        const auto label=pending_name.empty()?std::wstring(L"Remote computer"):pending_name;
         std::wstring message=waiting_retry?L"Reconnecting":L"Connecting";
         if(snapshot)message+=L"  \x00b7  Snapshot";
         message+=L"  \x00b7  Ctrl + Alt + ` to cancel";
@@ -599,7 +601,7 @@ struct Shell::Impl {
         // Remove video before its cover, including Escape during a fade.
         ShowWindow(viewer,SW_HIDE);
         hide_waiting();
-        selection_armed=false;pending_id.clear();
+        selection_armed=false;pending_id.clear();pending_name.clear();
         if(!active_id.empty())previous_id=active_id;active_id.clear();
         ShowWindow(viewer,SW_HIDE);hide_panel();ReleaseCapture();ClipCursor(nullptr);reset_remote_cursor();
         if(prior_focus&&IsWindow(prior_focus))SetForegroundWindow(prior_focus);prior_focus=nullptr;
@@ -610,6 +612,9 @@ struct Shell::Impl {
         if(id==active_id&&remote&&!reconnecting&&as_window==windowed){hide_panel();if(IsIconic(viewer))ShowWindow(viewer,SW_RESTORE);SetForegroundWindow(viewer);confine_mouse();publish_input();return;}
         auto it=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==id;});
         if(it==peers.end()){status=L"Computer is no longer in the device list.";InvalidateRect(panel,nullptr,FALSE);return;}
+        // Bind the display name to this selection, independently of discovery.
+        // A reboot removes the live peer before the reconnect cover is painted.
+        pending_name=wide(it->name);
         ++generation;input_session=0;publish_input();
         const bool adopting=peek_live&&peek_surface&&peek_surface->peer==id&&!as_window;
         const HWND adopted=adopting?peek_surface->window:nullptr;end_peek(false,adopted);
@@ -1258,6 +1263,10 @@ void Shell::update_peers(const std::vector<Peer>& peers){impl_->dispatch([s=impl
     }
     if(s->peers.size()!=peers.size())s->composition.finish_cards();
     s->peers=peers;s->sort_peers();s->scroll=std::min(s->scroll,static_cast<int>(peers.size()));
+    if(s->selection_armed){
+        const auto current=std::find_if(peers.begin(),peers.end(),[&](const Peer& p){return p.id==s->pending_id;});
+        if(current!=peers.end()&&!current->name.empty())s->pending_name=wide(current->name);
+    }
     s->publish_visible();s->publish_input();InvalidateRect(s->panel,nullptr,FALSE);
 });}
 
