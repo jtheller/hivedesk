@@ -44,7 +44,7 @@ struct InputCapture::Impl {
     struct Route {std::shared_ptr<const InputCaptureState> state;uint64_t id;bool enabled;};
     Route snapshot() {
         std::lock_guard lock(mutex);
-        return {state,route,state->remote&&!state->local_shell&&blocked_route!=route&&!stopping&&(!state->viewer||GetForegroundWindow()==state->viewer)};
+        return {state,route,state->remote&&state->viewer_focused&&!state->local_shell&&blocked_route!=route&&!stopping&&(!state->viewer||GetForegroundWindow()==state->viewer)};
     }
     void observe_route(uint64_t id) {
         if(observed_route==id)return;
@@ -239,7 +239,7 @@ struct InputCapture::Impl {
             CapturedInput input;Route target;
             {
                 std::unique_lock lock(mutex);wake.wait(lock,[&]{return stopping||queue.size();});if(stopping)return;
-                input=*queue.pop();target={state,route,state->remote&&blocked_route!=route};
+                input=*queue.pop();target={state,route,state->remote&&state->viewer_focused&&blocked_route!=route};
                 if(input.generation!=route||(!target.enabled&&input.event.kind!=InputKind::ReleaseAll))continue;
             }
             const auto now=input_now_us();
@@ -379,7 +379,7 @@ void InputCapture::stop(){
 void InputCapture::update(InputCaptureState state){
     auto next=std::make_shared<InputCaptureState>(std::move(state));auto& s=*impl_;std::lock_guard lock(s.mutex);
     const bool same_session=next->generation==s.state->generation&&next->session==s.state->session&&next->peer==s.state->peer;
-    const bool focus_changed=same_session&&((next->remote&&!next->local_shell)!=(s.state->remote&&!s.state->local_shell));
+    const bool focus_changed=same_session&&((next->remote&&next->viewer_focused&&!next->local_shell)!=(s.state->remote&&s.state->viewer_focused&&!s.state->local_shell));
     if(focus_changed)s.relay_router.invalidate_remote();
     if(!same_session||focus_changed){++s.route;s.queue.clear();}
     if(!same_session)s.local_mouse_us=0;
@@ -400,7 +400,7 @@ void InputCapture::cursor_input_applied(uint64_t session,uint64_t capture_us){
     if(session&&session==impl_->cursor_host_session)impl_->host_applied_us=std::max(impl_->host_applied_us,capture_us);
 }
 bool InputCapture::cursor_position_allowed(uint64_t session,uint64_t capture_us)const{
-    std::lock_guard lock(impl_->mutex);return !impl_->stopping&&impl_->state->remote&&!impl_->state->local_shell&&impl_->blocked_route!=impl_->route&&
+    std::lock_guard lock(impl_->mutex);return !impl_->stopping&&impl_->state->remote&&impl_->state->viewer_focused&&!impl_->state->local_shell&&impl_->blocked_route!=impl_->route&&
         session&&session==impl_->state->session&&capture_us>=impl_->local_mouse_us;
 }
 InputCaptureDiagnostics InputCapture::diagnostics()const{
@@ -426,7 +426,7 @@ RelayPlan InputCapture::route_remote(uint64_t host_session,const InputEvent& eve
         s.relay_point=point;s.relay_point_valid=true;
     }
     if(event.kind==InputKind::Absolute||event.kind==InputKind::Relative){s.remote_pointer_seen=true;s.remote_pointer_revision=s.pointer.revision;}
-    bool candidate=bool(target)&&state.remote&&!state.local_shell&&!state.settings_visible&&(isolated_test||GetForegroundWindow()==state.viewer);
+    bool candidate=bool(target)&&state.remote&&!state.local_shell&&!state.settings_visible&&(isolated_test||(state.viewer_focused&&GetForegroundWindow()==state.viewer));
     InputEvent mapped=event;
     if(event.kind!=InputKind::Key&&event.kind!=InputKind::ReleaseAll){
         const bool dragging=s.relay_router.remote_drag(target);
@@ -540,7 +540,7 @@ bool InputCapture::worker_self_test(std::string& result){
         }
         {
             Probe probe;probe.capture.update(route);start(probe);emit(probe,{InputKind::Key,0x1e,0});require(probe.wait(1),"Focus test initial input failed");
-            auto inactive=route;inactive.remote=false;probe.capture.update(inactive);require(probe.wait(2),"Focus loss did not release remote input without another event");
+            auto inactive=route;inactive.viewer_focused=false;probe.capture.update(inactive);require(probe.wait(2),"Focus loss did not release remote input without another event");
             {std::lock_guard lock(probe.mutex);require(probe.received[1].event.kind==InputKind::ReleaseAll&&probe.received[1].peer==route.peer&&probe.received[1].session==route.session,"Focus release targeted the wrong session");}
             probe.capture.update(route);require(probe.wait(3),"Focus regain lost the release barrier");
             {std::lock_guard lock(probe.mutex);require(probe.received[2].event.kind==InputKind::ReleaseAll,"Focus regain replayed held input");}

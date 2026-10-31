@@ -8,7 +8,7 @@ void Shell::cursor_sync_self_test(){
     s.local(false);s.hide_panel();s.end_peek(false);s.taskbar_focus_guard=false;
     s.remote=true;s.relative_mode=false;s.windowed=false;s.active_id="cursor-fixture";
     s.pending_id=s.active_id;s.input_session=41;s.remote_width=1920;s.remote_height=1080;s.last_local_motion=0;
-    const auto publish=[&]{auto route=s.input_state();route.remote=!s.taskbar_focus_guard;s.input_capture.update(route);};
+    const auto publish=[&]{auto route=s.input_state();route.remote=!s.taskbar_focus_guard;route.viewer_focused=true;s.input_capture.update(route);};
     s.cursor_position_gate.reset(41);publish();unsigned injections=0;INPUT last{};
     POINT fixture_point{100,100};bool fixture_focus=true;
     s.cursor_context_test=[&](POINT& point,bool& focused){point=fixture_point;focused=fixture_focus;};

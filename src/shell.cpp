@@ -316,7 +316,8 @@ struct Shell::Impl {
         state.returning=nested_return.busy();
         if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
         state.local_shell=nested_return.busy()||taskbar_peek.active()||taskbar_focus_guard||!peek_id.empty()||!fading_peeks.empty();
-        state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer);
+        state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&!sizing_viewer&&!IsIconic(viewer);
+        state.viewer_focused=GetForegroundWindow()==viewer;
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel=panel;state.panel_visible=panel&&(GetWindowLongPtrW(panel,GWL_STYLE)&WS_VISIBLE);state.panel_summoned=panel_summoned;
         state.settings_visible=settings&&IsWindowVisible(settings);

@@ -15,7 +15,9 @@ struct InputCaptureState {
     std::string peer;
     bool remote=false,relative=false,settings_visible=false,panel_visible=false,panel_summoned=false,recording_hotkey=false;
     bool windowed=false,panel_dragging=false,local_shell=false;HWND viewer{},panel{};
-    bool returning=false;
+    // Keep session availability separate from focus. Isolated relay fixtures
+    // supply focus explicitly; physical capture always requires both.
+    bool returning=false,viewer_focused=true;
     RECT panel_rect{},settings_rect{},viewer_rect{};
     bool hud_draggable=false;RECT hud_rect{};
     uint32_t screen_width=1,screen_height=1,remote_width=0,remote_height=0;
