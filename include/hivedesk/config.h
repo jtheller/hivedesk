@@ -11,6 +11,7 @@ struct AppConfig {
     StreamSettings stream;
     DesktopPreferences desktop;
     std::vector<std::string> device_order;
+    std::vector<std::string> stats_devices;
     uint16_t port = 47980;
     bool first_run = true;
 };

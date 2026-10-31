@@ -29,11 +29,12 @@ int main(){try{
     require(stale.cells[1].text==L"-- / 100 fps"&&stale.cells[2].text==L"NVENC --ms"&&stale.cells[4].text==L"-- Mbps"&&stale.cells[2].tone==HudTone::Muted,"stale readings masquerade as live");
     const std::wstring unicode=L"Jateruy-VI & 工作室・東京・München";
     const auto connecting=connecting_hud(false,unicode);require(connecting.cells[1].text==unicode,"connection name altered");
+    const auto retry=connecting_hud(true,unicode),error=unavailable_hud(L"Remote stats unavailable · Try again");
     auto unicode_hud=normal;unicode_hud.cells[0].text=unicode;
     CompactHudSurface surface;
     for(int dpi:{96,120,144,192}){
         const int height=MulDiv(28,dpi,96);
-        for(const auto& model:{normal,intel,warning,stale,alone,connecting,unicode_hud}){
+        for(const auto& model:{normal,intel,warning,stale,alone,connecting,retry,error,unicode_hud}){
             const auto layout=layout_hud(model,dpi);const int width=layout.width;
             require(surface.render(model,width,height,dpi),"HUD render/DPI");const auto* pixels=surface.pixels();
             require(pixels[0]==0,"rounded corner opaque");bool text=false;
@@ -42,7 +43,7 @@ int main(){try{
             if(model.divider){const int gap=MulDiv(20,dpi,96),icon_gap=MulDiv(16,dpi,96)+MulDiv(6,dpi,96);
                 for(size_t i=1;i<layout.cells.size();++i)require(layout.cells[i].x-icon_gap-(layout.cells[i-1].x+layout.cells[i-1].width)==gap,"group gaps differ");}
         }
-        for(int value=int(HudIcon::Frames);value<=int(HudIcon::Warning);++value){const auto icon=hud_icon(HudIcon(value),dpi);require(std::any_of(icon->alpha.begin(),icon->alpha.end(),[](auto a){return a>0;}),"empty icon");}
+        for(int value=int(HudIcon::Frames);value<=int(HudIcon::Unavailable);++value){const auto icon=hud_icon(HudIcon(value),dpi);require(std::any_of(icon->alpha.begin(),icon->alpha.end(),[](auto a){return a>0;}),"empty icon");}
         auto limited=layout_hud(unicode_hud,dpi,MulDiv(300,dpi,96));
         require(limited.width<=MulDiv(300,dpi,96)&&limited.cells[0].text==unicode,"narrow layout mutated original name");
         require(surface.render(unicode_hud,limited.width,height,dpi),"narrow viewer clipping");

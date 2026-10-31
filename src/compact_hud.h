@@ -52,8 +52,12 @@ inline CompactHud compact_hud(const DebugOverlayState& s,bool stats,bool warning
 }
 inline CompactHud connecting_hud(bool retry,const std::wstring& name){
     CompactHud hud;hud.automatic=true;hud.tone=HudTone::Blue;
-    hud.cells={{0,0,retry?L"Reconnecting":L"Connecting",HudTone::Blue,HudIcon::Link},
-        {0,0,name,HudTone::Normal},{0,0,L"Ctrl+Alt+`",HudTone::Muted}};return hud;
+    hud.cells={{0,0,retry?L"Reconnecting":L"Connecting",HudTone::Blue,retry?HudIcon::Retry:HudIcon::Link},
+    {0,0,name,HudTone::Normal},{0,0,L"Ctrl+Alt+`",HudTone::Muted}};return hud;
+}
+inline CompactHud unavailable_hud(const std::wstring& message){
+    CompactHud hud;hud.automatic=true;hud.tone=HudTone::Red;
+    hud.cells={{0,0,message,HudTone::Red,HudIcon::Unavailable}};return hud;
 }
 // Layout uses the same cached Unicode masks as painting. Gaps belong to groups;
 // the separator occupies their midpoint rather than adding another pair of gaps.
@@ -118,7 +122,7 @@ public:
             const double dx=std::abs(x+.5-half_width)-(half_width-radius),dy=std::abs(y+.5-half_height)-(half_height-radius);
             const double distance=std::hypot(std::max(dx,0.0),std::max(dy,0.0))+std::min(std::max(dx,dy),0.0)-radius;
             const double coverage=std::clamp(.5-distance,0.0,1.0);
-            uint32_t pixel=over(0,RGB(21,27,36),uint32_t(150*coverage));
+            uint32_t pixel=over(0,RGB(21,27,36),uint32_t(171*coverage));
             if(distance> -1.0)pixel=over(pixel,RGB(184,203,229),uint32_t(35*coverage));
 
             pixels_[size_t(y)*width+x]=pixel;

@@ -167,6 +167,7 @@ struct Shell::Impl {
     std::mutex source_mutex;std::optional<PendingSource> pending_source;
     InputDiagnostics input_diagnostics{};
     CompactHudSurface compact_surface,waiting_hud;bool compact_stats=false,hud_warning=false;uint64_t hud_shown_at=0,hud_notice_until=0;std::wstring hud_notice;
+    std::map<std::string,POINT> hud_offsets;uint64_t hud_drag_revision=0;bool hud_local_pointer=false;
     DebugSurface debug_surface;HFONT debug_font{};std::array<DiagnosticPulse,6> debug_pulses{};
     HFONT font{},title_font{},small_font{}; HBRUSH background_brush{},edit_brush{};
     DWORD ui_thread{}; UINT taskbar_created{}; int dpi=96;
@@ -318,6 +319,8 @@ struct Shell::Impl {
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel=panel;state.panel_visible=panel&&(GetWindowLongPtrW(panel,GWL_STYLE)&WS_VISIBLE);state.panel_summoned=panel_summoned;
         state.settings_visible=settings&&IsWindowVisible(settings);
+        state.hud_draggable=stats_draggable()&&!state.panel_visible&&!state.settings_visible&&health_badge&&IsWindowVisible(health_badge)&&GetForegroundWindow()==viewer;
+        if(state.hud_draggable)GetWindowRect(health_badge,&state.hud_rect);
         if(state.panel_visible)GetWindowRect(panel,&state.panel_rect);if(state.settings_visible)GetWindowRect(settings,&state.settings_rect);
         state.screen_width=uint32_t(std::max(1,GetSystemMetrics(SM_CXSCREEN)));state.screen_height=uint32_t(std::max(1,GetSystemMetrics(SM_CYSCREEN)));
         state.remote_width=remote_width;state.remote_height=remote_height;
@@ -450,7 +453,7 @@ struct Shell::Impl {
         SetTimer(owner,5,ConnectionHintDelayMs,nullptr);
         if(active_id!=id)previous_id=active_id;
         if(!IsWindowVisible(viewer)&&!prior_focus)prior_focus=GetForegroundWindow();
-        active_id=id;remote=true;reconnecting=true;input_session=0;publish_input();
+        active_id=id;bind_stats(id);remote=true;reconnecting=true;input_session=0;publish_input();
         reset_remote_cursor();
         if(adopting){hide_waiting();SetWindowPos(viewer,windowed?HWND_NOTOPMOST:HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);SetForegroundWindow(viewer);return;}
         try{
@@ -487,11 +490,11 @@ struct Shell::Impl {
         POINT point{};GetCursorPos(&point);
         const auto r=viewer_client();
         if(remote&&WindowFromPoint(point)==viewer&&PtInRect(&r,point))
-            SetCursor(selected_remote_cursor());
+            SetCursor(hud_local_pointer?LoadCursorW(nullptr,IDC_ARROW):selected_remote_cursor());
     }
     void apply_remote_position() {
         sample_physical_pointer();
-        if(!remote||relative_mode||!remote_cursor_received||!remote_width||!remote_height)return;
+        if(!remote||relative_mode||hud_local_pointer||!remote_cursor_received||!remote_width||!remote_height)return;
         const auto decision=cursor_position_gate.observe(remote_pointer,input_capture.cursor_position_allowed(input_session,remote_pointer.input_capture_us));
         if(decision!=CursorPositionGate::Result::Revision&&cursor_trace_count<8){
             ++cursor_trace_count;log("Cursor position: session="+std::to_string(input_session)+" revision="+std::to_string(remote_pointer.position_revision)+
@@ -542,19 +545,19 @@ struct Shell::Impl {
     }
     bool return_parent_valid()const{return !return_authorized||return_authorized();}
     bool hud_notice_visible()const{return GetTickCount64()<hud_notice_until;}
-    bool detailed_hud()const{return config.desktop.debug_overlay&&!hud_notice_visible();}
+    bool detailed_hud()const{return config.desktop.debug_overlay;}
+    bool stats_draggable()const{return remote&&!reconnecting&&!waiting_visible&&!config.desktop.debug_overlay&&!hud_notice_visible()&&compact_stats;}
+    void bind_stats(const std::string& peer){
+        compact_stats=std::find(config.stats_devices.begin(),config.stats_devices.end(),peer)!=config.stats_devices.end();
+        SetPropW(owner,L"HiveDesk.CompactStats",reinterpret_cast<HANDLE>(ULONG_PTR(compact_stats)));
+    }
     void stats_unavailable(const wchar_t* message){hud_notice=message;hud_notice_until=GetTickCount64()+3500;}
     void toggle_stats() {
-        // A shortcut selects the compact HUD, even if detailed debugging was on.
-        // Save through the same preference path so a restart does not restore
-        // the giant panel on top of the user's chosen compact presentation.
-        if(config.desktop.debug_overlay){
-            auto desktop=config.desktop;desktop.debug_overlay=false;
-            if(callbacks.save_preferences&&!callbacks.save_preferences(config.device_name,desktop)){
-                status=L"Could not switch from detailed debug to compact stats.";return;
-            }
-            config.desktop=desktop;
-        }
+        if(config.desktop.debug_overlay||active_id.empty())return;
+        auto next=config.stats_devices;std::erase(next,active_id);
+        if(!compact_stats){if(next.size()>=256){status=L"Too many saved stats preferences.";return;}next.push_back(active_id);}
+        if(callbacks.save_stats&&!callbacks.save_stats(next)){status=L"Could not save stats preference.";return;}
+        config.stats_devices=std::move(next);
         hud_notice_until=0;compact_stats=!compact_stats;
         SetPropW(owner,L"HiveDesk.CompactStats",reinterpret_cast<HANDLE>(ULONG_PTR(compact_stats)));
         if(health_badge)InvalidateRect(health_badge,nullptr,FALSE);
@@ -659,7 +662,7 @@ struct Shell::Impl {
         if(active_id!=id)previous_id=active_id;
         if(!remote&&!IsWindowVisible(viewer))prior_focus=GetForegroundWindow();
         if(!remote||active_id!=id||input_session!=session){remote_cursor_composition.reset(session);cursor_position_gate.reset(session);cursor_trace_count=0;}
-        active_id=id;input_session=session;remote=true;SetWindowTextW(viewer,(L"HiveDesk - "+label).c_str());
+        active_id=id;bind_stats(id);input_session=session;remote=true;SetWindowTextW(viewer,(L"HiveDesk - "+label).c_str());
         if(waiting_visible&&!waiting_fading){
             waiting_fading=true;
             try{SetTimer(owner,4,waiting_composition.hide(),nullptr);}catch(const std::exception&){hide_waiting();}
@@ -669,7 +672,7 @@ struct Shell::Impl {
         publish_input();
     }
     void confine_mouse() {
-        if(!remote||nested_return.busy()||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
+        if(!remote||hud_local_pointer||nested_return.busy()||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
         RECT r=viewer_client();
         if(relative_mode){int x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;r={x,y,x+1,y+1};SetCursorPos(x,y);}
         ClipCursor(&r);
@@ -776,11 +779,11 @@ struct Shell::Impl {
         return {remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time};
     }
     CompactHud compact_model()const {
-        return reconnecting?connecting_hud(waiting_retry,pending_name):hud_notice_visible()?CompactHud{352,HudTone::Red,{{22,320,hud_notice,HudTone::Red}}}:compact_hud(compact_state(),compact_stats,hud_warning,pending_name);
+        return reconnecting?connecting_hud(waiting_retry,pending_name):hud_notice_visible()?unavailable_hud(hud_notice):compact_hud(compact_state(),compact_stats,hud_warning,pending_name);
     }
     void paint_health() {
         RECT rect{};GetClientRect(health_badge,&rect);
-        if(!reconnecting&&detailed_hud()){
+        if(detailed_hud()){
             compact_surface.invalidate_present();
             if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,debug_rows()))debug_surface.present(health_badge);
         }else {
@@ -798,13 +801,22 @@ struct Shell::Impl {
         sample_cursor();
         if(GetTickCount64()-last_stream_tick>=100){last_stream_tick=GetTickCount64();if(callbacks.stream_tick)callbacks.stream_tick();}
         const bool warning=slow_indicator.update(GetTickCount64(),stream_health);hud_warning=warning;
+        const auto drag=input_capture.hud_drag();
+        const bool local_pointer=stats_draggable()&&!panel_mode&&!(settings&&IsWindowVisible(settings))&&GetForegroundWindow()==viewer&&(drag.alt||drag.active);
+        if(hud_local_pointer!=local_pointer){hud_local_pointer=local_pointer;confine_mouse();apply_remote_cursor();}
+        if(drag.revision!=hud_drag_revision){hud_drag_revision=drag.revision;
+            if(stats_draggable()&&drag.generation==generation.load()){
+                const auto client=viewer_client();hud_offsets[active_id]={MulDiv(drag.bounds.left+drag.point.x-drag.origin.x-client.left,96,dpi),MulDiv(drag.bounds.top+drag.point.y-drag.origin.y-client.top,96,dpi)};
+            }
+        }
         if(health_badge) {
-            if(remote&&!waiting_visible&&(reconnecting?connection_hint_visible:(warning||compact_stats||config.desktop.debug_overlay||hud_notice_visible()))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
+            if(remote&&!waiting_visible&&(config.desktop.debug_overlay||(reconnecting?connection_hint_visible:(warning||compact_stats||hud_notice_visible())))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&(config.desktop.debug_overlay||compact_stats)&&callbacks.debug_tick)callbacks.debug_tick();
                 const auto client=viewer_client();
                 const int available=std::max(px(80),int(client.right-client.left)-px(32));
-                const int width=!reconnecting&&detailed_hud()?std::min(px(460),available):layout_hud(compact_model(),dpi,available).width,height=std::min(px(!reconnecting&&detailed_hud()?474:28),std::max(px(28),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
-                const int left=client.left+px(16),top=client.top+px(16);
+                const int width=detailed_hud()?std::min(px(460),available):layout_hud(compact_model(),dpi,available).width,height=std::min(px(detailed_hud()?474:28),std::max(px(28),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
+                POINT offset{16,16};if(stats_draggable()){const auto at=hud_offsets.find(active_id);if(at!=hud_offsets.end())offset=at->second;}
+                const int left=client.left+std::clamp(px(offset.x),0,std::max(0,int(client.right-client.left)-width)),top=client.top+std::clamp(px(offset.y),0,std::max(0,int(client.bottom-client.top)-height));
                 if(!IsWindowVisible(health_badge))hud_shown_at=GetTickCount64();
                 if(!IsWindowVisible(health_badge)||bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOP,left,top,width,height,SWP_NOACTIVATE);paint_health();ShowWindow(health_badge,SW_SHOWNOACTIVATE);}
                 InvalidateRect(health_badge,nullptr,FALSE);
@@ -971,7 +983,6 @@ struct Shell::Impl {
         if(hotkey_changed&&!RegisterHotKey(owner,next_id,desktop.hotkey_modifiers|MOD_NOREPEAT,desktop.hotkey_key))return false;
         if(callbacks.save_preferences&&!callbacks.save_preferences(name,desktop)){if(hotkey_changed)UnregisterHotKey(owner,next_id);return false;}
         if(hotkey_changed){UnregisterHotKey(owner,hotkey_id);hotkey_id=next_id;hotkey_registered=true;}
-        if(desktop.debug_overlay)compact_stats=false;
         config.device_name=name;config.desktop=desktop;set_relative(desktop.relative_mouse);publish_input();tray();if(health_badge){ShowWindow(health_badge,SW_HIDE);InvalidateRect(health_badge,nullptr,FALSE);}InvalidateRect(panel,nullptr,FALSE);return true;
     }
     void settings_ui() {

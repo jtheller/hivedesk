@@ -21,6 +21,7 @@ struct ShellConfig {
     StreamSettings stream;
     DesktopPreferences desktop;
     std::vector<std::string> device_order;
+    std::vector<std::string> stats_devices;
 };
 struct ShellCallbacks {
     std::function<void(const std::string&)> select_peer;
@@ -46,6 +47,7 @@ struct ShellCallbacks {
     std::function<bool()> restart_video;
     std::function<bool()> restart;
     std::function<bool(const std::vector<std::string>&)> save_order;
+    std::function<bool(const std::vector<std::string>&)> save_stats;
     std::function<bool(const std::string&,const ReturnRequest&)> return_request;
     std::function<bool(const std::string&,const ReturnReply&)> return_reply;
     std::function<void(const std::string&,uint64_t)> return_finished;

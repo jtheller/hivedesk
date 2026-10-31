@@ -25,6 +25,7 @@ struct InputCapture::Impl {
     uint64_t route=1,blocked_route=0;
     InputCaptureQueue<> queue;
     PhysicalPointer pointer;
+    HudDragSnapshot hud;
     RelayRouter relay_router;uint64_t relay_host=0,remote_pointer_revision=0;bool remote_pointer_seen=false;
     POINT relay_point{};bool relay_point_valid=false;
     uint64_t cursor_host_session=0,host_applied_us=0,local_mouse_us=0;
@@ -36,6 +37,7 @@ struct InputCapture::Impl {
     std::array<bool,6> buttons{};
     DWORD summon_key_up=0;
     uint64_t observed_route=0;
+    bool hud_tracking=false,hud_release=false;
     static thread_local Impl* hooks;
 
     struct Route {std::shared_ptr<const InputCaptureState> state;uint64_t id;bool enabled;};
@@ -46,6 +48,7 @@ struct InputCapture::Impl {
     void observe_route(uint64_t id) {
         if(observed_route==id)return;
         observed_route=id;fixed.clear_forwarded();buttons.fill(false);
+        hud_tracking=false;{std::lock_guard lock(mutex);hud.active=false;}
     }
     void post(CaptureAction action,uint64_t generation) {
         if(owner)PostMessageW(owner,action_message,WPARAM(action),LPARAM(generation));
@@ -104,6 +107,7 @@ struct InputCapture::Impl {
         const auto now=input_now_us();const auto route=s->snapshot();s->observe_route(route.id);
         const bool up=(k.flags&LLKHF_UP)!=0;
         const auto fixed=s->fixed.observe(k.vkCode,k.scanCode,(k.flags&LLKHF_EXTENDED)!=0,up,false);
+        {std::lock_guard lock(s->mutex);s->hud.alt=(s->fixed.modifiers()&MOD_ALT)!=0;}
         if(fixed.consume) {
             if(fixed.action==FixedHotkey::KickController) {
                 if(route.enabled)s->fixed.release_forwarded_modifiers([&](uint32_t scan,bool extended){s->emit(route,{InputKind::Key,int32_t(scan),1,extended?1:0},now);});
@@ -115,6 +119,7 @@ struct InputCapture::Impl {
             }
             return 1;
         }
+        if(s->hud_tracking)return 1;
         if(s->summon_key_up==k.vkCode){if(up)s->summon_key_up=0;return 1;}
         if(!up&&k.vkCode==VK_ESCAPE&&route.state->panel_visible){
             if(route.state->local_shell){
@@ -147,6 +152,20 @@ struct InputCapture::Impl {
             route.state->local_shell?GetAncestor(WindowFromPoint(m.pt),GA_ROOT):nullptr))s->post(CaptureAction::HidePanelAnimated,route.state->generation);
         if(msg==WM_MOUSEMOVE){std::lock_guard lock(s->mutex);++s->pointer.revision;s->pointer.point=m.pt;s->pointer.motion_tick=GetTickCount64();
             s->pointer.host_session=s->cursor_host_session;s->pointer.host_input_us=s->host_applied_us;}
+        // Own the entire Alt+drag gesture before remote button/motion routing.
+        // Only this latest-position mailbox reaches UI; no per-motion UI FIFO.
+        if(s->hud_tracking&&(!route.enabled||!route.state->hud_draggable)){s->hud_tracking=false;std::lock_guard lock(s->mutex);s->hud.active=false;}
+        if(s->hud_tracking){
+            {std::lock_guard lock(s->mutex);if(msg==WM_MOUSEMOVE||msg==WM_LBUTTONUP){s->hud.point=m.pt;++s->hud.revision;}if(msg==WM_LBUTTONUP)s->hud.active=false;}
+            if(msg==WM_LBUTTONUP){s->hud_tracking=false;s->hud_release=false;}
+            return msg==WM_MOUSEMOVE?CallNextHookEx(nullptr,code,msg,data):1;
+        }
+        if(s->hud_release&&msg==WM_LBUTTONUP){s->hud_release=false;return 1;}
+        if(route.enabled&&route.state->hud_draggable&&s->fixed.modifiers()==MOD_ALT&&msg==WM_LBUTTONDOWN&&PtInRect(&route.state->hud_rect,m.pt)){
+            s->hud_tracking=s->hud_release=true;s->emit(route,{InputKind::ReleaseAll},now);
+            {std::lock_guard lock(s->mutex);s->hud.generation=route.state->generation;s->hud.origin=s->hud.point=m.pt;s->hud.bounds=route.state->hud_rect;s->hud.active=true;++s->hud.revision;}
+            return 1;
+        }
         if(!route.enabled)return CallNextHookEx(nullptr,code,msg,data);
         const int released=msg==WM_LBUTTONUP?1:msg==WM_RBUTTONUP?2:msg==WM_MBUTTONUP?3:msg==WM_XBUTTONUP?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;
         if(own_surface(*route.state,m.pt)||(route.state->windowed&&(!PtInRect(&route.state->viewer_rect,m.pt)||GetAncestor(WindowFromPoint(m.pt),GA_ROOTOWNER)!=route.state->viewer))) {
@@ -181,7 +200,7 @@ struct InputCapture::Impl {
         if(message==WM_INPUT&&s){
             const auto route=s->snapshot();s->observe_route(route.id);
             RAWINPUT input{};UINT bytes=sizeof(input);
-            if(route.enabled&&route.state->relative&&!route.state->settings_visible&&!route.state->panel_visible&&!route.state->panel_dragging&&GetRawInputData(reinterpret_cast<HRAWINPUT>(l),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))!=UINT(-1)
+            if(route.enabled&&route.state->relative&&!s->hud_tracking&&!(route.state->hud_draggable&&(s->fixed.modifiers()&MOD_ALT))&&!route.state->settings_visible&&!route.state->panel_visible&&!route.state->panel_dragging&&GetRawInputData(reinterpret_cast<HRAWINPUT>(l),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))!=UINT(-1)
                 &&input.header.dwType==RIM_TYPEMOUSE&&input.header.hDevice&&!(input.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
                 const LONG dx=input.data.mouse.lLastX,dy=input.data.mouse.lLastY;
                 if(dx||dy)s->emit(route,{InputKind::Relative,dx,dy},input_now_us());
@@ -288,6 +307,20 @@ bool InputCapture::routing_self_test(std::string& result){
         const auto press=s.queue.pop(),release=s.queue.pop();
         require(press&&release&&press->event.kind==InputKind::Button&&release->event.kind==InputKind::Button&&
             press->event.b==0&&release->event.b==1,"Remote mouse button edges changed");
+        state.hud_draggable=true;state.hud_rect={100,100,400,128};set();
+        key(VK_MENU,0x38);s.queue.clear();
+        require(mouse(WM_LBUTTONDOWN,{120,114})==1,"Alt HUD drag down not consumed");
+        require(s.queue.size()==1&&s.queue.pop()->event.kind==InputKind::ReleaseAll,"HUD drag did not release remote Alt without clicking");
+        mouse(WM_MOUSEMOVE,{420,314});mouse(WM_LBUTTONUP,{420,314});
+        const auto dragged=capture.hud_drag();
+        require(!dragged.active&&dragged.origin.x==120&&dragged.point.x==420&&dragged.bounds.left==100&&s.queue.size()==0,"HUD drag leaked remote motion/buttons or lost final position");
+        state.hud_draggable=false;set();
+        mouse(WM_LBUTTONDOWN,{120,114});mouse(WM_LBUTTONUP,{120,114});
+        require(s.queue.size()==2&&s.queue.pop()->event.kind==InputKind::Button&&s.queue.pop()->event.kind==InputKind::Button,"Fixed exception badge intercepted Alt click");
+        state.hud_draggable=true;set();mouse(WM_LBUTTONDOWN,{120,114});s.queue.clear();
+        ++state.generation;set();mouse(WM_LBUTTONUP,{420,314});
+        require(!capture.hud_drag().active&&s.queue.size()==0,"Canceled HUD gesture released into the next session");
+        state.hud_draggable=false;key(VK_MENU,0x38,true);set();
         key(VK_CONTROL,0x1d);key(VK_MENU,0x38);key(VK_SHIFT,0x2a);
         require(key('I',0x17)==1,"Deep stats chord forwarded");action(CaptureAction::ToggleRemoteStats);
         require(key('I',0x17)==1,"Stats repeat escaped");quiet();
@@ -337,6 +370,7 @@ void InputCapture::update(InputCaptureState state){
 }
 bool InputCapture::raw_mouse_available()const{std::lock_guard lock(impl_->mutex);return impl_->raw_available;}
 PhysicalPointer InputCapture::physical_pointer()const{std::lock_guard lock(impl_->mutex);return impl_->pointer;}
+HudDragSnapshot InputCapture::hud_drag()const{std::lock_guard lock(impl_->mutex);return impl_->hud;}
 void InputCapture::cursor_host(uint64_t session){
     std::lock_guard lock(impl_->mutex);impl_->cursor_host_session=session;impl_->host_applied_us=0;
     impl_->pointer.host_session=impl_->pointer.host_input_us=0;

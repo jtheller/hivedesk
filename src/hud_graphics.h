@@ -12,7 +12,7 @@
 #pragma comment(lib,"gdiplus.lib")
 
 namespace hive {
-enum class HudIcon { None, Frames, Bitrate, HardwareEncode, SoftwareEncode, HardwareDecode, SoftwareDecode, Unknown, Link, Warning };
+enum class HudIcon { None, Frames, Bitrate, HardwareEncode, SoftwareEncode, HardwareDecode, SoftwareDecode, Unknown, Link, Warning, Retry, Unavailable };
 struct HudMask {int width=0,height=0;std::vector<uint8_t> alpha;};
 
 // CPU-only shaped text. Font linking covers non-Latin names; the cache is
@@ -94,8 +94,12 @@ inline std::shared_ptr<const HudMask> hud_icon(HudIcon icon,int dpi){
         rounded(2,5,17,13,2,true);cut([&]{g.DrawEllipse(&pen,5.0f,8.5f,6.0f,6.0f);});line({{2,3},{2,20}});line({{6,18},{6,21}});line({{10,18},{10,21}});line({{20,12},{23,12}});line({{21,10},{23,12},{21,14}});break;
     case HudIcon::SoftwareDecode:
         line({{9,3},{10,1},{14,1},{15,3},{18,5},{20,5.3f},{22,8.3f},{21,10.3f},{21,13.3f},{22,15.3f},{20,18.3f},{18,18.6f},{15,20.6f},{14,22.6f},{10,22.6f},{9,20.6f},{6,18.6f},{4,18.3f},{2,15.3f},{3,13.3f},{3,10.3f},{2,8.3f},{4,5.3f},{6,5},{9,3}});line({{9,8},{15,12},{9,16},{9,8}});break;
-    case HudIcon::Warning:line({{12,2},{23,21},{1,21},{12,2}});line({{12,8},{12,13}});g.FillEllipse(&white,11.0f,16.0f,2.0f,2.0f);break;
-    case HudIcon::Link:rounded(2,7,11,8,4,false);rounded(11,9,11,8,4,false);line({{8,12},{16,12}});break;
+    case HudIcon::Warning:g.DrawArc(&pen,3.0f,3.0f,18.0f,18.0f,-34.0f,-326.0f);g.FillEllipse(&white,17.0f,2.0f,5.0f,5.0f);break;
+    case HudIcon::Link:rounded(2,7,12,8,4,false);rounded(10,9,12,8,4,false);line({{8,12},{16,12}});break;
+    case HudIcon::Retry:
+        g.DrawArc(&pen,2.860147f,2.580441f,18.0f,18.0f,-169.88616f,122.90242f);line({{18,5},{21,8}});line({{21,3},{21,8},{16,8}});
+        g.DrawArc(&pen,3.139853f,3.419559f,18.0f,18.0f,10.11384f,122.90242f);line({{6,19},{3,16}});line({{3,21},{3,16},{8,16}});break;
+    case HudIcon::Unavailable:g.DrawEllipse(&pen,3.0f,3.0f,18.0f,18.0f);line({{5.6f,18.4f},{18.4f,5.6f}});break;
     default:rounded(3,3,18,18,3,false);line({{8,12},{16,12}});break;
     }
     g.Flush(FlushIntentionSync);BitmapData data{};Rect area(0,0,side,side);

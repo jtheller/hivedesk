@@ -17,6 +17,7 @@ struct InputCaptureState {
     bool windowed=false,panel_dragging=false,local_shell=false;HWND viewer{},panel{};
     bool returning=false;
     RECT panel_rect{},settings_rect{},viewer_rect{};
+    bool hud_draggable=false;RECT hud_rect{};
     uint32_t screen_width=1,screen_height=1,remote_width=0,remote_height=0;
     uint32_t hotkey_key=0,hotkey_modifiers=0;
 };
@@ -29,6 +30,7 @@ inline bool dismiss_panel_on_mouse_down(const InputCaptureState& s,POINT p,HWND 
     return !PtInRect(&s.panel_rect,p);
 }
 struct PhysicalPointer { POINT point{};uint64_t revision=0,motion_tick=0,host_session=0,host_input_us=0; };
+struct HudDragSnapshot {uint64_t generation=0,revision=0;POINT origin{},point{};RECT bounds{};bool active=false,alt=false;};
 struct InputCaptureDiagnostics {
     uint64_t captured=0,dispatched=0,coalesced=0,overflows=0,expired=0;
     uint32_t queue_depth=0,queue_peak=0,dispatch_p95_us=0,dispatch_max_us=0;
@@ -43,6 +45,7 @@ public:
     void update(InputCaptureState);
     bool raw_mouse_available()const;
     PhysicalPointer physical_pointer()const;
+    HudDragSnapshot hud_drag()const;
     void cursor_host(uint64_t session);
     void cursor_input_applied(uint64_t session,uint64_t capture_us);
     bool cursor_position_allowed(uint64_t session,uint64_t capture_us)const;
