@@ -24,7 +24,32 @@ int main(){try{
     auto warning=compact_hud(state,true,true,L"Jateruy-VI");
     require(warning.cells[0].text==L"Jateruy-VI"&&warning.cells[4].tone==HudTone::Amber,"inline warning lost identity");
     const auto alone=compact_hud(state,false,true);require(alone.cells.size()==1&&alone.cells[0].icon==HudIcon::Warning,"stats-off warning disappeared");
+    // Reproduce static desktops at UI tick frequency: crossing the old 500 ms
+    // sample-age boundary must not blank/recolor cells or change any pixels.
+    auto idle=state;idle.health.pressure=0;idle.viewer.presented_frames=12;
+    idle.viewer.presented_millihz=idle.viewer.receive_kbps=0;
+    const auto idle_model=compact_hud(idle,true,false,L"Jateruy-VI");
+    require(idle_model.cells[1].text==L"0 / 100 fps"&&idle_model.cells[4].text==L"0 Mbps","idle rates are not current zero rates");
+    CompactHudSurface idle_surface;const auto idle_width=layout_hud(idle_model,96).width;
+    require(idle_surface.render(idle_model,idle_width,28,96),"idle baseline render");
+    const std::vector<uint32_t> idle_pixels(idle_surface.pixels(),idle_surface.pixels()+idle_width*28);
+    for(unsigned age=0;age<5000;age+=16){
+        idle.now=1000+age;idle.source_time=idle.now-age%100;idle.health_time=idle.now;
+        idle.source.encode_age_us=age*1000;idle.viewer.receive_sample_age_us=age*1000;
+        idle.viewer.service_sample_age_us=age<1000?age*1000:UINT32_MAX;
+        const auto model=compact_hud(idle,true,false,L"Jateruy-VI");
+        require(model==idle_model,"idle sample age flashed stat text or icons");
+        require(idle_surface.render(model,idle_width,28,96)&&std::equal(idle_pixels.begin(),idle_pixels.end(),idle_surface.pixels()),"idle HUD pixels flickered");
+    }
+    idle.source.encode_us=1200;idle.viewer.decode_us=900;idle.viewer.presented_millihz=60000;idle.viewer.receive_kbps=42000;
+    const auto resumed=compact_hud(idle,true,false);
+    require(resumed.cells[1].text==L"60 / 100 fps"&&resumed.cells[2].text==L"NVENC 1.2ms"&&resumed.cells[3].text==L"FFmpeg 0.9ms"&&resumed.cells[4].text==L"42 Mbps","live readings delayed after idle");
+    idle.now+=2000;
+    require(compact_hud(idle,true,false).cells[2].text==L"NVENC --ms","missing host telemetry kept an apparently live timing");
+    const auto empty=compact_hud(DebugOverlayState{},true,false);
+    require(empty.cells[2].text==L"Encoder --ms"&&empty.cells[3].text==L"NVDEC --ms","new session invented completed timings");
     state.now=4000;state.viewer.service_sample_age_us=state.viewer.receive_sample_age_us=600000;
+    state.viewer.session=0;
     auto stale=compact_hud(state,true,false);
     require(stale.cells[1].text==L"-- / 100 fps"&&stale.cells[2].text==L"NVENC --ms"&&stale.cells[4].text==L"-- Mbps"&&stale.cells[2].tone==HudTone::Muted,"stale readings masquerade as live");
     const std::wstring unicode=L"Jateruy-VI & 工作室・東京・München";
@@ -60,5 +85,5 @@ int main(){try{
     BITMAPFILEHEADER file{};BITMAPINFOHEADER info{};info.biSize=sizeof(info);info.biWidth=width;info.biHeight=-height;info.biPlanes=1;info.biBitCount=32;
     file.bfType=0x4d42;file.bfOffBits=sizeof(file)+sizeof(info);file.bfSize=file.bfOffBits+DWORD(preview.size()*4);
     std::ofstream out("compact-hud-native.bmp",std::ios::binary);out.write(reinterpret_cast<const char*>(&file),sizeof(file));out.write(reinterpret_cast<const char*>(&info),sizeof(info));out.write(reinterpret_cast<const char*>(preview.data()),std::streamsize(preview.size()*4));require(bool(out),"preview artifact");
-    std::printf("PASS compact HUD: Unicode/case, backend identity, current/target FPS, uniform gaps, stable numeric width, warnings, freshness, alpha, 96-192 DPI, narrow viewport; 100 draws %.1f ms\n",elapsed);return 0;
+    std::printf("PASS compact HUD: Unicode/case, backend identity, current/target FPS, uniform gaps, stable numeric width, idle pixel stability and immediate resume, warnings, telemetry loss, alpha, 96-192 DPI, narrow viewport; 100 draws %.1f ms\n",elapsed);return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL compact HUD: %s\n",e.what());return 1;}}

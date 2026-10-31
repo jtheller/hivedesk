@@ -32,10 +32,14 @@ inline CompactHud compact_hud(const DebugOverlayState& s,bool stats,bool warning
     CompactHud hud;hud.automatic=true;hud.tone=warning?HudTone::Amber:HudTone::Normal;
     if(!stats){hud.cells={{0,0,label,HudTone::Amber,HudIcon::Warning}};return hud;}
     hud.divider=true;
-    const bool source=s.source_time&&s.now-s.source_time<500;
-    const bool encode=source&&s.source.encode_age_us!=UINT32_MAX&&uint64_t(s.source.encode_age_us)+(s.now-s.source_time)*1000<500000;
-    const bool view=s.viewer.session&&s.viewer.service_sample_age_us<500000;
-    const bool receive=s.viewer.session&&s.viewer.receive_sample_age_us<500000;
+    // Frame age is not telemetry age: an unchanged desktop has no work to
+    // encode/decode. Keep the latest completed timings while host reports are
+    // alive, and show the viewer's current rolling rates (including zero).
+    // The detailed debug overlay still exposes individual sample freshness.
+    const bool source=s.source_time&&s.now-s.source_time<2000;
+    const bool encode=source&&(s.source.encode_age_us!=UINT32_MAX||s.source.encode_us!=0);
+    const bool view=s.viewer.session!=0;
+    const bool decode=view&&(s.viewer.presented_frames||s.viewer.service_sample_age_us!=UINT32_MAX);
     const auto budget=diagnostic_budget(s.health.target_millihz);
     const auto number=[](double value,int precision){std::wostringstream out;out<<std::fixed<<std::setprecision(precision)<<value;return out.str();};
     const auto ms=[&](const wchar_t* label,uint32_t us,bool fresh){return std::wstring(label)+L" "+(fresh?number(us/1000.0,1):L"--")+L"ms";};
@@ -46,8 +50,8 @@ inline CompactHud compact_hud(const DebugOverlayState& s,bool stats,bool warning
     hud.cells={{0,0,name.empty()?L"Remote computer":name,HudTone::Normal},
         {0,0,(view?number(s.viewer.presented_millihz/1000.0,0):L"--")+L" / "+target+L" fps",view?(warning?HudTone::Amber:HudTone::Normal):HudTone::Muted,HudIcon::Frames,target+L" / "+target+L" fps"},
         {0,0,ms(hud_encoder(backend),s.source.encode_us,encode),hud_tone(diagnostic_threshold(s.source.encode_us,budget*3/4,budget,encode)),encode_icon,std::wstring(hud_encoder(backend))+L" 88.8ms"},
-        {0,0,ms(decode_name,s.viewer.decode_us,view),hud_tone(diagnostic_threshold(s.viewer.decode_us,budget*3/4,budget,view)),s.viewer.software_decode?HudIcon::SoftwareDecode:HudIcon::HardwareDecode,std::wstring(decode_name)+L" 88.8ms"},
-        {0,0,(receive?number(s.viewer.receive_kbps/1000.0,0):L"--")+L" Mbps",receive?(warning&&(pressure&PressureNetwork)?HudTone::Amber:HudTone::Normal):HudTone::Muted,HudIcon::Bitrate,L"888 Mbps"}};
+        {0,0,ms(decode_name,s.viewer.decode_us,decode),hud_tone(diagnostic_threshold(s.viewer.decode_us,budget*3/4,budget,decode)),s.viewer.software_decode?HudIcon::SoftwareDecode:HudIcon::HardwareDecode,std::wstring(decode_name)+L" 88.8ms"},
+        {0,0,(view?number(s.viewer.receive_kbps/1000.0,0):L"--")+L" Mbps",view?(warning&&(pressure&PressureNetwork)?HudTone::Amber:HudTone::Normal):HudTone::Muted,HudIcon::Bitrate,L"888 Mbps"}};
     return hud;
 }
 inline CompactHud connecting_hud(bool retry,const std::wstring& name){
