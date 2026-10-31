@@ -55,6 +55,7 @@ constexpr uint32_t FeatureMediaProbe = 67108864;
 constexpr uint32_t FeatureHostProbe = 134217728;
 constexpr uint32_t FeatureWake = 268435456; // Authenticated MAC announcement and read-only power report.
 constexpr uint32_t FeatureCompactStats = 536870912; // Session-scoped deepest-viewer HUD toggle.
+constexpr uint32_t FeatureCodecIdentity = 1073741824; // Optional diagnostics v2; never changes stream setup.
 constexpr size_t MaxMediaProbeReport = 48 * 1024;
 struct MediaProbeReport { uint64_t request=0; uint32_t result=0; std::string text; };
 constexpr uint32_t SnapshotWidth = 672, SnapshotHeight = 378;
@@ -111,6 +112,7 @@ struct StreamHealth {
     uint64_t session=0;
     uint32_t target_millihz=0,rate_millihz=0,pressure=0;
 };
+enum class EncoderBackend : uint32_t { Unknown=0, Nvenc=1, Intel=2, Amd=3, Software=4 };
 struct SourceDiagnostics {
     uint64_t session=0;
     uint32_t encoded_millihz=0,encode_us=0,capture_wait_us=0;
@@ -124,9 +126,10 @@ struct SourceDiagnostics {
     bool receiver_recover=false;
     uint64_t feedback_sequence=0,source_discarded=0;
     uint64_t sequence_gaps=0,age_expired=0,queue_overflows=0;
+    EncoderBackend backend=EncoderBackend::Unknown;
 };
 inline bool valid_diagnostics(const SourceDiagnostics& d){
-    return d.session&&d.encoded_millihz<=4000000&&d.encode_us<=10000000&&d.capture_wait_us<=10000000&&d.send_wait_us_per_second<=1000000&&d.color_us<=10000000&&d.nvenc_us<=10000000&&
+    return uint32_t(d.backend)<=4&&d.session&&d.encoded_millihz<=4000000&&d.encode_us<=10000000&&d.capture_wait_us<=10000000&&d.send_wait_us_per_second<=1000000&&d.color_us<=10000000&&d.nvenc_us<=10000000&&
         (!d.rate_details||((d.average_qp<=51||d.average_qp==UINT32_MAX)&&d.receiver_service_us<=1000000&&d.rate_reason<=7));
 }
 inline bool valid_feedback(const StreamFeedback& f){

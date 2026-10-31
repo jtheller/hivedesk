@@ -22,20 +22,23 @@ bool read_feedback(StreamFeedback& f,R32 word,R64 wide) {
     if(f.transport_details){f.transport_bytes=wide();f.transport_sample_us=wide();}return true;
 }
 template<class W32,class W64>
-void write_diagnostics(const SourceDiagnostics& d,W32 word,W64 wide) {
-    word(1);word((d.automatic_cbr?1:0)|(d.quality_limited?2:0)|(d.receiver_recover?4:0)|(d.encode_details?8:0));
+void write_diagnostics(const SourceDiagnostics& d,W32 word,W64 wide,bool codec_identity=false) {
+    word(codec_identity?2:1);word((d.automatic_cbr?1:0)|(d.quality_limited?2:0)|(d.receiver_recover?4:0)|(d.encode_details?8:0));
     word(d.target_bitrate_bps);word(d.actual_bitrate_bps);word(d.average_qp);word(d.rate_reason);
     word(d.receiver_service_us);word(d.receiver_queue_us);
     wide(d.feedback_sequence);wide(d.source_discarded);
     wide(d.sequence_gaps);wide(d.age_expired);wide(d.queue_overflows);
+    if(codec_identity)word(uint32_t(d.backend));
 }
 template<class R32,class R64>
-bool read_diagnostics(SourceDiagnostics& d,R32 word,R64 wide) {
-    if(word()!=1)return false;const auto flags=word();if(flags>15)return false;
+bool read_diagnostics(SourceDiagnostics& d,R32 word,R64 wide,bool codec_identity=true) {
+    const auto version=word();if(version!=1&&(version!=2||!codec_identity))return false;const auto flags=word();if(flags>15)return false;
+    d.backend=EncoderBackend::Unknown;
     d.rate_details=true;d.automatic_cbr=(flags&1)!=0;d.quality_limited=(flags&2)!=0;d.receiver_recover=(flags&4)!=0;d.encode_details=(flags&8)!=0;
     d.target_bitrate_bps=word();d.actual_bitrate_bps=word();d.average_qp=word();d.rate_reason=word();
     d.receiver_service_us=word();d.receiver_queue_us=word();
     d.feedback_sequence=wide();d.source_discarded=wide();
-    d.sequence_gaps=wide();d.age_expired=wide();d.queue_overflows=wide();return true;
+    d.sequence_gaps=wide();d.age_expired=wide();d.queue_overflows=wide();
+    if(version==2){const auto backend=word();if(backend>4)return false;d.backend=EncoderBackend(backend);}return true;
 }
 }

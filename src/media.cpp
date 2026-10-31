@@ -550,6 +550,7 @@ public:
         else nvidia_=std::make_unique<Encoder>(width,height,settings,adapter);
     }
     bool ready()const{return intel_?intel_->ready():nvidia_->ready();}
+    EncoderBackend backend()const{return intel_?EncoderBackend::Intel:EncoderBackend::Nvenc;}
     uint32_t in_flight()const{return intel_?intel_->in_flight():nvidia_->in_flight();}
     bool automatic_rate()const{return intel_?intel_->automatic_rate():nvidia_->automatic_rate();}
     bool dynamic_rate()const{return intel_?intel_->dynamic_rate():nvidia_->dynamic_rate();}

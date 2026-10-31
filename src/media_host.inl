@@ -159,7 +159,7 @@ bool MediaHost::start(const StreamSettings& settings,std::function<void(EncodedF
                         pacer.observe(now,capacity,service,fresh?report.queue_us:0,blocked&&!bitrate_feedback,fresh&&report.recover,sampled_at,reported_at);
                         if(health&&now-last_health>=250000){health({settings.session,pacer.target(),pacer.rate(),pacer.pressure()});last_health=now;}
                         if(diagnostics&&now-diagnostic_since>=16000){
-                            SourceDiagnostics d;d.session=settings.session;
+                            SourceDiagnostics d;d.session=settings.session;d.backend=encoder.backend();
                             {
                                 std::lock_guard lock(impl_->wait_mutex);
                                 const auto window=diagnostic_window.sample(now,{encoded_frames,encoded_bytes,send_wait,window_qp_sum,window_qp_samples});

@@ -54,7 +54,7 @@ AppConfig load_config() {
     if(config.device_id.empty())config.device_id=narrow(bootstrap::load().id);
     if (config.device_id.empty()) { BYTE random[16]{}; if(BCryptGenRandom(nullptr,random,sizeof(random),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)throw std::runtime_error("Random generator failed"); config.device_id=hex(random,sizeof(random)); }
     config.name=read_ini(path,L"Name");
-    if(config.name.empty()) { wchar_t name[MAX_COMPUTERNAME_LENGTH+1]{}; DWORD size=MAX_COMPUTERNAME_LENGTH+1; GetComputerNameW(name,&size); config.name=name; }
+    if(config.name.empty())config.name=default_device_name();
     config.desktop.startup=GetPrivateProfileIntW(L"HiveDesk",L"Startup",1,path.c_str())!=0;
     config.desktop.tray_icon=GetPrivateProfileIntW(L"HiveDesk",L"TrayIcon",1,path.c_str())!=0;
     config.desktop.debug_overlay=GetPrivateProfileIntW(L"HiveDesk",L"DebugOverlay",0,path.c_str())!=0;
@@ -71,8 +71,33 @@ AppConfig load_config() {
     save_config(config);
     return config;
 }
+// The W profile API still writes ANSI unless the file already has a UTF-16
+// BOM. Convert old profiles atomically, preserving unknown sections/keys.
+static void ensure_unicode_profile(const std::filesystem::path& path){
+    WritePrivateProfileStringW(nullptr,nullptr,nullptr,path.c_str());
+    std::string bytes;
+    if(std::filesystem::exists(path)){
+        if(std::filesystem::file_size(path)>1024*1024)throw std::runtime_error("Settings file is unexpectedly large");
+        std::ifstream in(path,std::ios::binary);if(!in)throw std::runtime_error("Cannot read settings for Unicode migration");
+        bytes.assign(std::istreambuf_iterator<char>(in),{});
+    }
+    if(bytes.size()>=2&&uint8_t(bytes[0])==0xff&&uint8_t(bytes[1])==0xfe)return;
+    std::wstring text;const bool utf8=bytes.size()>=3&&uint8_t(bytes[0])==0xef&&uint8_t(bytes[1])==0xbb&&uint8_t(bytes[2])==0xbf;
+    const int skip=utf8?3:0,length=int(bytes.size())-skip;
+    if(length){const int n=MultiByteToWideChar(utf8?CP_UTF8:CP_ACP,utf8?MB_ERR_INVALID_CHARS:0,bytes.data()+skip,length,nullptr,0);
+        if(!n)throw std::runtime_error("Cannot decode existing settings");text.resize(n);
+        MultiByteToWideChar(utf8?CP_UTF8:CP_ACP,utf8?MB_ERR_INVALID_CHARS:0,bytes.data()+skip,length,text.data(),n);}
+    auto temporary=path;temporary+=L".unicode-"+std::to_wstring(GetCurrentProcessId())+L".tmp";
+    try{
+        std::ofstream out(temporary,std::ios::binary|std::ios::trunc);const wchar_t bom=0xfeff;
+        out.write(reinterpret_cast<const char*>(&bom),sizeof(bom));out.write(reinterpret_cast<const char*>(text.data()),std::streamsize(text.size()*sizeof(wchar_t)));out.close();
+        if(!out||!MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))throw std::runtime_error("Cannot save Unicode settings");
+        WritePrivateProfileStringW(nullptr,nullptr,nullptr,path.c_str());
+    }catch(...){std::error_code ignored;std::filesystem::remove(temporary,ignored);throw;}
+}
 void save_config(const AppConfig& config) {
     const auto path=data_directory()/L"settings.ini";
+    ensure_unicode_profile(path);
     auto write=[&](const wchar_t* key,const std::wstring& value){if(!WritePrivateProfileStringW(L"HiveDesk",key,value.c_str(),path.c_str()))throw std::runtime_error("Unable to save settings");};
     write(L"DeviceId",widen(config.device_id)); write(L"Name",config.name);
     std::string order;for(const auto& id:config.device_order){if(!order.empty())order+=' ';order+=id;}write(L"DeviceOrder",widen(order));

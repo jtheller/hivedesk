@@ -1,5 +1,6 @@
 #pragma once
 #include "debug_model.h"
+#include "hud_graphics.h"
 #include <cmath>
 #include <optional>
 #include <algorithm>
@@ -8,54 +9,84 @@ namespace hive {
 enum class HudTone { Normal, Muted, Blue, Amber, Red };
 struct HudCell {
     int x=0,width=0;std::wstring text;HudTone tone=HudTone::Normal;
+    HudIcon icon=HudIcon::None;std::wstring reserve;
     bool operator==(const HudCell&)const=default;
 };
 struct CompactHud {
     int width=352;HudTone tone=HudTone::Blue;std::vector<HudCell> cells;
+    bool automatic=false,divider=false;int separator=-1;
     bool operator==(const CompactHud&)const=default;
 };
 inline HudTone hud_tone(DiagnosticTone tone){
     return tone==DiagnosticTone::Muted?HudTone::Muted:tone==DiagnosticTone::Warning?HudTone::Amber:tone==DiagnosticTone::Critical?HudTone::Red:HudTone::Normal;
 }
-// Observational only: no pacing/rate feedback, no invented input-to-photon time.
-inline CompactHud compact_hud(const DebugOverlayState& s,bool stats,bool warning){
+// Metadata is supplied by the active remote encoder, never inferred from GPU names.
+inline const wchar_t* hud_encoder(EncoderBackend backend){
+    switch(backend){case EncoderBackend::Nvenc:return L"NVENC";case EncoderBackend::Intel:return L"QSV";
+    case EncoderBackend::Amd:return L"AMF";case EncoderBackend::Software:return L"FFmpeg";default:return L"Encoder";}
+}
+inline CompactHud compact_hud(const DebugOverlayState& s,bool stats,bool warning,const std::wstring& name=L"Remote computer"){
     const bool health=s.health_time&&s.now-s.health_time<2000;
     const auto pressure=health?s.health.pressure:0;
-    const auto label=warning?(pressure&PressureNetwork?L"Network":pressure&PressureEncode?L"Encode":pressure&PressureDecode?L"Decode":L"Slow"):L"Live";
-    CompactHud hud;hud.tone=warning?HudTone::Amber:HudTone::Blue;
-    if(!stats){hud.width=184;hud.cells={{22,150,std::wstring(label)+L" \x00b7 Slow",HudTone::Amber}};return hud;}
+    const auto label=pressure&PressureNetwork?L"Network slow":pressure&PressureEncode?L"Encode slow":pressure&PressureDecode?L"Decode slow":L"Stream slow";
+    CompactHud hud;hud.automatic=true;hud.tone=warning?HudTone::Amber:HudTone::Normal;
+    if(!stats){hud.cells={{0,0,label,HudTone::Amber,HudIcon::Warning}};return hud;}
+    hud.divider=true;
     const bool source=s.source_time&&s.now-s.source_time<500;
     const bool encode=source&&s.source.encode_age_us!=UINT32_MAX&&uint64_t(s.source.encode_age_us)+(s.now-s.source_time)*1000<500000;
     const bool view=s.viewer.session&&s.viewer.service_sample_age_us<500000;
     const bool receive=s.viewer.session&&s.viewer.receive_sample_age_us<500000;
     const auto budget=diagnostic_budget(s.health.target_millihz);
     const auto number=[](double value,int precision){std::wostringstream out;out<<std::fixed<<std::setprecision(precision)<<value;return out.str();};
-    const auto ms=[&](const wchar_t* label,uint32_t us,bool fresh){return std::wstring(label)+(fresh?number(us/1000.0,1):L"--")+L"ms";};
-    hud.cells={{22,58,label,warning?HudTone::Amber:HudTone::Muted},
-        {84,50,(view?number(s.viewer.presented_millihz/1000.0,0):L"--")+L" fps",view?(warning?HudTone::Amber:HudTone::Normal):HudTone::Muted},
-        {140,62,ms(L"E ",s.source.encode_us,encode),hud_tone(diagnostic_threshold(s.source.encode_us,budget*3/4,budget,encode))},
-        {208,62,ms(L"D ",s.viewer.decode_us,view),hud_tone(diagnostic_threshold(s.viewer.decode_us,budget*3/4,budget,view))},
-        {276,66,(receive?number(s.viewer.receive_kbps/1000.0,0):L"--")+L" Mbps",receive?(warning&&(pressure&PressureNetwork)?HudTone::Amber:HudTone::Normal):HudTone::Muted}};
+    const auto ms=[&](const wchar_t* label,uint32_t us,bool fresh){return std::wstring(label)+L" "+(fresh?number(us/1000.0,1):L"--")+L"ms";};
+    const auto target=s.health.target_millihz?number(s.health.target_millihz/1000.0,0):L"--";
+    const auto backend=s.source.backend;
+    const auto encode_icon=backend==EncoderBackend::Unknown?HudIcon::Unknown:backend==EncoderBackend::Software?HudIcon::SoftwareEncode:HudIcon::HardwareEncode;
+    const auto decode_name=s.viewer.software_decode?L"FFmpeg":L"NVDEC";
+    hud.cells={{0,0,name.empty()?L"Remote computer":name,HudTone::Normal},
+        {0,0,(view?number(s.viewer.presented_millihz/1000.0,0):L"--")+L" / "+target+L" fps",view?(warning?HudTone::Amber:HudTone::Normal):HudTone::Muted,HudIcon::Frames,target+L" / "+target+L" fps"},
+        {0,0,ms(hud_encoder(backend),s.source.encode_us,encode),hud_tone(diagnostic_threshold(s.source.encode_us,budget*3/4,budget,encode)),encode_icon,std::wstring(hud_encoder(backend))+L" 88.8ms"},
+        {0,0,ms(decode_name,s.viewer.decode_us,view),hud_tone(diagnostic_threshold(s.viewer.decode_us,budget*3/4,budget,view)),s.viewer.software_decode?HudIcon::SoftwareDecode:HudIcon::HardwareDecode,std::wstring(decode_name)+L" 88.8ms"},
+        {0,0,(receive?number(s.viewer.receive_kbps/1000.0,0):L"--")+L" Mbps",receive?(warning&&(pressure&PressureNetwork)?HudTone::Amber:HudTone::Normal):HudTone::Muted,HudIcon::Bitrate,L"888 Mbps"}};
     return hud;
 }
 inline CompactHud connecting_hud(bool retry,const std::wstring& name){
-    return {352,HudTone::Blue,{{22,86,retry?L"Reconnecting":L"Connecting",HudTone::Blue},{114,148,name,HudTone::Normal},{270,72,L"Ctrl+Alt+`",HudTone::Muted}}};
+    CompactHud hud;hud.automatic=true;hud.tone=HudTone::Blue;
+    hud.cells={{0,0,retry?L"Reconnecting":L"Connecting",HudTone::Blue,HudIcon::Link},
+        {0,0,name,HudTone::Normal},{0,0,L"Ctrl+Alt+`",HudTone::Muted}};return hud;
+}
+// Layout uses the same cached Unicode masks as painting. Gaps belong to groups;
+// the separator occupies their midpoint rather than adding another pair of gaps.
+inline CompactHud layout_hud(CompactHud hud,int dpi,int maximum=32768){
+    const auto px=[&](int v){return MulDiv(v,dpi,96);};
+    if(!hud.automatic){hud.width=std::min(maximum,px(hud.width));for(auto& c:hud.cells){c.x=px(c.x);c.width=px(c.width);}return hud;}
+    const int gap=px(20),inner=px(6),icon=px(16),margin=px(12);
+    std::vector<int> widths;int total=2*margin;
+    for(const auto& cell:hud.cells){const int w=std::max(hud_text(cell.text,dpi)->width,hud_text(cell.reserve,dpi)->width);widths.push_back(w);total+=w+(cell.icon!=HudIcon::None?icon+inner:0);}
+    if(!widths.empty())total+=gap*int(widths.size()-1);
+    // Keep every metric reachable in normal windows. Only constrain the name
+    // when the actual viewport cannot hold the full original Unicode spelling.
+    const size_t name=hud.divider?0:1;
+    if(total>maximum&&name<widths.size()){const int take=std::min(total-maximum,std::max(0,widths[name]-px(24)));widths[name]-=take;total-=take;}
+    int x=margin;
+    for(size_t i=0;i<hud.cells.size();++i){auto& c=hud.cells[i];if(i)x+=gap;
+        if(i==1&&hud.divider)hud.separator=x-gap/2;
+        if(c.icon!=HudIcon::None)x+=icon+inner;c.x=x;c.width=widths[i];x+=widths[i];}
+    hud.width=std::max(1,std::min(maximum,total));return hud;
 }
 inline COLORREF hud_color(HudTone tone){
-    switch(tone){case HudTone::Muted:return RGB(179,188,201);case HudTone::Blue:return RGB(148,196,255);
-    case HudTone::Amber:return RGB(239,196,124);case HudTone::Red:return RGB(247,147,154);default:return RGB(239,243,249);}
+    switch(tone){case HudTone::Muted:return RGB(170,170,170);case HudTone::Blue:return RGB(148,196,255);
+    case HudTone::Amber:return RGB(239,196,124);case HudTone::Red:return RGB(247,147,154);default:return RGB(236,236,236);}
 }
 // Small CPU-only premultiplied surface. No capture readback, blur shader, or
 // additional GPU device competes with video. Unicode GDI masks use grayscale AA.
 class CompactHudSurface {
-    HDC dc_{},mask_dc_{};HBITMAP bitmap_{},mask_bitmap_{};HGDIOBJ old_{},mask_old_{};HFONT font_{};
-    uint32_t *pixels_{},*mask_{};int width_=0,height_=0,dpi_=0;std::optional<CompactHud> cached_;
+    HDC dc_{};HBITMAP bitmap_{};HGDIOBJ old_{};
+    uint32_t *pixels_{};int width_=0,height_=0,dpi_=0;std::optional<CompactHud> cached_;
     uint64_t revision_=0,presented_revision_=0;HWND presented_window_{};RECT presented_rect_{};BYTE presented_alpha_=0;
     void clear(){
         if(dc_&&old_)SelectObject(dc_,old_);if(bitmap_)DeleteObject(bitmap_);if(dc_)DeleteDC(dc_);
-        if(mask_dc_&&mask_old_)SelectObject(mask_dc_,mask_old_);if(mask_bitmap_)DeleteObject(mask_bitmap_);if(mask_dc_)DeleteDC(mask_dc_);
-        if(font_)DeleteObject(font_);dc_=mask_dc_=nullptr;bitmap_=mask_bitmap_=nullptr;old_=mask_old_=nullptr;font_=nullptr;
-        pixels_=mask_=nullptr;width_=height_=dpi_=0;cached_.reset();invalidate_present();
+        dc_=nullptr;bitmap_=nullptr;old_=nullptr;pixels_=nullptr;width_=height_=dpi_=0;cached_.reset();invalidate_present();
     }
     static uint32_t over(uint32_t before,COLORREF color,uint32_t alpha){
         const uint32_t inverse=255-alpha;
@@ -69,17 +100,16 @@ public:
     CompactHudSurface(const CompactHudSurface&)=delete;CompactHudSurface& operator=(const CompactHudSurface&)=delete;
     void invalidate_present(){presented_window_=nullptr;}
     const uint32_t* pixels()const{return pixels_;}
-    bool render(const CompactHud& hud,int width,int height,int dpi){
+    bool render(const CompactHud& input,int width,int height,int dpi){
         if(width<=0||height<=0||dpi<=0)return false;
+        const auto hud=layout_hud(input,dpi,width);
         if(width_!=width||height_!=height||dpi_!=dpi){
             clear();BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;
             info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
-            dc_=CreateCompatibleDC(nullptr);mask_dc_=CreateCompatibleDC(nullptr);
+            dc_=CreateCompatibleDC(nullptr);
             bitmap_=CreateDIBSection(dc_,&info,DIB_RGB_COLORS,reinterpret_cast<void**>(&pixels_),nullptr,0);
-            mask_bitmap_=CreateDIBSection(mask_dc_,&info,DIB_RGB_COLORS,reinterpret_cast<void**>(&mask_),nullptr,0);
-            font_=CreateFontW(-MulDiv(12,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-            if(!dc_||!mask_dc_||!bitmap_||!mask_bitmap_||!font_){clear();return false;}
-            old_=SelectObject(dc_,bitmap_);mask_old_=SelectObject(mask_dc_,mask_bitmap_);width_=width;height_=height;dpi_=dpi;
+            if(!dc_||!bitmap_){clear();return false;}
+            old_=SelectObject(dc_,bitmap_);width_=width;height_=height;dpi_=dpi;
         }
         if(cached_&&*cached_==hud)return true;
         const auto px=[&](int value){return MulDiv(value,dpi,96);};
@@ -90,18 +120,31 @@ public:
             const double coverage=std::clamp(.5-distance,0.0,1.0);
             uint32_t pixel=over(0,RGB(21,27,36),uint32_t(150*coverage));
             if(distance> -1.0)pixel=over(pixel,RGB(184,203,229),uint32_t(35*coverage));
-            const double dot=std::hypot(x+.5-px(12),y+.5-half_height);
-            pixel=over(pixel,hud_color(hud.tone),uint32_t(255*std::clamp(px(2)+.5-dot,0.0,1.0)));
+
             pixels_[size_t(y)*width+x]=pixel;
         }
-        auto old_font=SelectObject(mask_dc_,font_);SetTextColor(mask_dc_,RGB(255,255,255));SetBkMode(mask_dc_,TRANSPARENT);
+        auto stamp=[&](const HudMask& mask,int left,int top,COLORREF color,int clip_left,int clip_right){
+            for(int y=0;y<mask.height;++y)for(int x=0;x<mask.width;++x){const int xx=left+x,yy=top+y;
+                if(xx<clip_left||xx>=clip_right||xx<0||xx>=width||yy<0||yy>=height)continue;
+                auto& dst=pixels_[size_t(yy)*width+xx];dst=over(dst,color,mask.alpha[size_t(y)*mask.width+x]);}
+        };
+        if(hud.separator>=0&&hud.separator<width)for(int y=px(8);y<std::min(height,px(20));++y)
+            for(int x=hud.separator;x<std::min(width,hud.separator+std::max(1,px(1)));++x){auto& dst=pixels_[size_t(y)*width+x];dst=over(dst,RGB(236,236,236),40);}
         for(const auto& cell:hud.cells){
-            RECT bounds{px(cell.x),0,std::min(width-px(8),px(cell.x+cell.width)),height};if(bounds.right<=bounds.left)continue;
-            PatBlt(mask_dc_,0,0,width,height,BLACKNESS);
-            DrawTextW(mask_dc_,cell.text.c_str(),int(cell.text.size()),&bounds,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
-            GdiFlush();for(int y=0;y<height;++y)for(int x=bounds.left;x<bounds.right;++x){const auto i=size_t(y)*width+x;pixels_[i]=over(pixels_[i],hud_color(cell.tone),mask_[i]&255);}
+            auto mask=hud_text(cell.text,dpi);const int right=std::min(width-px(8),cell.x+cell.width);
+            if(right<=cell.x)continue;
+            if(mask->width>cell.width){
+                // The complete name remains in the model and all identity paths.
+                // Shape the ellipsis too, without splitting UTF-16 surrogate pairs.
+                std::wstring short_text=cell.text;
+                while(!short_text.empty()&&hud_text(short_text+L"\x2026",dpi)->width>cell.width){short_text.pop_back();if(!short_text.empty()&&short_text.back()>=0xd800&&short_text.back()<=0xdbff)short_text.pop_back();}
+                mask=hud_text(short_text+L"\x2026",dpi);
+            }
+            const int offset=cell.reserve.empty()?0:std::max(0,cell.width-mask->width);
+            stamp(*mask,cell.x+offset,(height-mask->height)/2,hud_color(cell.tone),cell.x,right);
+            if(cell.icon!=HudIcon::None){const auto icon=hud_icon(cell.icon,dpi);stamp(*icon,cell.x-px(22),(height-icon->height)/2,hud_color(cell.tone),0,width);}
         }
-        SelectObject(mask_dc_,old_font);cached_=hud;++revision_;return true;
+        cached_=hud;++revision_;return true;
     }
     bool present(HWND window,BYTE alpha=255){
         RECT rect{};GetWindowRect(window,&rect);POINT destination{rect.left,rect.top},source{};SIZE size{width_,height_};

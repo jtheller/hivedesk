@@ -775,13 +775,16 @@ struct Shell::Impl {
     DebugOverlayState compact_state()const {
         return {remote_width,remote_height,stream_health,source_diagnostics,viewer_diagnostics,input_diagnostics,GetTickCount64(),source_stats_time,health_time};
     }
+    CompactHud compact_model()const {
+        return reconnecting?connecting_hud(waiting_retry,pending_name):hud_notice_visible()?CompactHud{352,HudTone::Red,{{22,320,hud_notice,HudTone::Red}}}:compact_hud(compact_state(),compact_stats,hud_warning,pending_name);
+    }
     void paint_health() {
         RECT rect{};GetClientRect(health_badge,&rect);
         if(!reconnecting&&detailed_hud()){
             compact_surface.invalidate_present();
             if(debug_surface.render(rect.right,rect.bottom,dpi,debug_font,debug_rows()))debug_surface.present(health_badge);
         }else {
-            const auto model=reconnecting?connecting_hud(waiting_retry,pending_name):hud_notice_visible()?CompactHud{352,HudTone::Red,{{22,320,hud_notice,HudTone::Red}}}:compact_hud(compact_state(),compact_stats,hud_warning);
+            const auto model=compact_model();
             if(compact_surface.render(model,rect.right,rect.bottom,dpi))compact_surface.present(health_badge,BYTE(std::min<uint64_t>(255,(GetTickCount64()-hud_shown_at)*255/120)));
         }
     }
@@ -799,7 +802,8 @@ struct Shell::Impl {
             if(remote&&!waiting_visible&&(reconnecting?connection_hint_visible:(warning||compact_stats||config.desktop.debug_overlay||hud_notice_visible()))&&IsWindowVisible(viewer)&&GetForegroundWindow()==viewer) {
                 if(!reconnecting&&(config.desktop.debug_overlay||compact_stats)&&callbacks.debug_tick)callbacks.debug_tick();
                 const auto client=viewer_client();
-                const int width=std::min(px(reconnecting?352:detailed_hud()?460:(compact_stats||hud_notice_visible())?352:184),std::max(px(80),int(client.right-client.left)-px(32))),height=std::min(px(!reconnecting&&detailed_hud()?474:28),std::max(px(28),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
+                const int available=std::max(px(80),int(client.right-client.left)-px(32));
+                const int width=!reconnecting&&detailed_hud()?std::min(px(460),available):layout_hud(compact_model(),dpi,available).width,height=std::min(px(!reconnecting&&detailed_hud()?474:28),std::max(px(28),int(client.bottom-client.top)-px(32)));RECT bounds{};GetWindowRect(health_badge,&bounds);
                 const int left=client.left+px(16),top=client.top+px(16);
                 if(!IsWindowVisible(health_badge))hud_shown_at=GetTickCount64();
                 if(!IsWindowVisible(health_badge)||bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=width||bounds.bottom-bounds.top!=height){SetWindowPos(health_badge,HWND_TOP,left,top,width,height,SWP_NOACTIVATE);paint_health();ShowWindow(health_badge,SW_SHOWNOACTIVATE);}

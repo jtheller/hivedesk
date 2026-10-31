@@ -3,6 +3,7 @@
 #include <bcrypt.h>
 #include <string>
 #include <algorithm>
+#include "device_name.h"
 
 namespace hive::bootstrap {
 constexpr wchar_t Registry[]=L"Software\\HiveDesk\\Bootstrap";
@@ -39,7 +40,7 @@ inline Identity initial(){
         BYTE bytes[16]{};if(BCryptGenRandom(nullptr,bytes,sizeof(bytes),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)return {};
         constexpr wchar_t hex[]=L"0123456789abcdef";for(auto b:bytes){value.id+=hex[b>>4];value.id+=hex[b&15];}
     }
-    if(value.name.empty()){wchar_t name[MAX_COMPUTERNAME_LENGTH+1]{};DWORD size=MAX_COMPUTERNAME_LENGTH+1;GetComputerNameW(name,&size);value.name=name;}
+    if(value.name.empty())value.name=default_device_name();
     return value;
 }
 // A lock keeps the user's SID, so it never replaces a working broker. A first

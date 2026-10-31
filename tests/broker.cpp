@@ -60,6 +60,13 @@ void rate_extension_check(){
         require(!rate_wire::read_diagnostics(d,[&]{return truncated.u32();},[&]{return truncated.u64();})||!truncated.end(),"Broker truncated diagnostic extension accepted");}
     data[4]=16;broker::Reader flags{data};
     require(!rate_wire::read_diagnostics(observed,[&]{return flags.u32();},[&]{return flags.u64();}),"Unknown diagnostic flags accepted");
+    source.backend=EncoderBackend::Intel;
+    data.clear();rate_wire::write_diagnostics(source,[&](uint32_t n){broker::u32(data,n);},[&](uint64_t n){broker::u64(data,n);},true);
+    broker::Reader codec{data};
+    require(rate_wire::read_diagnostics(observed,[&]{return codec.u32();},[&]{return codec.u64();})&&codec.end()&&observed.backend==EncoderBackend::Intel,"Broker codec identity roundtrip");
+    broker::Reader legacy{data};require(!rate_wire::read_diagnostics(observed,[&]{return legacy.u32();},[&]{return legacy.u64();},false),"Unnegotiated codec extension accepted");
+    for(size_t size=0;size<data.size();++size){broker::Bytes short_data(data.begin(),data.begin()+size);broker::Reader truncated{short_data};SourceDiagnostics d;
+        require(!rate_wire::read_diagnostics(d,[&]{return truncated.u32();},[&]{return truncated.u64();})||!truncated.end(),"Truncated codec identity accepted");}
 }
 struct Pipe {
     HANDLE server=INVALID_HANDLE_VALUE,client=INVALID_HANDLE_VALUE;

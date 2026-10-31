@@ -215,7 +215,7 @@ Bytes make_hello(const TransportConfig& cfg, uint8_t channel) {
     // prefix keeps their exact wire layout, with 160 fresh random challenge bits.
     // The complete challenge (including capabilities) is authenticated by HMAC.
     std::copy(feature_marker.begin(),feature_marker.end(),b.begin()+at);
-    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe|FeatureWake|FeatureCompactStats;
+    constexpr uint32_t features=FeatureDesktopAux|FeatureAutomaticStream|FeatureStreamDiagnostics|FeatureEncodeTiming|FeatureHostKick|FeatureAutoRate|FeatureDedicatedInput|FeatureFrameTiming|FeatureCursorComposition|FeatureBuildVersion|FeatureNativeSnapshot|FeatureWarmStream|FeatureRichClipboard|FeatureLivePeek|FeatureByteFeedback|FeaturePathProbe|FeatureDatagramVideo|FeatureDatagramRecovery|FeatureScopedCursor|FeatureNestedReturn|FeatureInputRelay|FeatureViewRoute|FeatureRemoteHive|FeatureMediaProbe|FeatureHostProbe|FeatureWake|FeatureCompactStats|FeatureCodecIdentity;
     const auto advertised=cfg.datagram_video?features:features&~(FeatureDatagramVideo|FeatureDatagramRecovery);
     for(unsigned i=0;i<4;++i)b[at+8+i]=uint8_t(advertised>>(24-i*8));return b;
 }
@@ -1015,7 +1015,7 @@ struct Transport::Impl {
         case Diagnostics: {
             SourceDiagnostics d;d.session=r.qword();d.encoded_millihz=r.dword();d.encode_us=r.dword();d.capture_wait_us=r.dword();d.send_wait_us_per_second=r.dword();d.feedback_age_us=r.dword();d.network_extra_us=r.dword();
             if(!r.end()){if(!(c.peer.features&FeatureEncodeTiming))return false;d.color_us=r.dword();d.nvenc_us=r.dword();d.encode_age_us=r.dword();d.encode_details=true;}
-            if(!r.end()&&(!(c.peer.features&FeatureAutoRate)||!rate_wire::read_diagnostics(d,[&]{return r.dword();},[&]{return r.qword();})))return false;
+            if(!r.end()&&(!(c.peer.features&FeatureAutoRate)||!rate_wire::read_diagnostics(d,[&]{return r.dword();},[&]{return r.qword();},(c.peer.features&FeatureCodecIdentity)!=0)))return false;
             if(!(c.peer.features&FeatureStreamDiagnostics)||!valid_diagnostics(d)||!r.end())return false;
             if(callbacks.diagnostics)callbacks.diagnostics(c.peer.id,d);return true;
         }
@@ -1489,7 +1489,7 @@ bool Transport::send_diagnostics(const std::string& peer,const SourceDiagnostics
     Bytes b{Diagnostics};u64(b,d.session);u32(b,d.encoded_millihz);u32(b,d.encode_us);u32(b,d.capture_wait_us);u32(b,d.send_wait_us_per_second);u32(b,d.feedback_age_us);u32(b,d.network_extra_us);
     const bool rate=d.rate_details&&(c->peer.features&FeatureAutoRate)&&(c->peer.features&FeatureEncodeTiming);
     if((d.encode_details||rate)&&(c->peer.features&FeatureEncodeTiming)){u32(b,d.color_us);u32(b,d.nvenc_us);u32(b,d.encode_age_us);}
-    if(rate)rate_wire::write_diagnostics(d,[&](uint32_t n){u32(b,n);},[&](uint64_t n){u64(b,n);});
+    if(rate)rate_wire::write_diagnostics(d,[&](uint32_t n){u32(b,n);},[&](uint64_t n){u64(b,n);},(c->peer.features&FeatureCodecIdentity)!=0);
     return c->enqueue(std::move(b));
 }
 bool Transport::send_input(const std::string& peer, const InputEvent& e) { auto c = impl_->find(peer); if (!c || !valid_input(e)) return false; Bytes b{Input}; u32(b,uint32_t(e.kind)); u32(b,uint32_t(e.a)); u32(b,uint32_t(e.b)); u32(b,uint32_t(e.c)); return c->enqueue(std::move(b)); }
@@ -2344,6 +2344,15 @@ bool Transport::self_test(std::string& result) {
         }
         control->peer.features|=FeatureAutoRate;
         if(!owner.dispatch(*control,control->control.back())||observed.rate_details){result="Legacy diagnostic rejected by new peer";return false;}
+        control->peer.features|=FeatureCodecIdentity;
+        d.backend=EncoderBackend::Intel;
+        if(!sender.send_diagnostics("rate-peer",d)||!owner.dispatch(*control,control->control.back())||observed.backend!=EncoderBackend::Intel){result="Codec identity roundtrip failed";return false;}
+        const auto identified=control->control.back();auto short_codec=identified;short_codec.pop_back();
+        if(owner.dispatch(*control,short_codec)){result="Truncated codec identity accepted";return false;}
+        auto bad_codec=identified;bad_codec[bad_codec.size()-1]=0xff;
+        if(owner.dispatch(*control,bad_codec)){result="Invalid codec identity accepted";return false;}
+        control->peer.features&=~FeatureCodecIdentity;
+        if(owner.dispatch(*control,identified)||!sender.send_diagnostics("rate-peer",d)||!owner.dispatch(*control,control->control.back())||observed.backend!=EncoderBackend::Unknown){result="Codec identity legacy gating failed";return false;}
         d.average_qp=52;f.received_millihz=4000001;
         if(sender.send_diagnostics("rate-peer",d)||sender.send_feedback("rate-peer",f)){result="Automatic-rate metric bounds failed";return false;}
         d.average_qp=UINT32_MAX;d.rate_reason=8;
