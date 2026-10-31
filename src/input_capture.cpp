@@ -35,6 +35,7 @@ struct InputCapture::Impl {
     // These are exclusively owned by the capture message thread.
     FixedHotkeys fixed;
     std::array<bool,6> buttons{};
+    std::array<bool,6> local_buttons{};
     DWORD summon_key_up=0;
     uint64_t observed_route=0;
     bool hud_tracking=false,hud_release=false;
@@ -43,7 +44,7 @@ struct InputCapture::Impl {
     struct Route {std::shared_ptr<const InputCaptureState> state;uint64_t id;bool enabled;};
     Route snapshot() {
         std::lock_guard lock(mutex);
-        return {state,route,state->remote&&!state->local_shell&&blocked_route!=route&&!stopping&&(!state->windowed||GetForegroundWindow()==state->viewer)};
+        return {state,route,state->remote&&!state->local_shell&&blocked_route!=route&&!stopping&&(!state->viewer||GetForegroundWindow()==state->viewer)};
     }
     void observe_route(uint64_t id) {
         if(observed_route==id)return;
@@ -90,8 +91,9 @@ struct InputCapture::Impl {
         return s.panel_dragging||(s.panel_visible&&PtInRect(&s.panel_rect,p))||(s.settings_visible&&PtInRect(&s.settings_rect,p));
     }
     static bool map_absolute(const InputCaptureState& s,POINT point,InputEvent& event) {
-        double width=s.windowed?s.viewer_rect.right-s.viewer_rect.left:s.screen_width,height=s.windowed?s.viewer_rect.bottom-s.viewer_rect.top:s.screen_height;
-        if(s.windowed){point.x-=s.viewer_rect.left;point.y-=s.viewer_rect.top;}
+        const auto bounds=input_viewer_bounds(s);
+        double width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
+        point.x-=bounds.left;point.y-=bounds.top;
         double content_width=width,content_height=height;
         if(s.remote_width&&s.remote_height){const double scale=std::min(width/s.remote_width,height/s.remote_height);content_width=s.remote_width*scale;content_height=s.remote_height*scale;}
         const double left=(width-content_width)*.5,top=(height-content_height)*.5;
@@ -166,10 +168,16 @@ struct InputCapture::Impl {
             {std::lock_guard lock(s->mutex);s->hud.generation=route.state->generation;s->hud.origin=s->hud.point=m.pt;s->hud.bounds=route.state->hud_rect;s->hud.active=true;++s->hud.revision;}
             return 1;
         }
-        if(!route.enabled)return CallNextHookEx(nullptr,code,msg,data);
+        const int pressed=msg==WM_LBUTTONDOWN?1:msg==WM_RBUTTONDOWN?2:msg==WM_MBUTTONDOWN?3:msg==WM_XBUTTONDOWN?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;
         const int released=msg==WM_LBUTTONUP?1:msg==WM_RBUTTONUP?2:msg==WM_MBUTTONUP?3:msg==WM_XBUTTONUP?(HIWORD(m.mouseData)==XBUTTON1?4:5):0;
-        if(own_surface(*route.state,m.pt)||(route.state->windowed&&(!PtInRect(&route.state->viewer_rect,m.pt)||GetAncestor(WindowFromPoint(m.pt),GA_ROOTOWNER)!=route.state->viewer))) {
+        if(released&&s->local_buttons[size_t(released)]){s->local_buttons[size_t(released)]=false;return CallNextHookEx(nullptr,code,msg,data);}
+        if(!route.enabled||std::any_of(s->local_buttons.begin(),s->local_buttons.end(),[](bool down){return down;})){
+            if(pressed)s->local_buttons[size_t(pressed)]=true;return CallNextHookEx(nullptr,code,msg,data);
+        }
+        const auto bounds=input_viewer_bounds(*route.state);
+        if(own_surface(*route.state,m.pt)||!PtInRect(&bounds,m.pt)||(route.state->windowed&&GetAncestor(WindowFromPoint(m.pt),GA_ROOTOWNER)!=route.state->viewer)) {
             if(released&&s->buttons[size_t(released)]){s->buttons[size_t(released)]=false;s->emit(route,{InputKind::Button,released,1},now);return 1;}
+            if(pressed)s->local_buttons[size_t(pressed)]=true;
             return CallNextHookEx(nullptr,code,msg,data);
         }
         if(msg==WM_MOUSEMOVE) {
@@ -273,9 +281,10 @@ bool InputCapture::routing_self_test(std::string& result){
         for(auto button:{WM_LBUTTONDOWN,WM_RBUTTONDOWN}){
             require(mouse(button,{400,400})==0,"Taskbar click was consumed");action(CaptureAction::HidePanelAnimated);
             require(s.queue.size()==0,"Taskbar click leaked to remote input");
+            mouse(button==WM_LBUTTONDOWN?WM_LBUTTONUP:WM_RBUTTONUP,{400,400});
         }
-        mouse(WM_LBUTTONDOWN,{100,100});quiet();
-        state.panel_dragging=true;set();mouse(WM_LBUTTONDOWN,{400,400});quiet();state.panel_dragging=false;set();
+        mouse(WM_LBUTTONDOWN,{100,100});mouse(WM_LBUTTONUP,{100,100});quiet();
+        state.panel_dragging=true;set();mouse(WM_LBUTTONDOWN,{400,400});mouse(WM_LBUTTONUP,{400,400});quiet();state.panel_dragging=false;set();
         require(key(VK_ESCAPE,1)==0,"Local Escape was swallowed before Explorer");action(CaptureAction::HidePanelAnimated);
         require(key(VK_ESCAPE,1,true)==0,"Local Escape key-up was swallowed");quiet();
         mouse(WM_LBUTTONDOWN,{400,400},LLMHF_INJECTED);key(VK_ESCAPE,1,false,LLKHF_INJECTED);quiet();
@@ -298,6 +307,17 @@ bool InputCapture::routing_self_test(std::string& result){
         require(key(VK_ESCAPE,1)==1,"Remote Hive Escape was not intercepted");action(CaptureAction::HidePanel);
         require(key(VK_ESCAPE,1,true)==1&&s.queue.size()==0,"Hive Escape key-up leaked to remote");quiet();
         state.panel_visible=state.panel_summoned=false;set();
+        // Fullscreen absolute input must leave both left/above and right/below
+        // secondary monitors local; a local drag stays local on re-entry.
+        for(const POINT outside:std::array<POINT,4>{{{-100,400},{2020,400},{400,-100},{400,1180}}}){
+            mouse(WM_MOUSEMOVE,outside);require(s.queue.size()==0,"Secondary-screen movement reached remote");
+            require(mouse(WM_LBUTTONDOWN,outside)==0,"Secondary-screen click swallowed");
+            mouse(WM_MOUSEMOVE,{400,400});require(mouse(WM_LBUTTONUP,{400,400})==0&&s.queue.size()==0,"Local drag crossing into fullscreen was stolen");
+        }
+        mouse(WM_LBUTTONDOWN,{400,400});s.queue.clear();
+        mouse(WM_MOUSEMOVE,{2020,400});require(s.queue.size()==0,"Remote drag followed pointer onto local screen");
+        require(mouse(WM_LBUTTONUP,{2020,400})==1&&s.queue.size()==1&&s.queue.pop()->event.kind==InputKind::Button,"Remote button remained held after screen exit");
+        state.viewer=s.owner;set();require(key('A',0x1e)==0&&key('A',0x1e,true)==0&&s.queue.size()==0,"Unfocused fullscreen intercepted local typing");state.viewer=nullptr;set();
         require(key('A',0x1e)==1&&key('A',0x1e,true)==1,"Remote key edges were not intercepted");
         const auto down=s.queue.pop(),up=s.queue.pop();
         require(down&&up&&down->event.kind==InputKind::Key&&up->event.kind==InputKind::Key&&down->event.a==0x1e&&
@@ -514,6 +534,9 @@ bool InputCapture::worker_self_test(std::string& result){
             geometry.remote_width=1080;geometry.remote_height=1920;
             require(!Impl::map_absolute(geometry,{310,425},mapped)&&Impl::map_absolute(geometry,{700,425},mapped),"Windowed letterbox mapping failed");
             geometry.panel_dragging=true;require(Impl::own_surface(geometry,{1800,900}),"A dragged card leaked input outside the sidebar");
+            geometry.windowed=false;geometry.viewer_rect={-1920,-1080,0,0};geometry.remote_width=1920;geometry.remote_height=1080;
+            require(Impl::map_absolute(geometry,{-960,-540},mapped)&&std::abs(mapped.a-32768)<100&&std::abs(mapped.b-32768)<100,"Negative monitor origin mapping failed");
+            require(!Impl::map_absolute(geometry,{100,100},mapped),"Adjacent local monitor mapped as fullscreen video");
         }
         {
             Probe probe;probe.capture.update(route);start(probe);emit(probe,{InputKind::Key,0x1e,0});require(probe.wait(1),"Focus test initial input failed");

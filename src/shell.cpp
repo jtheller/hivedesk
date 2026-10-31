@@ -275,6 +275,7 @@ struct Shell::Impl {
     unsigned cursor_trace_count=0;
 #ifdef HIVEDESK_SHELL_TEST
     std::function<void(const INPUT&)> cursor_position_test_sink;
+    std::function<void(POINT&,bool&)> cursor_context_test;
 #endif
     HCURSOR sent_cursor{},remote_cursor{};
     bool cursor_sent=false,sent_cursor_visible=false,remote_cursor_visible=true,remote_cursor_received=false;
@@ -315,7 +316,7 @@ struct Shell::Impl {
         state.returning=nested_return.busy();
         if(!keep_taskbar_guard&&!taskbar_peek.active()&&GetForegroundWindow()==viewer)taskbar_focus_guard=false;
         state.local_shell=nested_return.busy()||taskbar_peek.active()||taskbar_focus_guard||!peek_id.empty()||!fading_peeks.empty();
-        state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&(!windowed||(GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer)));
+        state.remote=remote&&!reconnecting&&!shutting_down&&!state.local_shell&&GetForegroundWindow()==viewer&&!sizing_viewer&&!IsIconic(viewer);
         state.windowed=windowed;state.viewer=viewer;state.viewer_rect=viewer_client();state.panel_dragging=pressed_card>=0;state.relative=relative_mode;state.recording_hotkey=recording_hotkey;
         state.panel=panel;state.panel_visible=panel&&(GetWindowLongPtrW(panel,GWL_STYLE)&WS_VISIBLE);state.panel_summoned=panel_summoned;
         state.settings_visible=settings&&IsWindowVisible(settings);
@@ -505,14 +506,18 @@ struct Shell::Impl {
         POINT point{};GetCursorPos(&point);
         // Never pull against recent local movement or take the pointer out of our UI.
         if(own_surface(point)||GetTickCount64()-last_local_motion<100)return;
-        const auto client=viewer_client();
-        if(windowed&&(GetForegroundWindow()!=viewer||sizing_viewer||!PtInRect(&client,point)))return;
+        const auto client=viewer_client();bool focused=GetForegroundWindow()==viewer;
+#ifdef HIVEDESK_SHELL_TEST
+        if(cursor_context_test)cursor_context_test(point,focused);
+#endif
+        if(!focused||sizing_viewer||!PtInRect(&client,point))return;
         const double width=client.right-client.left,height=client.bottom-client.top;
         const double scale=std::min(width/remote_width,height/remote_height);
         const double x=(width-remote_width*scale)/2+(remote_pointer.x/65535.0)*(remote_width-1)*scale;
         const double y=(height-remote_height*scale)/2+(remote_pointer.y/65535.0)*(remote_height-1)*scale;
-        INPUT input{};input.type=INPUT_MOUSE;input.mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE;
-        input.mi.dx=LONG((client.left+x+.5)*65536/GetSystemMetrics(SM_CXSCREEN));input.mi.dy=LONG((client.top+y+.5)*65536/GetSystemMetrics(SM_CYSCREEN));input.mi.dwExtraInfo=InputMarker;
+        INPUT input{};input.type=INPUT_MOUSE;input.mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK;
+        input.mi.dx=LONG((client.left+x+.5-GetSystemMetrics(SM_XVIRTUALSCREEN))*65536/std::max(1,GetSystemMetrics(SM_CXVIRTUALSCREEN)));
+        input.mi.dy=LONG((client.top+y+.5-GetSystemMetrics(SM_YVIRTUALSCREEN))*65536/std::max(1,GetSystemMetrics(SM_CYVIRTUALSCREEN)));input.mi.dwExtraInfo=InputMarker;
 #ifdef HIVEDESK_SHELL_TEST
         if(cursor_position_test_sink){cursor_position_test_sink(input);return;}
 #endif
@@ -672,7 +677,7 @@ struct Shell::Impl {
         publish_input();
     }
     void confine_mouse() {
-        if(!remote||hud_local_pointer||nested_return.busy()||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer||(windowed&&!relative_mode)){ClipCursor(nullptr);return;}
+        if(!remote||!relative_mode||hud_local_pointer||nested_return.busy()||reconnecting||panel_mode||taskbar_peek.active()||taskbar_focus_guard||sizing_viewer||GetForegroundWindow()!=viewer){ClipCursor(nullptr);return;}
         RECT r=viewer_client();
         if(relative_mode){int x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;r={x,y,x+1,y+1};SetCursorPos(x,y);}
         ClipCursor(&r);

@@ -21,6 +21,10 @@ struct InputCaptureState {
     uint32_t screen_width=1,screen_height=1,remote_width=0,remote_height=0;
     uint32_t hotkey_key=0,hotkey_modifiers=0;
 };
+inline RECT input_viewer_bounds(const InputCaptureState& s){
+    return s.viewer_rect.right>s.viewer_rect.left&&s.viewer_rect.bottom>s.viewer_rect.top?s.viewer_rect:
+        RECT{0,0,LONG(s.screen_width),LONG(s.screen_height)};
+}
 // Hit-tested root distinguishes Explorer covering the bottom of the sidebar
 // from a click on Hive itself. The hook only posts a dismissal; never consumes it.
 inline bool dismiss_panel_on_mouse_down(const InputCaptureState& s,POINT p,HWND root) {
